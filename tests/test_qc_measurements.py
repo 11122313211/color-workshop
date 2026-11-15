@@ -390,6 +390,46 @@ def test_api_import_requires_calibration_and_instrument(api_client):
     assert r2.status_code == 400  # 缺仪器登记
 
 
+def test_api_ink_quality_verified_gate(api_client):
+    """TSV 密度会话：复测 verified → QC 指标可用；追加 rejected 记录被排除。"""
+    from app.services.cgats import lab_from_xyz, white_xyz
+
+    white = np.asarray(white_xyz("D50", "2"))
+    def _row(label, scale, den):
+        xyz = [float(v) for v in white * scale]
+        return (label, lab_from_xyz(xyz, white), xyz, den)
+
+    rows = [
+        _row("C", 0.09, [1.55, 0.43, 0.17, 0.78]),
+        _row("M", 0.22, [0.20, 1.56, 0.86, 0.60]),
+        _row("Y", 0.45, [0.02, 0.10, 1.09, 0.06]),
+        _row("c60", 0.30, [0.51, 0.19, 0.06, 0.34]),
+        _row("w", 1.00, [0.01, 0.01, 0.02, 0.01]),
+    ]
+    body = make_tsv(rows)
+    r = _import(api_client, body, filename="q1.txt", instrument="Xrite530",
+                calibrated_at="2026-07-08T10:00:00", repeat_mode="single")
+    sid = r.json()["session"]["id"]
+    assert r.json()["record"]["reliability"] == "warning"  # 单次测量
+    q = api_client.get("/api/qc/ink-quality", params={"session_id": sid}).json()
+    assert q["verified_records"] == 0 and q["inks"] == {}  # 门禁：warning 不进指标
+
+    _import(api_client, body, filename="q2.txt", session_id=sid, repeat_mode="repeat")
+    q2 = api_client.get("/api/qc/ink-quality", params={"session_id": sid}).json()
+    assert q2["verified_records"] == 2 and q2["skipped_records"] == 0
+    assert set(q2["inks"]) == {"C", "M", "Y"}
+    assert q2["inks"]["C"]["strength"] == pytest.approx(1.55)
+    assert q2["tvi"] and q2["tvi"][0]["nominal"] == 60
+    assert q2["session"]["instrument"] == "Xrite530"
+
+    # 追加一条 rejected 记录 → 被排除并计数
+    garbage = make_xyzlab_cgats([("A1", [-22.0, -23.0, -26.0], [0.0, 8.58, 305.27])])
+    _import(api_client, garbage, filename="bad.txt", session_id=sid)
+    q3 = api_client.get("/api/qc/ink-quality", params={"session_id": sid}).json()
+    assert q3["skipped_records"] == 1
+    assert "bad.txt" not in q3["source_records"]
+
+
 def test_api_session_and_record_delete_regrade(api_client):
     rows = {f"A{i + 1}": _smooth_refl(i / 5) for i in range(6)}
     sid = _import(api_client, make_spectral_cgats(rows), filename="a.txt",

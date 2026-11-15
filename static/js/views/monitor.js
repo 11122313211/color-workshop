@@ -248,7 +248,7 @@ async function openImportWizard(view) {
  * 只消费 verified 数据；无 verified 时显示方法要求占位（教育用户何为可信数据）
  * ========================================================= */
 
-const INK_COLORS = { C: "#1f7fd0", M: "#d04f9e", Y: "#c99a1e" };
+const INK_COLORS = { C: "#1f7fd0", M: "#d04f9e", Y: "#c99a1e", R: "#d05a4e", G: "#4e9e5f", B: "#8a7fdd" };
 
 /* GATF 色轮理想方位（自顶部顺时针，Y/R/M/B/C/G 每 60°） */
 const WHEEL_ANGLE = { Y: 0, R: 60, M: 120, B: 180, C: 240, G: 300 };

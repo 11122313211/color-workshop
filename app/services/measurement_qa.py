@@ -242,19 +242,37 @@ def check_outliers(patches: list[dict]) -> list[str]:
 
 
 def grade_session(session: dict, records: list[dict], paper_white_lab: list[float] | None = None) -> None:
-    """对会话内全部记录重评分级（就地更新 reliability / density_ok / reasons）。"""
+    """对会话内全部记录重评分级（就地更新 reliability / density_ok / reasons）。
+
+    两遍扫描：先做记录级校验（规则 2/3/4/5），被 rejected 的记录不参与第二遍的
+    复测配对（规则 1）——rejected 数据「可查不可用」，不得污染有效记录的复测结论。
+    """
     repeat_mode = session.get("repeat_mode") == "repeat"
 
-    # ---- 规则 1：复测一致性（会话级）----
+    # ---- 第一遍：记录级（规则 3 交叉校验 / 4 数值合理性 / 2 纸白 / 5 离群）----
+    verdicts: list[RecordVerdict] = []
+    for rec in records:
+        verdict = RecordVerdict()
+        declared = declared_condition_of(rec)
+        kind = rec.get("kind", "cgats")
+        for pt in rec.get("patches", []):
+            for f in check_patch(pt, declared, paper_white_lab, kind):
+                verdict.add(f)
+        for reason in check_outliers(rec.get("patches", [])):
+            verdict.add(PatchFinding(reason, "warning"))
+        verdicts.append(verdict)
+
+    # ---- 第二遍：规则 1 复测一致性（会话级，rejected 不参与配对）----
     repeat_findings: dict[int, list[str]] = {}
+    eligible = [i for i, v in enumerate(verdicts) if v.reliability != "rejected"]
     if repeat_mode:
         by_label: dict[str, list[tuple[int, list[float]]]] = {}
-        for ri, rec in enumerate(records):
-            for pt in rec.get("patches", []):
+        for ri in eligible:
+            for pt in records[ri].get("patches", []):
                 lab = effective_lab(pt)
                 if lab is not None:
                     by_label.setdefault(str(pt.get("label", "")).strip(), []).append((ri, lab))
-        if len(records) >= 2:
+        if len(eligible) >= 2:
             for label, entries in by_label.items():
                 if len(entries) < 2:
                     continue
@@ -266,26 +284,18 @@ def grade_session(session: dict, records: list[dict], paper_white_lab: list[floa
                             f"复测不一致：标签 {label} 跨记录 ΔE={worst:.2f} > {REPEAT_MAX_DE}")
         # 复测模式下无任何可配对同标签（含仅 1 条记录）→ 尚不构成有效复测
         if not any(len(v) >= 2 for v in by_label.values()):
-            for ri in range(len(records)):
+            for ri in eligible:
                 repeat_findings.setdefault(ri, []).append(
                     "复测模式已声明，但未发现可配对的同标签测量（每个目标至少测 2 次）")
     else:
-        for ri in range(len(records)):
+        for ri in eligible:
             repeat_findings.setdefault(ri, []).append("单次测量：未声明复测（建议每个目标至少复测 1 次）")
 
-    # ---- 记录级：规则 3/4/2 + 5 ----
+    # ---- 合并 ----
     for ri, rec in enumerate(records):
-        verdict = RecordVerdict()
-        declared = declared_condition_of(rec)
-        kind = rec.get("kind", "cgats")
-        for pt in rec.get("patches", []):
-            for f in check_patch(pt, declared, paper_white_lab, kind):
-                verdict.add(f)
-        for reason in check_outliers(rec.get("patches", [])):
-            verdict.add(PatchFinding(reason, "warning"))
+        verdict = verdicts[ri]
         for reason in repeat_findings.get(ri, []):
             verdict.add(PatchFinding(reason, "warning"))
-
         rec["reliability"] = verdict.reliability
         rec["density_ok"] = bool(verdict.density_ok)
         rec["reasons"] = verdict.reasons

@@ -24,7 +24,7 @@ ok = True
 # 0. 静态页与 API 健康
 r = client.get("/api/health")
 ok &= check("健康检查", r.status_code == 200 and r.json()["status"] == "ok", r.text[:80])
-ok &= check("版本号 v0.4.0", r.json().get("version") == "0.4.0")
+ok &= check("版本号 v0.5.0", r.json().get("version") == "0.5.0")
 r = client.get("/", follow_redirects=False)
 ok &= check("根路径重定向", r.status_code == 307 and r.headers["location"] == "/static/index.html")
 r = client.get("/static/index.html")
@@ -180,7 +180,122 @@ ok &= check(
 r = client.delete(f"/api/processes/{pid}/compensation")
 ok &= check("补偿模型重置", r.status_code == 200 and r.json()["status"] == "reset")
 
-# 7. 清理
+# 7. V0.5：测量导入 + 可靠性分级（verified / rejected / 门禁）
+E2E_SID = "E2E_QC_SESSION"
+
+
+def _spectral_text(perturb: float = 0.0) -> bytes:
+    fields = "\t".join(["SampleID", "SAMPLE_NAME"] + [f"nm{w}" for w in range(380, 731, 10)])
+    import math
+
+    def row(label, base):
+        vals = [round(min(1.0, base + 0.35 / (1 + math.exp(-(w - 520) / 40))) + perturb, 4)
+                for w in range(380, 731, 10)]
+        return f"1\t{label}\t" + "\t".join(str(v) for v in vals)
+
+    head = (
+        'INSTRUMENTATION\t"Eye-One Pro"\n'
+        'ILLUMINATION_NAME\t"D50"\n'
+        'OBSERVER_ANGLE\t"2"\n'
+        "NUMBER_OF_FIELDS\t38\n"
+        "BEGIN_DATA_FORMAT\n" + fields + "\nEND_DATA_FORMAT\n"
+        "NUMBER_OF_SETS\t2\nBEGIN_DATA\n"
+    )
+    return (head + row("A1", 0.05) + "\n" + row("A2", 0.02) + "\nEND_DATA\n").encode("utf-8")
+
+
+qc_params = {"filename": "e2e_v1.txt", "instrument": "E2E-Probe", "condition": "M1",
+             "calibrated_at": "2026-01-01T08:00:00", "repeat_mode": "single", "process_id": pid}
+r = client.post("/api/qc/measurements/import", params=qc_params, content=_spectral_text(),
+                headers={"Content-Type": "application/octet-stream"})
+ok &= check(
+    "V0.5 测量导入（单次→warning，校准登记生效）",
+    r.status_code == 200 and r.json()["record"]["reliability"] == "warning"
+    and r.json()["session"]["instrument"] == "E2E-Probe",
+    str(r.json().get("record", {}).get("reasons", []))[:60],
+)
+qc_sid = r.json()["session"]["id"]
+r = client.post("/api/qc/measurements/import",
+                params={"filename": "e2e_v2.txt", "session_id": qc_sid, "repeat_mode": "repeat"},
+                content=_spectral_text(), headers={"Content-Type": "application/octet-stream"})
+ok &= check(
+    "V0.5 复测对齐 → 会话 verified",
+    r.status_code == 200 and r.json()["session"]["stats"]["verified"] == 2,
+    str(r.json()["session"]["stats"]),
+)
+
+garbage = ("\n".join([
+    'INSTRUMENTATION\t"Eye-One Pro"', "NUMBER_OF_FIELDS\t11",
+    "BEGIN_DATA_FORMAT",
+    "SampleID\tSAMPLE_NAME\tRGB_R\tRGB_G\tRGB_B\tXYZ_X\tXYZ_Y\tXYZ_Z\tLAB_L\tLAB_A\tLAB_B",
+    "END_DATA_FORMAT", "NUMBER_OF_SETS\t1", "BEGIN_DATA",
+    "1\tA1\t0\t0\t0\t-22.69\t-23.75\t-26.41\t0\t8.58\t305.27",
+    "END_DATA"]) + "\n").encode("utf-8")
+r = client.post("/api/qc/measurements/import",
+                params={"filename": "e2e_bad.txt", "session_id": qc_sid},
+                content=garbage, headers={"Content-Type": "application/octet-stream"})
+ok &= check(
+    "V0.5 垃圾数据 → rejected",
+    r.status_code == 200 and r.json()["record"]["reliability"] == "rejected",
+    str(r.json()["record"]["reasons"])[:60],
+)
+
+r = client.get("/api/qc/measurements")
+ok &= check("V0.5 会话列表", r.status_code == 200 and any(s["id"] == qc_sid for s in r.json()))
+r = client.get("/api/qc/measurements", params={"session_id": qc_sid, "reliability": "rejected"})
+ok &= check("V0.5 会话详情按可靠性过滤", r.status_code == 200 and len(r.json()["records"]) == 1)
+
+# V0.5：ink-quality 只消费 verified
+r = client.get("/api/qc/ink-quality", params={"session_id": qc_sid})
+iq = r.json()
+ok &= check(
+    "V0.5 ink-quality 门禁（本会话无密度数据 → 空指标不误报）",
+    r.status_code == 200 and iq["verified_records"] == 2 and iq["inks"] == {},
+    f"verified={iq['verified_records']} skipped={iq['skipped_records']}",
+)
+
+# V0.5：testform 样张
+r = client.post("/api/qc/testform", params={"process_id": pid})
+tf = r.json()
+ok &= check(
+    "V0.5 验证样张（双点重复 + PDF/TIFF）",
+    r.status_code == 200 and tf["pairs_count"] > 30 and tf["pdf_b64"][:4] == "JVBE"
+    and len(tf["tiff_b64"]) > 10000,
+    f"labels={tf['labels_count'] if 'labels_count' in tf else len(tf['labels'])} pairs={tf['pairs_count']}",
+)
+
+# V0.5：补偿门禁（关联无 verified 的会话 → 不沉淀）
+r = client.post("/api/qc/measurements/import",
+                params={"filename": "e2e_single.txt", "instrument": "E2E-Probe",
+                        "calibrated_at": "2026-01-01T09:00:00", "repeat_mode": "single"},
+                content=_spectral_text(), headers={"Content-Type": "application/octet-stream"})
+gate_sid = r.json()["session"]["id"]
+ok &= check("V0.5 单次会话无 verified（门禁前置）", r.json()["session"]["stats"]["verified"] == 0)
+
+records = client.get("/api/recipes", params={"process_id": pid}).json()
+rid2 = next(x["id"] for x in records if x["label"] == "青")
+pred2 = next(x for x in records if x["id"] == rid2)["predicted_lab"]
+r = client.post(
+    "/api/recipes/verify",
+    json={"recipe_id": rid2, "measured_lab": [pred2[0] + 2.5, pred2[1] - 2.5, pred2[2] + 2.0],
+          "measurement_session_id": gate_sid},
+)
+v = r.json()
+ok &= check(
+    "V0.5 补偿门禁（rejected 会话→修正照常、不沉淀）",
+    r.status_code == 200 and v["improved"] is True
+    and v["compensation_status"]["applied"] is False and v["compensation_status"]["skipped_reason"],
+    f"components dL={v['components']['dL']}",
+)
+ok &= check("V0.5 verify 响应含 ΔE 分量", "components" in v and "dE76" in v["components"]
+            and abs(v["components"]["dL"] - 2.5) < 0.5)
+
+# V0.5 清理 QC 会话
+for sid in (qc_sid, gate_sid):
+    r = client.delete("/api/qc/measurements", params={"session_id": sid})
+    ok &= check("V0.5 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
+
+# 8. 清理
 for p in (pid, pid_b):
     r = client.delete(f"/api/processes/{p}")
     ok &= check("清理工艺", r.status_code == 200)

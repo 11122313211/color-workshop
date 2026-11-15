@@ -1,7 +1,8 @@
 # 色彩工坊 · 印前色彩管理闭环平台
 
-> 面向印前的色彩管理小软件 · V0.4（真 3D 色域 + 精度升级 + 监控闭环）
-> 以 ΔE / CIEDE2000 为统一度量：**目标 LAB → 工艺 ICC 反查最优 CMYK 配方 → 打印实测 → 闭环修正 → 工艺级累积学习**。
+> 面向印前的色彩管理小软件 · V0.5（可信测量闭环：数据可靠性门禁）
+> 以 ΔE / CIEDE2000 为统一度量：**目标 LAB → 工艺 ICC 反查最优 CMYK 配方 → 打印实测 → 闭环修正 → 工艺级累积学习**，
+> 且所有测量数据先过**方法学门禁**（测前登记 → 校准确认 → 测量 → 复测一致性 → 交叉校验 → 可信度分级 → 分级数据流向）。
 
 ## 定位与核心工作流
 
@@ -22,8 +23,9 @@
 |---|---|---|
 | 算法层 | lcms2（经 Pillow ImageCms）+ colour-science + coloraide + scipy | ICC CMM 正向预测、色差、色域采样、Qhull 凸包 |
 | 反查引擎 | 自研（`app/services/recipe.py`） | 粗查表 + 最近邻 + 坐标下降 + **多线性插值精搜层**（插值排序、真实 ΔE 定夺），通道数泛化（CMYK/RGB/GRAY） |
-| 补偿模型 | 自研（`app/services/compensation.py`） | 实测闭环沉淀工艺级墨量偏置（EMA 累积 + sha 失效），预测时自动应用 |
-| 后端 | FastAPI + JSON 落盘（`data/`） | API 服务，工艺库/配方记录/补偿模型重启不丢（损坏自动隔离备份） |
+| 补偿模型 | 自研（`app/services/compensation.py`） | 实测闭环沉淀工艺级墨量偏置（EMA 累积 + sha 失效），预测时自动应用；**V0.5 起受 verified 门禁约束** |
+| 测量可靠性 | 自研（`cgats.py` / `measurement_qa.py` / `measurements.py` / `density.py`） | CGATS.17 / Status-T 解析（编码容错）、五条校验规则分级（verified/warning/rejected）、GATF 油墨指标与 TVI |
+| 后端 | FastAPI + JSON 落盘（`data/`） | API 服务，工艺库/配方记录/补偿模型/测量会话重启不丢（损坏自动隔离备份） |
 | 前端 | 原生 ES Module + Canvas + three.js（vendored，无构建） | iOS 扁平风 SPA，hash 路由，亮/暗主题，2D/真 3D（WebGL）色域组件 |
 
 ## 项目结构
@@ -38,7 +40,12 @@ color-mgmt/
 │   │   ├── filedb.py            # JSON 落盘存储（原子写 + 损坏隔离备份）
 │   │   ├── processes.py         # 工艺库：CRUD/ICC 替换/色域采样（凸包/覆盖率/Qhull 表面）
 │   │   ├── recipe.py            # LAB→CMYK 反查引擎（插值精搜层）+ 配方记录 + 实测验证
-│   │   ├── compensation.py      # 工艺级误差补偿模型（EMA 累积学习）
+│   │   ├── compensation.py      # 工艺级误差补偿模型（EMA 累积学习 + verified 门禁）
+│   │   ├── cgats.py             # 测量导出解析（CGATS.17 / Status-T TSV，编码容错，CIE 积分）
+│   │   ├── measurement_qa.py    # 五条可靠性规则 → verified|warning|rejected
+│   │   ├── measurements.py      # 测量会话存储与导入编排（每次导入全会话重分级）
+│   │   ├── density.py           # GATF 油墨四指标 + Murray–Davies 网点面积 + TVI
+│   │   ├── testform.py          # A4 CMYK 验证样张（双点重复布局，PDF/TIFF）
 │   │   ├── files.py             # 印前预检（图像 + PDF/pypdf）+ 经工艺 ICC 转换（软打样）
 │   │   ├── store.py             # 设备/测量/工作流（V0.1 保留）
 │   │   └── visualization.py     # CIE 色度图、色域数据
@@ -55,7 +62,7 @@ color-mgmt/
 │   └── js/                      # api / router / icons / components / gamut-view / gamut-three / views/*
 ├── scripts/                     # 探针、冒烟、e2e、清理脚本
 ├── data/                        # 运行时数据（工艺 ICC、配方记录、补偿模型）
-└── tests/                       # pytest 64 项（API 层 + 精度基线门禁 + PDF 预检 + fixtures）
+└── tests/                       # pytest 106 项（API 层 + 精度基线门禁 + 测量可靠性 + 样张 + fixtures）
 ```
 
 ## 快速开始
@@ -109,6 +116,23 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 | `/api/files/preflight` | POST | 预检：图像（嵌入 ICC / 模式 / DPI / 主导色）与 PDF（页数/色彩空间/专色/输出意图/缩略图） |
 | `/api/files/convert` | POST | 经工艺 ICC 转换（CMYK 输出 TIFF + 软打样预览 PNG）；PDF 仅预检不支持转换 |
 
+### QC 测量可靠性闭环（V0.5）
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/qc/measurements/import` | POST | 导入测量导出文件（raw bytes；会话登记 instrument/condition M0-M2/calibrated_at/backing/repeat_mode）；每次导入全会话重分级 |
+| `/api/qc/measurements` | GET | 会话列表 / 会话详情（`?session_id=`，可按 reliability 过滤） |
+| `/api/qc/measurements` | DELETE | 删除会话 / 单条记录（删后重分级） |
+| `/api/qc/ink-quality` | GET | GATF 油墨四指标 + Murray–Davies TVI（**仅消费 verified 且密度通道可用**） |
+| `/api/qc/testform` | POST | A4 CMYK 验证样张（设备值直出 + 双点重复布局，PDF/TIFF + mm 级配对坐标表） |
+
+**可靠性分级与数据流向**：每条记录输出 `verified / warning / rejected` + 原因 +
+`density_ok` 通道标记。五条规则：①复测一致性（同标签 ΔE≤0.4）②纸白校验
+（本征合理性 + 工艺 ICC 纸白比对）③交叉校验（Lab↔XYZ 跨条件探测 D50/D65 ×
+2°/10°，全条件失配 → rejected；光谱↔Lab 积分复算）④密度/色度物理量程
+⑤梯尺 3σ(MAD) 离群。**verified → QC 指标/ΔE 分量/补偿沉淀；warning → 仅展示；
+rejected → 可查不可用**。verify 端点可携带 `measurement_session_id` 关联测量会话
+（补偿门禁）。
+
 ### V0.1 端点（保留，供工具箱使用）
 `/api/devices`、`/api/measurements`、`/api/color-checker/detect`、`/api/convert`、
 `/api/correction`、`/api/delta-e`（含 `/lab`）、`/api/closed-loop`、
@@ -128,6 +152,10 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 - 色域外目标不虚假收敛：返回最优可印配方并如实标注 ΔE（≤2 达标 / ≤5 可用 / >5 超差）。
 - 精度基线门禁：`tests/test_precision_baseline.py` + `tests/baselines/precision_baseline.json`
   （V0.4 刷新：域内 ΔE 0.064–0.344；回归阈值 ΔE ≤ 基线 +0.15、墨量分量漂移 ≤2pp）。
+- **测量可靠性（V0.5）**：CIE 积分自实现（380-730nm/10nm，白点与教科书 D50/2°
+  (96.42,100,82.49) 自检一致）；Lab↔XYZ 交叉校验在四个标准条件中寻找一致口径，
+  全条件失配（ΔE>12）判 rejected——直接拦截转录/单位错误；GATF 四指标与
+  Murray–Davies 数值经课程实验组手算对拍。
 - PCS 为 D50 Lab；前端色块与点云经 Bradford 色适应（D50→D65）转 sRGB / display-p3 显示。
 
 ## 版本
@@ -141,12 +169,19 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
   交互基建（模态焦点圈闭 / 骨架屏 / 危险确认弹层 / 375px 适配）、
   测试体系去平台化（50 项，含 API 层与精度基线门禁）。
   路线图见 `docs/V0.3-下一阶段规划.md`
-- **V0.4（当前）**：真 3D + 精度 + 监控闭环 —— three.js 真 3D 色域体积
+- **V0.4**：真 3D + 精度 + 监控闭环 —— three.js 真 3D 色域体积
   （Qhull 包络网格 + Lambert 光照 + L\* 切片 + WebGL 回退链）、插值精搜层
   （打破 8-bit 平台期）+ 精度基线刷新、工艺级补偿模型（累积学习）、
   ΔE 监控面板（趋势 + 漂移告警）、多工艺色域对比（凸包归属 + 交集运算）、
   PDF 印前预检（pypdf + 首页缩略图）、修复凸包索引错位遗留 bug。
   实施记录见 `docs/V0.4-实施规划.md`
+- **V0.5（当前）**：可信测量闭环 —— 实验方法七要素审计（三份课程报告：
+  复测缺失/校准未记录/转录链断裂/口径漂移均转化为产品对策）、CGATS.17 +
+  Status-T 双解析器（编码容错 + CIE 积分自实现）、五条可靠性规则分级
+  （verified/warning/rejected + density_ok 通道标记）、测量会话登记与导入向导、
+  GATF 油墨四指标 + TVI 曲线 + GATF 色轮（只消费 verified）、A4 CMYK 双点
+  重复样张生成器、ΔE 分量分解（dL/da/db/dC/dh/dE76）+ 解读文案、
+  补偿模型 verified 门禁。实施记录见 `docs/V0.5-实施规划.md`
 
 ## 许可
 
