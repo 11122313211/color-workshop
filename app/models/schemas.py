@@ -308,6 +308,8 @@ class RecipePredictResponse(BaseModel):
 class RecipeVerifyRequest(BaseModel):
     recipe_id: str
     measured_lab: tuple[float, float, float]
+    #: 关联测量会话（V0.5 补偿门禁）：提供时仅当会话含 verified 记录才沉淀补偿
+    measurement_session_id: str = ""
 
 
 class RecipeVerifyResponse(BaseModel):
@@ -319,6 +321,10 @@ class RecipeVerifyResponse(BaseModel):
     corrected_predicted_lab: list[float]
     improved: bool
     verification: dict
+    #: V0.5：ΔE 分量分解（dL/da/db/dC/dh/dE76，实测−预测）
+    components: Optional[dict] = None
+    #: V0.5：补偿门禁结果 {applied, n, skipped_reason}
+    compensation_status: Optional[dict] = None
 
 
 class PreflightRequest(BaseModel):

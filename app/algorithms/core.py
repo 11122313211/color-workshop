@@ -133,6 +133,34 @@ def delta_e_batch(lab1, lab2, method: str = "cie2000") -> np.ndarray:
     return np.asarray(colour.delta_E(lab1, lab2, method=m), dtype=np.float64)
 
 
+def delta_e_components(lab1, lab2) -> dict:
+    """ΔE 分量分解（解读辅助；ΔE2000 主口径不变）。
+
+    lab1 为参考/预测值，lab2 为实测值，分量为「实测 − 参考」：
+    dL/da/db、dC（彩度差）、dh（色相角差，(−180,180]°）、dE76（ΔE1976 总色差）。
+    """
+    lab1 = np.asarray(lab1, dtype=np.float64)
+    lab2 = np.asarray(lab2, dtype=np.float64)
+    dL, da, db = (lab2 - lab1).tolist()
+    c1 = float(np.hypot(lab1[1], lab1[2]))
+    c2 = float(np.hypot(lab2[1], lab2[2]))
+    h1 = float(np.degrees(np.arctan2(lab1[2], lab1[1])))
+    h2 = float(np.degrees(np.arctan2(lab2[2], lab2[1])))
+    dh = h2 - h1
+    if dh > 180.0:
+        dh -= 360.0
+    elif dh <= -180.0:
+        dh += 360.0
+    return {
+        "dL": round(float(dL), 4),
+        "da": round(float(da), 4),
+        "db": round(float(db), 4),
+        "dC": round(c2 - c1, 4),
+        "dh": round(dh, 4),
+        "dE76": round(float(np.linalg.norm(lab2 - lab1)), 4),
+    }
+
+
 def delta_e_from_rgb(
     rgb1, rgb2,
     space: str = "srgb",

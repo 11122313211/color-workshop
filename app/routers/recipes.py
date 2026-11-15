@@ -221,6 +221,16 @@ def verify(req: RecipeVerifyRequest):
     if not proc:
         raise HTTPException(404, "配方所属工艺已被删除")
 
+    # V0.5 补偿门禁：关联测量会话时，仅当会话含 verified 记录才允许补偿沉淀
+    comp_session = None
+    if req.measurement_session_id:
+        from ..services.measurements import MeasurementStore
+
+        comp_session = MeasurementStore().get_session(req.measurement_session_id)
+        if comp_session is None:
+            raise HTTPException(404, "关联测量会话不存在")
+    comp_verified = bool(comp_session and (comp_session.get("stats") or {}).get("verified", 0) > 0)
+
     icc_bytes = _processes.icc_bytes(doc["process_id"])
     verification = run_verification(
         icc_bytes,
@@ -230,18 +240,29 @@ def verify(req: RecipeVerifyRequest):
         tolerance=doc.get("tolerance", 2.0),
         method=doc.get("method", "cie2000"),
     )
+    # ΔE 分量分解（实测 − 预测），解读辅助
+    from ..algorithms.core import delta_e_components
+
+    components = delta_e_components(doc["predicted_lab"], req.measured_lab)
     recipe_store.append_verification(req.recipe_id, verification)
 
     # 工艺级补偿模型：修正有效时把「修正配方 − 原配方」累积进设备空间偏置
+    comp_status = {"applied": False, "n": None, "skipped_reason": ""}
     if verification["improved"]:
         channels = proc["icc_meta"]["channels"]
         names = CHANNEL_NAMES.get(channels, [])
-        if names:
+        if names and (comp_session is None or comp_verified):
             delta_device = [
                 (verification["corrected_recipe"].get(n, 0.0) - doc["recipe"].get(n, 0.0)) / 100.0
                 for n in names
             ]
-            _compensations.accumulate(doc["process_id"], proc["icc_sha256"], delta_device)
+            bias_doc = _compensations.accumulate(doc["process_id"], proc["icc_sha256"], delta_device)
+            comp_status = {"applied": True, "n": bias_doc.get("n") if bias_doc else None, "skipped_reason": ""}
+        elif names and not comp_verified:
+            comp_status = {
+                "applied": False, "n": None,
+                "skipped_reason": "关联测量会话无 verified 记录——补偿不沉淀（可信测量闭环门禁）",
+            }
 
     return RecipeVerifyResponse(
         recipe_id=req.recipe_id,
@@ -252,4 +273,6 @@ def verify(req: RecipeVerifyRequest):
         corrected_predicted_lab=verification["corrected_predicted_lab"],
         improved=verification["improved"],
         verification=verification,
+        components=components,
+        compensation_status=comp_status,
     )

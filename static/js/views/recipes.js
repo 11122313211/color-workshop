@@ -306,11 +306,27 @@ function resultCard(r, idx) {
 }
 
 function verificationBlock(v) {
+  const c = v.components;
+  const compStatus = v.compensation_status || {};
+  const compChip = compStatus.applied
+    ? `<span class="chip" style="background:var(--green-soft); color:var(--green)">补偿已沉淀 n=${compStatus.n}</span>`
+    : compStatus.skipped_reason
+      ? `<div class="issue issue-warn" style="margin-top:10px">${icon("warn")}<span>${esc(compStatus.skipped_reason)}</span></div>`
+      : "";
+  const interp = [];
+  if (c) {
+    if (Math.abs(c.dL) >= 0.5) interp.push(`实测偏${c.dL > 0 ? "亮" : "暗"}（ΔL ${c.dL > 0 ? "+" : ""}${c.dL}）`);
+    if (Math.abs(c.dC) >= 0.5) interp.push(`饱和度偏${c.dC > 0 ? "高" : "低"}（ΔC ${c.dC > 0 ? "+" : ""}${c.dC}）`);
+    if (Math.abs(c.dh) >= 1) interp.push(`色相偏移 ${c.dh > 0 ? "+" : ""}${c.dh}°`);
+    if (!interp.length) interp.push("各分量均在阈值内，偏差以明度/彩度微差为主");
+  }
   return `<div class="disclosure open" style="margin-top:14px">
     <div class="disclosure-body">
       <div class="issue ${v.improved ? "issue-info" : "issue-warn"}">${icon(v.improved ? "check" : "warn")}
         <span>实测 ΔE <b>${v.delta_e_measured}</b> → 修正配方后预测 ΔE <b>${v.delta_e_corrected}</b>（模型误差 ${v.delta_e_model_error}）${v.improved ? "，建议采用修正配方" : "，修正收益有限，建议重测"}</span>
       </div>
+      ${c ? `<p class="swatch-meta" style="margin-top:8px">分量（实测−预测）：ΔL ${c.dL} · Δa ${c.da} · Δb ${c.db} · ΔC ${c.dC} · Δh ${c.dh}° · ΔE76 ${c.dE76}${interp.length ? ` — ${interp.join("，")}` : ""}</p>` : ""}
+      ${compChip}
       <div style="margin-top:10px">${recipeLine(v.corrected_recipe)}</div>
     </div>
   </div>`;
@@ -333,11 +349,30 @@ function openVerifyModal(view, r, idx) {
       <input class="input" id="vm-b" type="number" step="0.1" placeholder="b">
       <span></span><span></span>
     </div>
+    <div class="field" id="vm-sess-field" style="margin-top:12px">
+      <label>关联测量会话（可选 — 补偿门禁）</label>
+      <select id="vm-sess" class="input"><option value="">不关联（修正照常，补偿沉淀不受限）</option></select>
+      <p class="swatch-meta" style="margin-top:4px">关联后仅当会话含 <b>verified</b> 测量（复测一致 + 交叉校验通过）时，修正才会沉淀进工艺补偿模型。</p>
+    </div>
     <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:16px">
       <button class="btn btn-ghost" id="vm-cancel">取消</button>
       <button class="btn" id="vm-ok">提交验证</button>
     </div>
   `);
+
+  // 测量会话下拉（有 verified 记录的会话优先展示）
+  apiGet("/api/qc/measurements").then((sessions) => {
+    const sel = m.modal.querySelector("#vm-sess");
+    for (const s of sessions) {
+      const hasVerified = (s.stats || {}).verified > 0;
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = `${s.instrument} · ${s.condition} · ${hasVerified ? `verified ${s.stats.verified}` : "无 verified"}${hasVerified ? " ✓" : ""}`;
+      sel.appendChild(opt);
+    }
+  }).catch(() => {
+    m.modal.querySelector("#vm-sess-field").hidden = true;
+  });
 
   // 预填当前预测值，方便演示
   m.modal.querySelector("#vm-l").value = r.predicted_lab[0];
@@ -359,7 +394,11 @@ function openVerifyModal(view, r, idx) {
         (d) => d.target_lab[0] === r.target_lab[0] && d.target_lab[1] === r.target_lab[1] && d.target_lab[2] === r.target_lab[2]
       );
       if (!doc) throw new Error("未找到对应配方记录，请重新预测");
-      const v = await apiPost("/api/recipes/verify", { recipe_id: doc.id, measured_lab: lab });
+      const v = await apiPost("/api/recipes/verify", {
+        recipe_id: doc.id,
+        measured_lab: lab,
+        measurement_session_id: m.modal.querySelector("#vm-sess").value || "",
+      });
       r._lastVerification = v;
       m.close();
       renderResults(view, state.results);
