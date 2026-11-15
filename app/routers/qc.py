@@ -128,6 +128,25 @@ def ink_quality(
     return result
 
 
+@router.post("/testform")
+def make_testform(
+    process_id: str = Query(..., description="工艺 id（页眉标注工艺名）"),
+    dpi: int = Query(300, ge=150, le=600, description="输出分辨率"),
+):
+    """生成 A4 CMYK 验证样张（设备值直出 + 双点重复布局）。
+
+    返回 PDF（打印用）+ TIFF（工艺流程回传）+ PNG 预览 + 双点配对坐标表。
+    """
+    proc = _processes.get(process_id)
+    if proc is None:
+        raise HTTPException(404, "工艺不存在")
+    from ..services.testform import generate_testform
+
+    result = generate_testform(process_name=proc.get("name", ""), dpi=dpi)
+    result["process"] = {"id": proc["id"], "name": proc.get("name", "")}
+    return result
+
+
 @router.delete("/measurements")
 def delete_measurement(
     session_id: str = Query(..., description="会话 id"),

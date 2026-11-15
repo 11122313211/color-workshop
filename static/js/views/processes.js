@@ -6,6 +6,7 @@
 
 import {
   apiGet, apiPatch, apiDelete, apiUploadICC, apiReplaceICC, fileToArrayBuffer,
+  apiPostRaw, downloadDataUri,
 } from "../api.js";
 import { icon } from "../icons.js";
 import {
@@ -504,9 +505,63 @@ function compensationCard(p) {
     </div>`;
 }
 
+/* 验证样张模态（V0.5 M3）：双点重复布局的 A4 CMYK 样张，PDF/TIFF 下载 */
+async function openTestformModal(view, p) {
+  const modal = openModal(`
+    <h3 class="title">${icon("doc")}生成验证样张 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
+    <p class="swatch-meta" style="margin-top:4px">A4 CMYK · 设备值直出（不做 ICC 转换，测的是设备自身表现）。
+      每个测量目标左右双点重复——打印后逐点测量并导入「监控 → 测量数据」，同标签两点自动构成复测对。</p>
+    <div style="display:flex; align-items:center; gap:10px; margin-top:12px">
+      <div class="field" style="margin:0">
+        <label>分辨率</label>
+        <select id="tf-dpi" class="input"><option>300</option><option>600</option></select>
+      </div>
+      <span style="flex:1"></span>
+      <button class="btn btn-secondary" data-tf-close type="button">关闭</button>
+      <button class="btn tf-go" type="button">${icon("printer")}生成样张</button>
+    </div>
+    <div id="tf-result" style="margin-top:14px"></div>
+  `);
+  const $ = (sel) => modal.modal.querySelector(sel);
+
+  $(".tf-go").addEventListener("click", async () => {
+    const dpi = Number($("#tf-dpi").value || 300);
+    const goBtn = $(".tf-go");
+    goBtn.disabled = true;
+    $("#tf-result").innerHTML = `<p class="swatch-meta">生成中…</p>`;
+    try {
+      const res = await apiPostRaw("/api/qc/testform", { process_id: p.id, dpi }, new Uint8Array(0));
+      const pairs = res.pairs || [];
+      $("#tf-result").innerHTML = `
+        <img src="${res.preview_b64}" alt="样张预览"
+          style="width:100%; max-width:340px; display:block; margin:0 auto; border-radius:10px; border:1px solid var(--separator)">
+        <div class="swatch-meta" style="margin-top:10px">
+          ${res.page_mm[0]}×${res.page_mm[1]}mm @${res.dpi}dpi · ${res.labels.length} 种标签 · ${pairs.length} 个双点复测对
+        </div>
+        <div style="display:flex; gap:10px; margin-top:12px; flex-wrap:wrap">
+          <button class="btn tf-pdf" type="button">${icon("download")}下载 PDF（打印）</button>
+          <button class="btn btn-secondary tf-tiff" type="button">${icon("download")}下载 TIFF</button>
+        </div>
+        <details style="margin-top:10px"><summary class="swatch-meta">双点配对坐标（mm）</summary>
+          <div class="kv-list swatch-meta" style="max-height:180px; overflow:auto; margin-top:6px">
+            ${pairs.slice(0, 60).map((q) => `<div class="chip chip-mono">${esc(q.label)}: A(${q.pos_a_mm.join(",")}) ↔ B(${q.pos_b_mm.join(",")})</div>`).join(" ")}
+          </div>
+        </details>`;
+      $(".tf-pdf").addEventListener("click", () =>
+        downloadDataUri(`data:application/pdf;base64,${res.pdf_b64}`, `testform-${p.name}-${dpi}dpi.pdf`));
+      $(".tf-tiff").addEventListener("click", () =>
+        downloadDataUri(`data:image/tiff;base64,${res.tiff_b64}`, `testform-${p.name}-${dpi}dpi.tif`));
+    } catch (e) {
+      $("#tf-result").innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
+    }
+    goBtn.disabled = false;
+  });
+
+  modal.modal.querySelector("[data-tf-close]").addEventListener("click", () => modal.close());
+}
+
 /* 色域对比模态（V0.4）：双工艺凸包叠加 + 交集多边形 + xy 面积指标 */
-async function openCompareModal(view, p) {
-  let others = [];
+async function openCompareModal(view, p) {  let others = [];
   try {
     others = (await apiGet("/api/processes")).filter((x) => x.id !== p.id);
   } catch (_) { /* 列表失败也可手动刷新重试 */ }
@@ -649,6 +704,7 @@ export async function renderProcessDetail(view, params) {
             <span><i class="dot legend-srgb"></i>sRGB</span>
             <span><i class="dot legend-proc"></i>工艺凸包 · 采样点按 L* 着色</span>
           </div>
+          <button class="btn btn-secondary btn-sm" id="btn-testform">${icon("doc")}生成验证样张</button>
           <button class="btn btn-secondary btn-sm" id="btn-compare">${icon("compare")}色域对比</button>
         </div>
       </div>
@@ -713,6 +769,7 @@ export async function renderProcessDetail(view, params) {
     openProcessEditor(view, { mode: "edit", process: p, onDone: reload })
   );
   view.querySelector("#btn-compare").addEventListener("click", () => openCompareModal(view, p));
+  view.querySelector("#btn-testform").addEventListener("click", () => openTestformModal(view, p));
   view.querySelector("#btn-delete").addEventListener("click", async () => {
     const ok = await confirmDanger({
       title: `删除工艺「${p.name}」？`,
