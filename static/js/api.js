@@ -30,6 +30,16 @@ export function apiPost(path, body) {
   });
 }
 
+/** POST 原始字节（query 参数携带元数据，Content-Type: application/octet-stream） */
+export function apiPostRaw(path, query, bytes) {
+  const qs = new URLSearchParams(query);
+  return request(`${path}?${qs.toString()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: bytes,
+  });
+}
+
 export function apiDelete(path) {
   return request(path, { method: "DELETE" });
 }

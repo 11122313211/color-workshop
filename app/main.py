@@ -23,6 +23,7 @@ from .routers import (
     router_processes,
     router_recipes,
     router_files,
+    router_qc,
 )
 
 app = FastAPI(
@@ -43,6 +44,7 @@ app.include_router(router_system)
 app.include_router(router_processes)
 app.include_router(router_recipes)
 app.include_router(router_files)
+app.include_router(router_qc)
 app.include_router(router_devices)
 app.include_router(router_measurements)
 app.include_router(router_color_checker)
