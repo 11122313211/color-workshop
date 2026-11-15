@@ -1,6 +1,6 @@
 # 色彩工坊 · 印前色彩管理闭环平台
 
-> 面向印前的色彩管理小软件 · V0.5（可信测量闭环：数据可靠性门禁）
+> 面向印前的色彩管理小软件 · V0.6（闭环后半环：从分级数据走向诊断与修正）
 > 以 ΔE / CIEDE2000 为统一度量：**目标 LAB → 工艺 ICC 反查最优 CMYK 配方 → 打印实测 → 闭环修正 → 工艺级累积学习**，
 > 且所有测量数据先过**方法学门禁**（测前登记 → 校准确认 → 测量 → 复测一致性 → 交叉校验 → 可信度分级 → 分级数据流向）。
 
@@ -25,6 +25,7 @@
 | 反查引擎 | 自研（`app/services/recipe.py`） | 粗查表 + 最近邻 + 坐标下降 + **多线性插值精搜层**（插值排序、真实 ΔE 定夺），通道数泛化（CMYK/RGB/GRAY） |
 | 补偿模型 | 自研（`app/services/compensation.py`） | 实测闭环沉淀工艺级墨量偏置（EMA 累积 + sha 失效），预测时自动应用；**V0.5 起受 verified 门禁约束** |
 | 测量可靠性 | 自研（`cgats.py` / `measurement_qa.py` / `measurements.py` / `density.py`） | CGATS.17 / Status-T 解析（编码容错）、五条校验规则分级（verified/warning/rejected）、GATF 油墨指标与 TVI |
+| QC 诊断与评价 | 自研（`diagnosis.py` / `qc_compare.py` / `evaluations.py` / `testform.py`） | 规则型诊断引擎（R1-R8 行业标准口径）、双会话指标 Δ 对比与工艺趋势、GB/T 34053 主观评价检查单、双点样张 + 目视诊断页 |
 | 后端 | FastAPI + JSON 落盘（`data/`） | API 服务，工艺库/配方记录/补偿模型/测量会话重启不丢（损坏自动隔离备份） |
 | 前端 | 原生 ES Module + Canvas + three.js（vendored，无构建） | iOS 扁平风 SPA，hash 路由，亮/暗主题，2D/真 3D（WebGL）色域组件 |
 
@@ -44,8 +45,11 @@ color-mgmt/
 │   │   ├── cgats.py             # 测量导出解析（CGATS.17 / Status-T TSV，编码容错，CIE 积分）
 │   │   ├── measurement_qa.py    # 五条可靠性规则 → verified|warning|rejected
 │   │   ├── measurements.py      # 测量会话存储与导入编排（每次导入全会话重分级）
-│   │   ├── density.py           # GATF 油墨四指标 + Murray–Davies 网点面积 + TVI
-│   │   ├── testform.py          # A4 CMYK 验证样张（双点重复布局，PDF/TIFF）
+│   │   ├── density.py           # GATF 四指标 + TVI + 反差率 K / 叠印率 / 灰平衡 / 均匀性（V0.6）
+│   │   ├── diagnosis.py         # 规则型印刷诊断引擎 R1-R8（行业标准口径，V0.6）
+│   │   ├── qc_compare.py        # 双会话指标 Δ 对比 + 工艺趋势时间序列（V0.6）
+│   │   ├── evaluations.py       # 主观评价检查单（GB/T 34053 方法论，V0.6）
+│   │   ├── testform.py          # A4 CMYK 验证样张（双点重复 + 75% 梯级 + 目视诊断页，PDF/TIFF）
 │   │   ├── files.py             # 印前预检（图像 + PDF/pypdf）+ 经工艺 ICC 转换（软打样）
 │   │   ├── store.py             # 设备/测量/工作流（V0.1 保留）
 │   │   └── visualization.py     # CIE 色度图、色域数据
@@ -62,7 +66,7 @@ color-mgmt/
 │   └── js/                      # api / router / icons / components / gamut-view / gamut-three / views/*
 ├── scripts/                     # 探针、冒烟、e2e、清理脚本
 ├── data/                        # 运行时数据（工艺 ICC、配方记录、补偿模型）
-└── tests/                       # pytest 106 项（API 层 + 精度基线门禁 + 测量可靠性 + 样张 + fixtures）
+└── tests/                       # pytest 154 项（API 层 + 精度基线门禁 + 测量可靠性 + 诊断 + 评价 + fixtures）
 ```
 
 ## 快速开始
@@ -116,22 +120,34 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 | `/api/files/preflight` | POST | 预检：图像（嵌入 ICC / 模式 / DPI / 主导色）与 PDF（页数/色彩空间/专色/输出意图/缩略图） |
 | `/api/files/convert` | POST | 经工艺 ICC 转换（CMYK 输出 TIFF + 软打样预览 PNG）；PDF 仅预检不支持转换 |
 
-### QC 测量可靠性闭环（V0.5）
+### QC 测量可靠性闭环（V0.5 / V0.6）
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/api/qc/measurements/import` | POST | 导入测量导出文件（raw bytes；会话登记 instrument/condition M0-M2/calibrated_at/backing/repeat_mode）；每次导入全会话重分级 |
 | `/api/qc/measurements` | GET | 会话列表 / 会话详情（`?session_id=`，可按 reliability 过滤） |
 | `/api/qc/measurements` | DELETE | 删除会话 / 单条记录（删后重分级） |
-| `/api/qc/ink-quality` | GET | GATF 油墨四指标 + Murray–Davies TVI（**仅消费 verified 且密度通道可用**） |
-| `/api/qc/testform` | POST | A4 CMYK 验证样张（设备值直出 + 双点重复布局，PDF/TIFF + mm 级配对坐标表） |
+| `/api/qc/ink-quality` | GET | GATF 四指标 + TVI + 反差率 K / 叠印率 / 灰平衡偏移 / 实地均匀性 + **诊断结论**（仅消费 verified 且密度通道可用） |
+| `/api/qc/testform` | POST | A4 CMYK 验证样张（设备值直出 + 双点重复布局 + 75% 梯级；第二页目视诊断区：星标/细线/套准） |
+| `/api/qc/compare` | GET | 双会话指标 Δ 表（K/TVI/色强度/灰度/叠印率，Δ=主−对比） |
+| `/api/qc/trend` | GET | 工艺绑定会话的时间序列（每会话现场计算，不落库） |
+| `/api/qc/evaluations/templates` | GET | 主观评价模板（书刊/纸包装/塑料包装）与 5 级打分制说明 |
+| `/api/qc/evaluations` | POST/GET/DELETE | 创建 / 列表 / 详情（含统计）/ 删除主观评价 |
+| `/api/qc/evaluations/entries` | POST | 录入评价人打分（JSON body `{指标: 1-5}`） |
 
 **可靠性分级与数据流向**：每条记录输出 `verified / warning / rejected` + 原因 +
-`density_ok` 通道标记。五条规则：①复测一致性（同标签 ΔE≤0.4）②纸白校验
-（本征合理性 + 工艺 ICC 纸白比对）③交叉校验（Lab↔XYZ 跨条件探测 D50/D65 ×
-2°/10°，全条件失配 → rejected；光谱↔Lab 积分复算）④密度/色度物理量程
-⑤梯尺 3σ(MAD) 离群。**verified → QC 指标/ΔE 分量/补偿沉淀；warning → 仅展示；
-rejected → 可查不可用**。verify 端点可携带 `measurement_session_id` 关联测量会话
-（补偿门禁）。
+`density_ok` 通道标记。五条规则：①复测一致性（同标签 ΔE≤0.4；**V0.6 起纯密度
+记录按滤色密度通道配对，差 ≤0.05**）②纸白校验（本征合理性 + 工艺 ICC 纸白比对）
+③交叉校验（Lab↔XYZ 跨条件探测 D50/D65 × 2°/10°，全条件失配 → rejected；
+光谱↔Lab 积分复算）④密度/色度物理量程 ⑤梯尺 3σ(MAD) 离群。
+**verified → QC 指标/ΔE 分量/补偿沉淀；warning → 仅展示；rejected → 可查不可用**。
+verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门禁）。
+
+**QC 诊断引擎（V0.6，R1-R8）**：量化常量取自行业标准——TVI 中间调目标 16%±3%
+（ISO 12647-2:2013）、反差率 K≥0.40 / ΔK±10%、叠印率 ≥60%、灰平衡 |a*|,|b*|≤1.0
+（GB/T 17934.2 精神）、实地 CV≤5%；每条结论含证据/成因/建议/依据，
+缺数据给 info 指引（生成 V0.6 样张即可补齐 75% 梯级/叠印块/灰平衡块）。
+**主观评价（GB/T 34053 方法论）**：多评价人独立 5 级打分 → 每指标算术平均 +
+标准差（σ>0.8 提示打分分歧）。
 
 ### V0.1 端点（保留，供工具箱使用）
 `/api/devices`、`/api/measurements`、`/api/color-checker/detect`、`/api/convert`、
@@ -155,7 +171,11 @@ rejected → 可查不可用**。verify 端点可携带 `measurement_session_id`
 - **测量可靠性（V0.5）**：CIE 积分自实现（380-730nm/10nm，白点与教科书 D50/2°
   (96.42,100,82.49) 自检一致）；Lab↔XYZ 交叉校验在四个标准条件中寻找一致口径，
   全条件失配（ΔE>12）判 rejected——直接拦截转录/单位错误；GATF 四指标与
-  Murray–Davies 数值经课程实验组手算对拍。
+  Murray–Davies 数值经手算对拍。
+- **QC 指标与诊断（V0.6）**：反差率 K / 叠印率（第二印色滤色通道口径）/ 灰平衡
+  a\*b\* 偏移 / 实地均匀性（样本标准差 CV）全部经手算锚点对拍；诊断规则常量取自
+  ISO 12647-2:2013 / GB/T 17934.2 / GATF 口径并在结论中标注依据；纯密度复测
+  配对（密度差 ≤0.05）打通密度计工作流。
 - PCS 为 D50 Lab；前端色块与点云经 Bradford 色适应（D50→D65）转 sRGB / display-p3 显示。
 
 ## 版本
@@ -175,13 +195,20 @@ rejected → 可查不可用**。verify 端点可携带 `measurement_session_id`
   ΔE 监控面板（趋势 + 漂移告警）、多工艺色域对比（凸包归属 + 交集运算）、
   PDF 印前预检（pypdf + 首页缩略图）、修复凸包索引错位遗留 bug。
   实施记录见 `docs/V0.4-实施规划.md`
-- **V0.5（当前）**：可信测量闭环 —— 实验方法七要素审计（三份课程报告：
+- **V0.5**：可信测量闭环 —— 实验方法七要素审计（三份课程报告：
   复测缺失/校准未记录/转录链断裂/口径漂移均转化为产品对策）、CGATS.17 +
   Status-T 双解析器（编码容错 + CIE 积分自实现）、五条可靠性规则分级
   （verified/warning/rejected + density_ok 通道标记）、测量会话登记与导入向导、
   GATF 油墨四指标 + TVI 曲线 + GATF 色轮（只消费 verified）、A4 CMYK 双点
   重复样张生成器、ΔE 分量分解（dL/da/db/dC/dh/dE76）+ 解读文案、
   补偿模型 verified 门禁。实施记录见 `docs/V0.5-实施规划.md`
+- **V0.6（当前）**：闭环后半环——从分级数据走向诊断与修正 —— QC 指标补全
+  （反差率 K / 油墨叠印率 / 灰平衡 a\*b\* 偏移 / 实地均匀性，样张补 75% 梯级）、
+  规则型诊断引擎 R1-R8（ISO 12647-2 / GB/T 17934.2 / GATF 口径，结论含
+  证据/成因/建议/依据）、双会话 Δ 对比 + 工艺趋势时间序列（定期抽检监控暗调）、
+  主观评价检查单（GB/T 34053：多评价人 5 级打分 → 均值±标准差 + 一致性预警）、
+  样张目视诊断页（星标 / 0.01-0.6pt 细线 / 套准标记）、纯密度复测配对
+  （密度计工作流进 verified）。实施记录见 `docs/V0.6-实施规划.md`
 
 ## 许可
 

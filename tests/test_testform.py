@@ -36,6 +36,10 @@ def test_pdf_and_tiff_readable(form):
     assert img.mode == "CMYK"
     w, h = img.size
     assert w == 2480 and h == 3508  # A4 @300dpi
+    # V0.6：多页（第二页目视诊断区）
+    assert getattr(img, "n_frames", 1) == 2
+    img.seek(1)
+    assert img.size == (w, h)
     preview = Image.open(io.BytesIO(base64.b64decode(form["preview_b64"].split(",", 1)[1])))
     assert preview.mode == "RGB"
 
@@ -63,14 +67,18 @@ def test_patch_values_direct_device(form):
 
 
 def test_tvi_labels_compatible_with_m2(form):
-    """梯尺标签可直接被 M2 parse_ink_label 识别并配对 TVI（K 梯尺不参与 TVI）。"""
+    """梯尺标签可直接被 parse_ink_label 识别并配对 TVI（V0.6 起黑版也参与）。"""
     from app.services.density import parse_ink_label
 
     for label in ("c60", "m30", "y40"):
         channel, nominal = parse_ink_label(label)
         assert nominal is not None and channel in "CMY"
-    # K 梯尺标签不属于 TVI 目标（ink_metrics 需 C/M/Y 三滤色，会被聚合器自然跳过）
-    assert parse_ink_label("k100")[1] is None
+    # V0.6：黑版纳入解析——k100/k75 是合法网点标签（供 K 值与黑版 TVI）
+    assert parse_ink_label("k100") == ("K", 100)
+    assert parse_ink_label("k75") == ("K", 75)
+    # 75% 梯级存在（相对反差 K 的关键控制点）
+    assert "c75" in form["labels"] and "k75" in form["labels"]
+    assert 75 in _INK_STEPS and len(_INK_STEPS) == 12
 
 
 def test_dpi_scaling():

@@ -1,4 +1,4 @@
-"""测试样张生成器（V0.5 可信测量闭环 · M3，方法标准化的载体）。
+"""测试样张生成器（V0.5 可信测量闭环 · M3，V0.6 目视诊断扩展）。
 
 Pillow CMYK 栅格样张（A4 / 300dpi），**设备值直出**（不做 ICC 转换——
 样张测的是设备自身表现），每个测量目标**双点重复布局**（同标签左右两份），
@@ -6,18 +6,26 @@ Pillow CMYK 栅格样张（A4 / 300dpi），**设备值直出**（不做 ICC 转
 
 布局（左右两个对称半版，内容一致）：
 - 实地/叠印条：C M Y K R(M+Y) G(C+Y) B(C+M) W(纸白)；
-- 梯尺：C/M/Y/K 各 0→100 共 11 级（标签 c0..c100 / m0.. / y0.. / k0..，
-  与 M2 的 parse_ink_label 直接兼容）；
+- 梯尺：C/M/Y/K 各 12 级（0→100 步 10 + 75——75% 梯级供相对反差 K 值计算，
+  标签 c0..c100 / m0.. / y0.. / k0..，与 density.parse_ink_label 直接兼容）；
 - 灰平衡格：GB1(C50M40Y40) GB2(C60M50Y50) GB3(C25M20Y20)；
 - 角线、页眉（工艺名 + 日期）与页脚说明。
 
-输出 TIFF + PDF（Pillow 原生 CMYK PDF 编码，单页无需 pypdf 组页）。
+第二页「目视诊断区」（V0.6，方法源自 ISO300 类测试版与 GATF 判读口诀）：
+- 星标 ×2（约 35:1 形变放大：中心均匀黑化=网点增大、方向性楔形=滑版/条杠、
+  偏向非对称=重影、中心白点扩大=网点收缩）；
+- 正向/反白细线组（0.01/0.05/0.4/0.6pt，横向+纵向，极细网点还原考核）；
+- 套准标记（圆/三角撞色叠印 + 十字圆环，量化套印误差）。
+目视目标不进 labels/pairs（不做测量配对）。
+
+输出 TIFF + PDF（Pillow 原生 CMYK 多页编码，无需 pypdf 组页），预览为第一页。
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import math
 from datetime import date
 
 from PIL import Image, ImageDraw, ImageFont
@@ -25,7 +33,8 @@ from PIL import Image, ImageDraw, ImageFont
 DPI_DEFAULT = 300
 PAGE_MM = (210.0, 297.0)
 
-_INK_STEPS = list(range(0, 101, 10))
+# 0→100 步 10 + 75：75% 是相对反差 K=(Ds−D75)/Ds 的关键控制点
+_INK_STEPS = sorted(set(list(range(0, 101, 10)) + [75]))
 # CMYK 元组顺序 (C, M, Y, K)；R=M100Y100，G=C100Y100，B=C100M100
 _SOLIDS = [
     ("C", (255, 0, 0, 0)),
@@ -80,9 +89,9 @@ def _draw_half(draw: ImageDraw.ImageDraw, x0: int, y0: int, w: int, font: ImageF
         positions.append((label, x + size // 2, y + size // 2))
         x += size + 8
 
-    # 梯尺：每色一行 11 级
+    # 梯尺：每色一行 12 级（含 75%）
     y += size + 34
-    step_w = (w - 10 * 6) // 11
+    step_w = (w - (len(_INK_STEPS) - 1) * 6) // len(_INK_STEPS)
     for ch, name in enumerate("CMYK"):
         row_y = y + ch * 92
         for i, v in enumerate(_INK_STEPS):
@@ -103,6 +112,126 @@ def _draw_half(draw: ImageDraw.ImageDraw, x0: int, y0: int, w: int, font: ImageF
         draw.text((xx + size / 2, y + size + 4), label, font=small, fill=(0, 0, 0, 255), anchor="ma")
         positions.append((label, xx + size // 2, y + size // 2))
     return positions
+
+
+# ---------------------------------------------------------------------------
+# 第二页：目视诊断区（星标 / 细线 / 套准，不参与测量配对）
+# ---------------------------------------------------------------------------
+
+# 星标：36 细楔形（黑:白 ≈ 36%），约 35:1 形变放大
+_STAR_WEDGES = 36
+_FINE_WIDTHS_PT = (0.01, 0.05, 0.4, 0.6)
+
+
+def _draw_star_target(draw: ImageDraw.ImageDraw, cx: int, cy: int, r: int, dpi: int) -> None:
+    """GATF 星标：楔形自中心放射，中心小白点（网点收缩时白点扩大）。"""
+    for i in range(_STAR_WEDGES):
+        a0 = i * (2 * math.pi / _STAR_WEDGES)
+        a1 = a0 + math.radians(3.6)
+        pts = [(cx, cy),
+               (cx + r * math.cos(a0), cy + r * math.sin(a0)),
+               (cx + r * math.cos(a1), cy + r * math.sin(a1))]
+        draw.polygon(pts, fill=(0, 0, 0, 255))
+    rc = round(1.5 / 25.4 * dpi)
+    draw.ellipse([cx - rc, cy - rc, cx + rc, cy + rc], fill=(0, 0, 0, 0))
+
+
+def _draw_fine_lines(draw: ImageDraw.ImageDraw, x0: int, y: int, w: int, dpi: int,
+                     font: ImageFont.FreeTypeFont, reverse: bool = False) -> None:
+    """细线组：0.01/0.05/0.4/0.6pt 横+纵线条；reverse=True 时黑底反白。"""
+    line_color = (0, 0, 0, 0) if reverse else (0, 0, 0, 255)   # 反白=白线
+    bg = (0, 0, 0, 255) if reverse else (0, 0, 0, 0)
+    n = len(_FINE_WIDTHS_PT)
+    gw = (w - (n - 1) * 10) // n
+    gh = round(24 / 25.4 * dpi)
+    for i, wpt in enumerate(_FINE_WIDTHS_PT):
+        xx = x0 + i * (gw + 10)
+        draw.rectangle([xx, y, xx + gw, y + gh], fill=bg, outline=(0, 0, 0, 255))
+        px = max(1, round(wpt / 72.0 * dpi))
+        cy = y + gh // 2
+        draw.line([(xx + 4, cy), (xx + gw - 4, cy)], fill=line_color, width=px)
+        cxl = xx + gw // 2
+        draw.line([(cxl, y + 4), (cxl, y + gh - 4)], fill=line_color, width=px)
+        draw.text((xx + gw / 2, y + gh + 3), f"{wpt}pt{' 反白' if reverse else ''}",
+                  font=font, fill=(0, 0, 0, 255), anchor="ma")
+
+
+def _draw_registrations(draw: ImageDraw.ImageDraw, x0: int, y: int, dpi: int,
+                        font: ImageFont.FreeTypeFont) -> None:
+    """套准标记：圆/三角撞色叠印（错位 1.5mm）+ 十字圆环。"""
+    mm = lambda v: round(v / 25.4 * dpi)  # noqa: E731
+    # 撞色对（色序 KCMY 相邻色组），圆=先印色，三角=后印色
+    combos = [(("C", (255, 0, 0, 0)), ("M", (0, 255, 0, 0))),
+              (("M", (0, 255, 0, 0)), ("Y", (0, 0, 255, 0))),
+              (("Y", (0, 0, 255, 0)), ("K", (0, 0, 0, 255))),
+              (("K", (0, 0, 0, 255)), ("C", (255, 0, 0, 0)))]
+    r = mm(6)
+    step = mm(26)
+    for i, (c1, c2) in enumerate(combos):
+        cx = x0 + i * step + r
+        cy = y + r
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=c1[1], width=mm(0.5))
+        off = mm(1.5)  # 设计错位：套准正确时错位恰好 1.5mm，超过即套印误差
+        pts = [(cx + off, cy - r), (cx + off - r * 0.9, cy + r * 0.75),
+               (cx + off + r * 0.9, cy + r * 0.75)]
+        draw.polygon(pts, outline=c2[1], width=mm(0.5))
+        draw.text((cx, cy + r + 3), f"{c1[0]}+{c2[0]}", font=font,
+                  fill=(0, 0, 0, 255), anchor="ma")
+    # 十字圆环套准标（经典标记）
+    cx = x0 + 4 * step + r + mm(4)
+    cy = y + r
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(0, 0, 0, 255), width=mm(0.5))
+    draw.line([(cx - r - mm(3), cy), (cx + r + mm(3), cy)], fill=(0, 0, 0, 255), width=mm(0.5))
+    draw.line([(cx, cy - r - mm(3)), (cx, cy + r + mm(3))], fill=(0, 0, 0, 255), width=mm(0.5))
+    draw.text((cx, cy + r + 3), "十", font=font, fill=(0, 0, 0, 255), anchor="ma")
+
+
+def _build_visual_page(w: int, h: int, margin: int, dpi: int, process_name: str,
+                       font_title, font_meta, font_foot):
+    """生成第二页（目视诊断区）的 (Image, ImageDraw)。"""
+    img = Image.new("CMYK", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    title = "目视诊断区 · 星标 / 细线 / 套准"
+    draw.text((margin, margin), title, font=font_title, fill=(0, 0, 0, 255))
+    if process_name:
+        draw.text((w - margin, margin), process_name, font=font_meta,
+                  fill=(0, 0, 0, 255), anchor="ra")
+
+    mm = lambda v: round(v / 25.4 * dpi)  # noqa: E731
+    y = margin + mm(14)
+
+    # 星标 ×2（左右两处，便于同张对比）
+    r_star = mm(30)
+    for cx in (w // 2 - mm(45), w // 2 + mm(45)):
+        _draw_star_target(draw, cx, y + r_star, r_star, dpi)
+    draw.text((w // 2, y + 2 * r_star + 6),
+              "星标：中心白点完整=正常 · 均匀黑化=网点增大 · 方向性楔形=滑版/条杠 · 偏向非对称=重影 · 白点扩大=网点收缩",
+              font=font_foot, fill=(0, 0, 0, 255), anchor="ma")
+    y += 2 * r_star + mm(12)
+
+    # 正向细线组
+    draw.text((margin, y), "正向细线（横向+纵向）", font=font_meta, fill=(0, 0, 0, 255))
+    y += mm(7)
+    _draw_fine_lines(draw, margin, y, w - margin * 2, dpi, font_meta, reverse=False)
+    y += mm(24 + 10)
+
+    # 反白细线组
+    draw.text((margin, y), "反白细线（黑底白线，考核反白不堵塞）", font=font_meta, fill=(0, 0, 0, 255))
+    y += mm(7)
+    _draw_fine_lines(draw, margin, y, w - margin * 2, dpi, font_meta, reverse=True)
+    y += mm(24 + 10)
+
+    # 套准标记
+    draw.text((margin, y), "套准标记（圆/三角撞色，设计错位 1.5mm）", font=font_meta, fill=(0, 0, 0, 255))
+    y += mm(7)
+    _draw_registrations(draw, margin, y, dpi, font_meta)
+
+    # 页脚
+    foot = ("目视目标不参与测量配对 · 星标判读借 35:1 形变放大 · "
+            "细线断线/反白堵塞即极细网点还原不足")
+    draw.text((w / 2, h - margin), foot, font=font_foot, fill=(0, 0, 0, 255), anchor="ms")
+    return img, draw
 
 
 def generate_testform(process_name: str = "", dpi: int = DPI_DEFAULT) -> dict:
@@ -142,11 +271,15 @@ def generate_testform(process_name: str = "", dpi: int = DPI_DEFAULT) -> dict:
             "测量时背衬使用同一批未印刷样张")
     draw.text((w / 2, h - margin), foot, font=font_foot, fill=(0, 0, 0, 255), anchor="ms")
 
-    # 输出：TIFF（CMYK）+ PDF（Pillow 原生 DeviceCMYK）+ PNG 预览
+    # 第二页：目视诊断区（星标/细线/套准，不参与测量配对）
+    page2, _ = _build_visual_page(w, h, margin, dpi, process_name, font_title, font_meta, font_foot)
+
+    # 输出：TIFF（CMYK 多页）+ PDF（Pillow 原生 DeviceCMYK 多页）+ PNG 预览（第一页）
     tiff_buf = io.BytesIO()
-    img.save(tiff_buf, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
+    img.save(tiff_buf, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw",
+             save_all=True, append_images=[page2])
     pdf_buf = io.BytesIO()
-    img.save(pdf_buf, format="PDF", resolution=dpi)
+    img.save(pdf_buf, format="PDF", resolution=dpi, save_all=True, append_images=[page2])
     preview = img.convert("RGB").resize((w // 5, h // 5))
     preview_buf = io.BytesIO()
     preview.save(preview_buf, format="PNG")
@@ -174,4 +307,6 @@ def generate_testform(process_name: str = "", dpi: int = DPI_DEFAULT) -> dict:
         "pairs_count": len(pairs),
         "dpi": dpi,
         "page_mm": list(PAGE_MM),
+        "pages": 2,
+        "steps": _INK_STEPS,
     }

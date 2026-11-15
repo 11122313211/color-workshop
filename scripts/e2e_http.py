@@ -24,7 +24,7 @@ ok = True
 # 0. 静态页与 API 健康
 r = client.get("/api/health")
 ok &= check("健康检查", r.status_code == 200 and r.json()["status"] == "ok", r.text[:80])
-ok &= check("版本号 v0.5.0", r.json().get("version") == "0.5.0")
+ok &= check("版本号 v0.6.0", r.json().get("version") == "0.6.0")
 r = client.get("/", follow_redirects=False)
 ok &= check("根路径重定向", r.status_code == 307 and r.headers["location"] == "/static/index.html")
 r = client.get("/static/index.html")
@@ -294,6 +294,134 @@ ok &= check("V0.5 verify 响应含 ΔE 分量", "components" in v and "dE76" in 
 for sid in (qc_sid, gate_sid):
     r = client.delete("/api/qc/measurements", params={"session_id": sid})
     ok &= check("V0.5 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
+
+# 7.5 V0.6：K 值/叠印率/灰平衡/均匀性 + 诊断 + 对比/趋势 + 主观评价
+
+
+def _density_tsv(c_solid=1.35, c75=0.90, b_over_m=1.15, gb="51.5\t0.8\t-1.2"):
+    """合成密度 TSV（无 XYZ/Lab，GB1 带 Lab）：实地/梯尺(50/75)/叠印/灰平衡块。
+
+    数值口径：M 实地 1.40 → T=(b_over_m−0.45)/1.40；K=(1.35−c75)/1.35。
+    """
+    head = "Color Name\tCIE Lab\t\t\tStatus T C\tM\tY\tK\r\n"
+    rows = [
+        f"C\t\t\t\t{c_solid}\t0.45\t0.12\t0.05",
+        "M\t\t\t\t0.10\t1.40\t0.55\t0.04",
+        "Y\t\t\t\t0.05\t0.10\t1.10\t0.03",
+        "K\t\t\t\t1.60\t1.55\t1.45\t1.60",
+        "c50\t\t\t\t0.45\t0.20\t0.07\t0.15",
+        f"c75\t\t\t\t{c75}\t0.22\t0.06\t0.15",
+        "k75\t\t\t\t0.90\t0.85\t0.80\t0.88",
+        "R\t\t\t\t0.10\t1.35\t1.30\t0.40",
+        "G\t\t\t\t1.05\t0.30\t1.02\t0.30",
+        f"B\t\t\t\t1.20\t{b_over_m}\t0.30\t0.45",
+        f"GB1\t{gb}\t1.05\t0.62\t0.61\t0.05",
+    ]
+    return (head + "\n".join(rows) + "\r\n").encode("utf-8")
+
+
+def _import_density(client, filename, values, process_id=""):
+    """导入同内容两份（密度复测对）→ 返回 (session_id, stats)。"""
+    params = {"filename": filename, "instrument": "E2E-Dens",
+              "calibrated_at": "2026-01-01T10:00:00", "repeat_mode": "single"}
+    if process_id:
+        params["process_id"] = process_id
+    r = client.post("/api/qc/measurements/import", params=params, content=_density_tsv(**values),
+                    headers={"Content-Type": "application/octet-stream"})
+    sid = r.json()["session"]["id"]
+    r = client.post("/api/qc/measurements/import", params={"filename": f"{filename}.r2", "session_id": sid,
+                    "repeat_mode": "repeat"}, content=_density_tsv(**values),
+                    headers={"Content-Type": "application/octet-stream"})
+    return sid, r.json()["session"]["stats"]
+
+
+# 问题会话：K≈0.33（低于 0.40）+ B 叠印 50%（低于 60%）+ 灰平衡 b* 偏蓝
+v6_a, stats_a = _import_density(client, "e2e_v6a.txt", {}, process_id=pid)
+ok &= check(
+    "V0.6 纯密度复测配对 → verified",
+    stats_a["verified"] == 2 and stats_a["warning"] == 0,
+    str(stats_a),
+)
+r = client.get("/api/qc/ink-quality", params={"session_id": v6_a})
+iq6 = r.json()
+k_c = (iq6.get("print_contrast") or {}).get("C") or {}
+ok &= check(
+    "V0.6 反差率 K 聚合（Ds−D75/Ds）",
+    r.status_code == 200 and abs(k_c.get("k", 0) - (1.35 - 0.90) / 1.35) < 1e-3
+    and len(iq6.get("uniformity") or []) >= 1,
+    f"k={k_c.get('k')} uni={len(iq6.get('uniformity') or [])}",
+)
+diag = iq6.get("diagnosis") or []
+diag_rules = {f["rule"]: f["severity"] for f in diag}
+ok &= check(
+    "V0.6 诊断结论 R2 warn / R4 err / R5 warn",
+    diag_rules.get("R2") == "warn" and diag_rules.get("R4") == "err" and diag_rules.get("R5") == "warn",
+    str(diag_rules),
+)
+ok &= check(
+    "V0.6 叠印率与灰平衡输出",
+    any(t["label"] == "B" and abs(t["t"] - 50.0) < 0.2 for t in iq6.get("trapping") or [])
+    and any(abs(g["db"] + 1.2) < 1e-6 for g in iq6.get("gray_balance") or []),
+    str((iq6.get("trapping") or [{}])[0]),
+)
+
+# 健康会话：K≈0.44 + 叠印 71% 达标 + 灰平衡正常
+v6_b, _ = _import_density(client, "e2e_v6b.txt",
+                          {"c75": 0.75, "b_over_m": 1.45, "gb": "51.5\t0.3\t-0.5"}, process_id=pid)
+r = client.get("/api/qc/compare", params={"session_id_a": v6_a, "session_id_b": v6_b})
+cmp6 = r.json()
+d_kc = (cmp6.get("deltas") or {}).get("k", {}).get("C") or {}
+ok &= check(
+    "V0.6 会话对比 Δ 表（K/B 叠印，Δ=主−对比）",
+    r.status_code == 200 and abs(d_kc.get("delta", 0) - (0.3333 - 0.4444)) < 0.01,
+    f"k.C delta={d_kc.get('delta')}",
+)
+r = client.get("/api/qc/trend", params={"process_id": pid})
+pts6 = r.json().get("points") or []
+ok &= check(
+    "V0.6 工艺趋势时间序列",
+    r.status_code == 200 and len(pts6) == 2 and all((p.get("k") or {}).get("C") is not None for p in pts6),
+    f"points={len(pts6)}",
+)
+
+# 主观评价：模板 → 创建 → 双人打分 → 统计 → 非法打分 422 → 删除
+r = client.get("/api/qc/evaluations/templates")
+ok &= check(
+    "V0.6 评价模板三套",
+    r.status_code == 200 and set((r.json().get("templates") or {}).keys()) == {"book", "paper_pack", "plastic_pack"},
+)
+r = client.post("/api/qc/evaluations", params={"template": "paper_pack", "title": "E2E 评价"})
+ev6 = r.json()
+ev_id = ev6["id"]
+ok &= check("V0.6 创建评价", r.status_code == 200 and ev6["template_name"] == "纸包装")
+scores = {"颜色无明显偏色": 5, "色彩鲜艳饱满": 4, "色彩过渡自然": 4, "明暗部细节完整": 5,
+          "阶调过渡平顺": 4, "图案边缘顺滑无毛刺": 5, "小字细线清晰不发虚": 4,
+          "墨色均匀无深浅差异": 5, "墨层洁净无脏点晕染": 4, "裁切整齐无毛边": 5,
+          "套印精准无错位": 4, "粘合牢固无开胶": 5, "盒体规整无歪斜": 5}
+r = client.post("/api/qc/evaluations/entries", params={"evaluation_id": ev_id, "evaluator": "甲"},
+                json=scores)
+r2 = client.post("/api/qc/evaluations/entries", params={"evaluation_id": ev_id, "evaluator": "乙"},
+                 json={**scores, "颜色无明显偏色": 4, "裁切整齐无毛边": 4})
+st6 = r2.json().get("stats") or {}
+ok &= check(
+    "V0.6 评价统计（均值/标准差/综合）",
+    r.status_code == 200 and r2.status_code == 200 and st6.get("entries") == 2
+    and st6.get("overall") is not None and st6.get("consistency_warn") == [],
+    f"overall={st6.get('overall')}",
+)
+r = client.post("/api/qc/evaluations/entries", params={"evaluation_id": ev_id, "evaluator": "丙"},
+                json={"不存在指标": 5})
+ok &= check("V0.6 非法指标打分 → 422", r.status_code == 422)
+r = client.get("/api/qc/evaluations", params={"evaluation_id": ev_id})
+ok &= check("V0.6 评价详情含统计", r.status_code == 200 and "stats" in r.json()
+            and any(row["item"] == "裁切整齐无毛边" for row in r.json()["stats"]["rows"]))
+r = client.delete("/api/qc/evaluations", params={"evaluation_id": ev_id})
+ok &= check("V0.6 评价删除", r.status_code == 200 and r.json()["status"] == "deleted")
+
+# V0.6 清理 QC 会话
+for sid in (v6_a, v6_b):
+    r = client.delete("/api/qc/measurements", params={"session_id": sid})
+    ok &= check("V0.6 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
 
 # 8. 清理
 for p in (pid, pid_b):

@@ -447,3 +447,32 @@ def test_api_session_and_record_delete_regrade(api_client):
     r2 = api_client.delete("/api/qc/measurements", params={"session_id": sid})
     assert r2.status_code == 200
     assert api_client.get("/api/qc/measurements", params={"session_id": sid}).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# V0.6：纯密度记录（密度计工作流，无 Lab）的复测一致性
+# ---------------------------------------------------------------------------
+
+
+def test_rule1_density_repeat_pairing_verified():
+    """纯密度记录按密度通道复测配对（V0.6 REPEAT_MAX_DENSITY=0.05）。"""
+    session = {"repeat_mode": "repeat"}
+    patches = [
+        {"label": "C", "densities": {"C": 1.35, "M": 0.45, "Y": 0.12, "K": 0.05}},
+        {"label": "c75", "densities": {"C": 0.80, "M": 0.22, "Y": 0.06, "K": 0.10}},
+    ]
+    recs = [_rec(patches, kind="tsv"), _rec(patches, kind="tsv")]
+    grade_session(session, recs)
+    assert all(r["reliability"] == "verified" for r in recs)
+    assert all(r["density_ok"] for r in recs)
+
+
+def test_rule1_density_repeat_drift_warns():
+    """同标签密度漂移 > 0.05 → warning（Lab 缺席时的密度口径复测）。"""
+    session = {"repeat_mode": "repeat"}
+    p1 = [{"label": "C", "densities": {"C": 1.35, "M": 0.45, "Y": 0.12, "K": 0.05}}]
+    p2 = [{"label": "C", "densities": {"C": 1.45, "M": 0.45, "Y": 0.12, "K": 0.05}}]
+    recs = [_rec(p1, kind="tsv"), _rec(p2, kind="tsv")]
+    grade_session(session, recs)
+    assert all(r["reliability"] == "warning" for r in recs)
+    assert any("密度差" in r for r in recs[0]["reasons"])

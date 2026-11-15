@@ -1,7 +1,10 @@
-/* 监控视图（V0.4/V0.5）：ΔE 趋势总览 + 分工艺漂移告警 + 测量数据可靠性闭环。
- * 数据源：GET /api/recipes/stats + GET /api/qc/measurements。
+/* 监控视图（V0.4/V0.5/V0.6）：ΔE 趋势总览 + 分工艺漂移告警 + 测量数据可靠性闭环
+ * + 印刷 QC（GATF 指标 / 诊断结论 / 会话对比）。
+ * 数据源：GET /api/recipes/stats + GET /api/qc/*。
  * V0.5 测量数据卡：会话登记（仪器/条件/校准/背衬/复测模式）→ 导入 → 五条规则分级
  * （verified/warning/rejected），rejected 数据可查不可用。
+ * V0.6：QC 卡补全反差率 K / 叠印率 / 灰平衡 / 均匀性指标与规则型诊断结论（R1-R8），
+ * 会话对比 Δ 表，工艺绑定会话 K 值趋势 sparkline；主观评价卡见 views/evaluation.js。
  */
 
 import { apiGet, apiPostRaw, apiDelete } from "../api.js";
@@ -9,6 +12,7 @@ import { icon } from "../icons.js";
 import {
   emptyState, errorState, skeletonCards, esc, openModal, toast, confirmDanger, observeRedraw,
 } from "../components.js";
+import { renderEvalCard } from "./evaluation.js";
 
 const TOL_DEFAULT = 2.0;
 
@@ -23,7 +27,33 @@ function reliabilityBadge(rel) {
   return `<span class="badge ${m.cls}">${icon(m.icon)}${m.text}</span>`;
 }
 
-function sessionRow(s, onDetail) {
+/* V0.6：工艺会话反差率 K 迷你趋势（定期抽检监控暗调层次的时间轴视图）。
+ * K 预警线下（<0.40）折线转警示色；K 预警线见 diagnosis.K_MIN。 */
+const K_MIN_UI = 0.40;
+
+function kTrendChip(points) {
+  const vals = (points || []).map((p) => (p.k ? (p.k.C ?? p.k.M ?? p.k.Y ?? p.k.K) : null));
+  const present = vals.filter((v) => v != null);
+  if (present.length < 2) return "";
+  const W = 110, H = 24;
+  const hi = Math.max(...present) + 0.05, lo = Math.min(...present) - 0.05;
+  const pts = vals.map((v, i) => {
+    if (v == null) return null;
+    const x = 2 + (i / Math.max(vals.length - 1, 1)) * (W - 4);
+    const y = H - 3 - ((v - lo) / Math.max(hi - lo, 0.01)) * (H - 6);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).filter(Boolean);
+  const last = vals[vals.length - 1];
+  const color = last != null && last < K_MIN_UI ? "var(--orange)" : "var(--green)";
+  return `<span title="该工艺各会话反差率 K 趋势（抽检监控暗调）" style="display:inline-flex; align-items:center; gap:5px">
+    <span class="swatch-meta">K 趋势</span>
+    <svg width="${W}" height="${H}" aria-hidden="true" style="vertical-align:middle">
+      <polyline points="${pts.join(" ")}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>
+      ${pts.map((p) => `<circle cx="${p.split(",")[0]}" cy="${p.split(",")[1]}" r="1.8" fill="${color}"/>`).join("")}
+    </svg></span>`;
+}
+
+function sessionRow(s, trendSparkHtml) {
   const st = s.stats || { verified: 0, warning: 0, rejected: 0 };
   const repeatChip = s.repeat_mode === "repeat"
     ? `<span class="chip" style="background:var(--green-soft); color:var(--green)">复测组</span>`
@@ -36,6 +66,7 @@ function sessionRow(s, onDetail) {
         ${condChip}${repeatChip}
         <span class="swatch-meta">校准 ${esc(s.calibrated_at || "未登记")}${s.backing ? " · 背衬 " + esc(s.backing) : ""}</span>
         <span style="flex:1"></span>
+        ${trendSparkHtml || ""}
         <span class="badge badge-green">${st.verified} verified</span>
         <span class="badge badge-orange">${st.warning} warning</span>
         <span class="badge badge-red">${st.rejected} rejected</span>
@@ -77,6 +108,16 @@ async function renderMeasurementCard(view) {
     return acc;
   }, { v: 0, w: 0, r: 0 });
 
+  // V0.6：工艺绑定会话的反差率趋势（定期抽检监控暗调）——每工艺一次请求
+  const trends = {};
+  const procIds = [...new Set(sessions.map((s) => s.process_id).filter(Boolean))];
+  await Promise.all(procIds.map(async (pid) => {
+    try {
+      const t = await apiGet(`/api/qc/trend?process_id=${encodeURIComponent(pid)}`);
+      trends[pid] = t.points || [];
+    } catch { trends[pid] = []; }
+  }));
+
   holder.innerHTML = `
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
       <div class="card-title" style="margin:0">${icon("check")}测量数据（可靠性闭环）</div>
@@ -88,7 +129,7 @@ async function renderMeasurementCard(view) {
     </div>
     <p class="swatch-meta" style="margin-top:8px">方法闭环：测前登记 → 校准确认 → 测量 → 复测一致性 → 交叉校验 → 可信度分级。
       只有 <b>verified</b> 数据流向 QC 指标与补偿模型；rejected 数据可查不可用。</p>
-    ${sessions.length ? sessions.map((s) => sessionRow(s)).join("") : `
+    ${sessions.length ? sessions.map((s) => sessionRow(s, kTrendChip(trends[s.process_id]))).join("") : `
       <div class="empty" style="margin-top:10px">
         <p class="swatch-meta">还没有测量会话。点击「导入测量」登记仪器与校准信息，导入分光/密度计导出的 CGATS.17 或 Status-T 文本。</p>
       </div>`}
@@ -248,7 +289,7 @@ async function openImportWizard(view) {
  * 只消费 verified 数据；无 verified 时显示方法要求占位（教育用户何为可信数据）
  * ========================================================= */
 
-const INK_COLORS = { C: "#1f7fd0", M: "#d04f9e", Y: "#c99a1e", R: "#d05a4e", G: "#4e9e5f", B: "#8a7fdd" };
+const INK_COLORS = { C: "#1f7fd0", M: "#d04f9e", Y: "#c99a1e", K: "#4a4a52", R: "#d05a4e", G: "#4e9e5f", B: "#8a7fdd" };
 
 /* GATF 色轮理想方位（自顶部顺时针，Y/R/M/B/C/G 每 60°） */
 const WHEEL_ANGLE = { Y: 0, R: 60, M: 120, B: 180, C: 240, G: 300 };
@@ -314,8 +355,8 @@ function drawTvi(canvas, points) {
   ctx.beginPath(); ctx.moveTo(PAD.l, Y(0)); ctx.lineTo(W - PAD.r, Y(0)); ctx.stroke();
   ctx.setLineDash([]);
 
-  // 每色折线
-  for (const inkKey of ["C", "M", "Y"]) {
+  // 每色折线（V0.6 起黑版参与 TVI）
+  for (const inkKey of ["C", "M", "Y", "K"]) {
     const pts = points.filter((p) => p.ink === inkKey).sort((a, b) => a.nominal - b.nominal);
     if (!pts.length) continue;
     ctx.strokeStyle = INK_COLORS[inkKey]; ctx.lineWidth = 2;
@@ -379,20 +420,183 @@ function drawWheel(canvas, patches) {
 }
 
 function inkCard(label, m) {
-  const pct = (v) => `${(v * 100).toFixed(1)}%`;
+  const pct = (v) => (v == null ? "-" : `${(v * 100).toFixed(1)}%`);
+  const kChip = label === "K"
+    ? `<span class="chip chip-mono">K密度 ${m.strength.toFixed(2)}</span>`
+    : `<span class="chip chip-mono">DH ${m.strength.toFixed(2)}</span>`;
   return `
     <div style="flex:1; min-width:150px; border:1px solid var(--separator); border-radius:10px; padding:10px 12px">
       <div style="display:flex; align-items:center; gap:8px">
         <span style="width:12px; height:12px; border-radius:4px; background:${INK_COLORS[label]}"></span>
         <b style="color:var(--label)">${esc(m.label)}</b>
-        <span class="chip chip-mono">DH ${m.strength.toFixed(2)}</span>
+        ${kChip}
       </div>
       <div class="swatch-meta" style="margin-top:6px; line-height:1.9">
-        色相误差 <b>${pct(m.hue_error)}</b> · 灰度 <b>${pct(m.grayness)}</b><br>
-        色效率 <b>${pct(m.efficiency)}</b> · 色纯度 <b>${pct(m.purity)}</b><br>
+        ${label === "K" ? "黑版不参与 GATF 三滤色色相类指标" : `色相误差 <b>${pct(m.hue_error)}</b> · 灰度 <b>${pct(m.grayness)}</b><br>
+        色效率 <b>${pct(m.efficiency)}</b> · 色纯度 <b>${pct(m.purity)}</b>`}<br>
         滤色密度 C/M/Y <b>${m.densities.C.toFixed(2)} / ${m.densities.M.toFixed(2)} / ${m.densities.Y.toFixed(2)}</b>
       </div>
     </div>`;
+}
+
+/* ---- V0.6 诊断结论块：severity 徽标 + 标题，点击展开证据/成因/建议/依据 ---- */
+function diagnosisBlock(findings) {
+  const sev = {
+    ok: { cls: "badge-green", label: "正常" },
+    info: { cls: "badge-blue", label: "解读" },
+    warn: { cls: "badge-orange", label: "关注" },
+    err: { cls: "badge-red", label: "超限" },
+  };
+  const rows = (findings || []).map((f, i) => {
+    const s = sev[f.severity] || sev.info;
+    return `
+      <div class="qc-diagnosis" data-i="${i}" style="border-top:1px solid var(--separator); padding:8px 0">
+        <div style="display:flex; align-items:center; gap:8px; cursor:pointer">
+          <span class="badge ${s.cls}">${s.label}</span>
+          <b style="color:var(--label); font-size:13px; flex:1">${esc(f.title)}</b>
+          <span class="swatch-meta chip-mono">${esc(f.rule)}</span>
+        </div>
+        <div class="qc-diagnosis-detail" hidden style="margin-top:6px; padding-left:2px; line-height:1.9">
+          ${f.evidence ? `<div class="swatch-meta">证据：${esc(f.evidence)}</div>` : ""}
+          ${f.cause ? `<div class="swatch-meta">成因：${esc(f.cause)}</div>` : ""}
+          ${f.action ? `<div class="swatch-meta" style="color:var(--label)">建议：<b>${esc(f.action)}</b></div>` : ""}
+          ${f.ref ? `<div class="swatch-meta">依据：${esc(f.ref)}</div>` : ""}
+        </div>
+      </div>`;
+  }).join("");
+  if (!rows) return "";
+  return `
+    <div style="margin-top:14px">
+      <div class="card-title" style="font-size:14px">诊断结论（规则型 · R1-R8）</div>
+      <div style="margin-top:6px">${rows}</div>
+    </div>`;
+}
+
+function bindDiagnosisToggles(root) {
+  root.querySelectorAll(".qc-diagnosis > div:first-child").forEach((head) => {
+    head.addEventListener("click", () => {
+      const detail = head.parentElement.querySelector(".qc-diagnosis-detail");
+      if (detail) detail.hidden = !detail.hidden;
+    });
+  });
+}
+
+/* ---- V0.6 新指标子块：反差率 K / 叠印率 / 灰平衡 / 均匀性 ---- */
+function extraMetricsBlock(data) {
+  const pc = data.print_contrast || {};
+  const kRow = (ink, e) => {
+    if (!e) return "";
+    const warn = e.k != null && e.k < 0.4;
+    const kText = e.k == null ? "-" : e.k.toFixed(2);
+    return `<tr>
+      <td style="padding:4px 8px 4px 0"><b style="color:${INK_COLORS[ink]}">${ink}</b></td>
+      <td class="chip-mono" style="padding:4px 8px 4px 0">${e.d_solid != null ? e.d_solid.toFixed(2) : "-"}</td>
+      <td class="chip-mono" style="padding:4px 8px 4px 0">${e.d_75 != null ? e.d_75.toFixed(2) : "-"}</td>
+      <td style="padding:4px 0"><b>${kText}</b> ${warn ? `<span class="badge badge-orange">低于 0.40</span>` : ""}</td>
+    </tr>`;
+  };
+  const kEntries = ["C", "M", "Y", "K"].map((k) => kRow(k, pc[k])).filter(Boolean);
+  const kBlock = kEntries.length ? `
+    <div style="flex:1; min-width:260px; border:1px solid var(--separator); border-radius:10px; padding:10px 12px">
+      <div style="display:flex; align-items:center; gap:8px"><b style="color:var(--label)">相对反差 K</b>
+        <span class="swatch-meta">(Ds−D75)/Ds</span></div>
+      <table style="margin-top:6px; width:100%; font-size:12px; border-collapse:collapse">
+        <tr class="swatch-meta"><td style="padding:2px 8px 2px 0">色</td><td style="padding:2px 8px 2px 0">Ds</td><td style="padding:2px 8px 2px 0">D75</td><td style="padding:2px 0">K</td></tr>
+        ${kEntries.join("")}
+      </table>
+    </div>` : "";
+
+  const traps = (data.trapping || []).filter((t) => t.t != null);
+  const trapBlock = traps.length ? `
+    <div style="flex:1; min-width:260px; border:1px solid var(--separator); border-radius:10px; padding:10px 12px">
+      <div style="display:flex; align-items:center; gap:8px"><b style="color:var(--label)">油墨叠印率 T</b>
+        <span class="swatch-meta">≥60% 合格</span></div>
+      <table style="margin-top:6px; width:100%; font-size:12px; border-collapse:collapse">
+        ${traps.map((t) => `<tr>
+          <td style="padding:4px 8px 4px 0"><b style="color:${INK_COLORS[t.label] || "var(--label)"}">${esc(t.label)}</b>
+            <span class="swatch-meta">${esc(t.first)}+${esc(t.second)} · ${esc(t.filter)}滤色</span></td>
+          <td style="padding:4px 0"><b>${t.t.toFixed(0)}%</b>
+            ${t.ok ? `<span class="badge badge-green">达标</span>` : `<span class="badge badge-red">低于 60%</span>`}</td>
+        </tr>`).join("")}
+      </table>
+    </div>` : "";
+
+  const gb = data.gray_balance || [];
+  const gbBlock = gb.length ? `
+    <div style="flex:1; min-width:260px; border:1px solid var(--separator); border-radius:10px; padding:10px 12px">
+      <div style="display:flex; align-items:center; gap:8px"><b style="color:var(--label)">灰平衡偏移</b>
+        <span class="swatch-meta">|a*|、|b*|≤1.0</span></div>
+      <table style="margin-top:6px; width:100%; font-size:12px; border-collapse:collapse">
+        ${gb.map((g) => {
+          const bad = Math.abs(g.da) > 1.0 || Math.abs(g.db) > 1.0;
+          return `<tr>
+            <td style="padding:4px 8px 4px 0"><b>${esc(g.label)}</b></td>
+            <td class="chip-mono" style="padding:4px 8px 4px 0">a* ${g.da >= 0 ? "+" : ""}${g.da.toFixed(2)}</td>
+            <td class="chip-mono" style="padding:4px 8px 4px 0">b* ${g.db >= 0 ? "+" : ""}${g.db.toFixed(2)}</td>
+            <td style="padding:4px 0">${bad ? `<span class="badge badge-orange">${esc(g.direction)}</span>` : `<span class="badge badge-green">${esc(g.direction)}</span>`}</td>
+          </tr>`;
+        }).join("")}
+      </table>
+    </div>` : "";
+
+  const uni = data.uniformity || [];
+  const uniBlock = uni.length ? `
+    <div style="flex:1; min-width:260px; border:1px solid var(--separator); border-radius:10px; padding:10px 12px">
+      <div style="display:flex; align-items:center; gap:8px"><b style="color:var(--label)">实地均匀性</b>
+        <span class="swatch-meta">CV≤5%（复测多点）</span></div>
+      <table style="margin-top:6px; width:100%; font-size:12px; border-collapse:collapse">
+        ${uni.map((u) => {
+          const bad = (u.cv || 0) > 0.05;
+          return `<tr>
+            <td style="padding:4px 8px 4px 0"><b style="color:${INK_COLORS[u.ink]}">${u.ink}</b></td>
+            <td class="swatch-meta" style="padding:4px 8px 4px 0">n=${u.n} · mean ${u.mean.toFixed(2)} · std ${u.std.toFixed(3)}</td>
+            <td style="padding:4px 0"><b>CV ${(u.cv * 100).toFixed(1)}%</b> ${bad ? `<span class="badge badge-orange">不均</span>` : `<span class="badge badge-green">均匀</span>`}</td>
+          </tr>`;
+        }).join("")}
+      </table>
+    </div>` : "";
+
+  const blocks = [kBlock, trapBlock, gbBlock, uniBlock].filter(Boolean);
+  if (!blocks.length) return `
+    <div class="empty" style="margin-top:12px">
+      <p class="swatch-meta">本会话数据不含 75% 梯级 / 双色叠印块 / 灰平衡块（GB）或复测对，
+      反差率 K、叠印率、灰平衡、均匀性无法计算——生成 V0.6 验证样张（含 75% 梯级与目视诊断页）并启用复测模式即可覆盖。</p>
+    </div>`;
+  return `<div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px">${blocks.join("")}</div>`;
+}
+
+/* ---- V0.6 会话对比 Δ 表 ---- */
+function compareTable(cmp) {
+  const d = cmp.deltas || {};
+  // 传入的 e.a/e.b/e.delta 均为显示单位值（"%" 行的调用方已自行换算）
+  const row = (name, unit, e) => {
+    if (!e) return "";
+    const fmt = (v) => (v == null ? "-" : `${v.toFixed(unit === "%" ? 1 : 2)}${unit}`);
+    const deltaCls = e.delta == null ? "swatch-meta" : e.delta !== 0 ? "chip-mono" : "swatch-meta";
+    return `<tr>
+      <td style="padding:4px 10px 4px 0"><b>${esc(name)}</b></td>
+      <td class="chip-mono" style="padding:4px 10px 4px 0">${fmt(e.a)}</td>
+      <td class="chip-mono" style="padding:4px 10px 4px 0">${fmt(e.b)}</td>
+      <td class="${deltaCls}" style="padding:4px 0">${e.delta == null ? "缺一侧数据" : `${e.delta > 0 ? "+" : ""}${fmt(e.delta)}`}</td>
+    </tr>`;
+  };
+  const rows = [];
+  for (const [ink, e] of Object.entries(d.k || {})) rows.push(row(`反差率 K（${ink}）`, "", e));
+  // qc_compare 的 tvi_mid/trapping 已是百分数值；grayness 为 0-1 需 ×100
+  for (const [ink, e] of Object.entries(d.tvi_mid || {})) rows.push(row(`TVI 中间调（${ink}）`, "%", e));
+  for (const [ink, e] of Object.entries(d.strength || {})) rows.push(row(`色强度 DH（${ink}）`, "", e));
+  for (const [ink, e] of Object.entries(d.grayness || {})) rows.push(row(`灰度（${ink}）`, "%", {
+    a: e.a != null ? e.a * 100 : null,
+    b: e.b != null ? e.b * 100 : null,
+    delta: e.delta != null ? e.delta * 100 : null,
+  }));
+  for (const [pair, e] of Object.entries(d.trapping || {})) rows.push(row(`叠印率 T（${pair}）`, "%", e));
+  if (!rows.length) return `<p class="swatch-meta" style="margin-top:10px">两个会话都没有可对比的 verified 指标。</p>`;
+  return `
+    <table style="margin-top:8px; width:100%; font-size:12px; border-collapse:collapse">
+      <tr class="swatch-meta"><td style="padding:2px 10px 2px 0">指标</td><td style="padding:2px 10px 2px 0">主会话</td><td style="padding:2px 10px 2px 0">对比会话</td><td style="padding:2px 0">Δ（主−对比）</td></tr>
+      ${rows.join("")}
+    </table>`;
 }
 
 async function renderQcCard(view) {
@@ -418,12 +622,17 @@ async function renderQcCard(view) {
   const options = sessions.map((s, i) =>
     `<option value="${esc(s.id)}">${esc(s.instrument)} · ${esc(s.condition)} · ${esc((s.created_at || "").replace("T", " "))}</option>`
   ).join("");
+  const compareOptions = ['<option value="">不对比</option>']
+    .concat(sessions.map((s) => `<option value="${esc(s.id)}">${esc(s.instrument)} · ${esc((s.created_at || "").replace("T", " "))}</option>`))
+    .join("");
 
   holder.innerHTML = `
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
       <div class="card-title" style="margin:0">${icon("printer")}印刷 QC（GATF）</div>
       <span class="chip">仅消费 verified</span>
       <span style="flex:1"></span>
+      <span class="swatch-meta">对比会话</span>
+      <select id="qc-ink-compare" class="input" style="max-width:230px">${compareOptions}</select>
       <select id="qc-ink-session" class="input" style="max-width:280px">${options}</select>
     </div>
     <div id="qc-ink-body" style="margin-top:12px">${skeletonCards(1)}</div>
@@ -455,11 +664,30 @@ async function renderQcCard(view) {
       return;
     }
 
-    const inkKeys = ["C", "M", "Y"].filter((k) => data.inks[k]);
-    const wheelPatches = [...inkKeys.map((k) => ({ label: k, ...data.inks[k] })),
+    const inkKeys = ["C", "M", "Y", "K"].filter((k) => data.inks[k]);
+    const wheelPatches = [...["C", "M", "Y"].filter((k) => data.inks[k]).map((k) => ({ label: k, ...data.inks[k] })),
       ...data.overprints.filter((o) => WHEEL_ANGLE[o.label.toUpperCase()] != null)];
+
+    // V0.6：会话对比（主会话 vs 对比会话）
+    const compareSid = holder.querySelector("#qc-ink-compare").value;
+    let cmpHtml = "";
+    if (compareSid && compareSid !== sid) {
+      try {
+        const cmp = await apiGet(`/api/qc/compare?session_id_a=${encodeURIComponent(sid)}&session_id_b=${encodeURIComponent(compareSid)}`);
+        cmpHtml = `
+          <div id="qc-compare-block" style="margin-top:14px">
+            <div class="card-title" style="font-size:14px">会话对比 Δ 表（Δ = 主会话 − 对比会话）</div>
+            ${compareTable(cmp)}
+          </div>`;
+      } catch (e) {
+        cmpHtml = `<div class="gamut-error" style="margin-top:10px">对比失败：${esc(e.message)}</div>`;
+      }
+    }
+
     body.innerHTML = `
       <div style="display:flex; gap:10px; flex-wrap:wrap">${inkKeys.map((k) => inkCard(k, data.inks[k])).join("")}</div>
+      ${diagnosisBlock(data.diagnosis)}
+      ${extraMetricsBlock(data)}
       <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:14px">
         <div style="flex:1; min-width:320px">
           <div class="card-title" style="font-size:14px">TVI 网点增大曲线</div>
@@ -470,8 +698,10 @@ async function renderQcCard(view) {
           <canvas id="qc-wheel-canvas" style="margin-top:8px"></canvas>
         </div>
       </div>
+      ${cmpHtml}
       ${data.skipped_records ? `<p class="swatch-meta" style="margin-top:10px">已排除 ${data.skipped_records} 条未达 verified 的记录（warning/rejected）——QC 指标不消费未过门禁的数据。</p>` : ""}
     `;
+    bindDiagnosisToggles(body);
 
     const tviCanvas = body.querySelector("#qc-tvi-canvas");
     const wheelCanvas = body.querySelector("#qc-wheel-canvas");
@@ -484,6 +714,7 @@ async function renderQcCard(view) {
   };
 
   holder.querySelector("#qc-ink-session").addEventListener("change", load);
+  holder.querySelector("#qc-ink-compare").addEventListener("change", load);
   await load();
 }
 
@@ -558,16 +789,18 @@ export async function renderMonitorView(view) {
     <div class="page-head">
       <div>
         <h1 class="large-title">监控</h1>
-        <p class="page-sub">配方 ΔE 趋势、工艺漂移告警与测量数据可靠性闭环</p>
+        <p class="page-sub">配方 ΔE 趋势、工艺漂移告警、测量可靠性闭环与主观评价</p>
       </div>
     </div>
     <div id="monitor-body">${skeletonCards(4)}</div>
     <div id="qc-measure-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
     <div id="qc-ink-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
+    <div id="qc-eval-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
   `;
-  // 测量数据卡与 QC 卡独立加载（与配方统计互不阻塞）
+  // 测量数据卡、QC 卡与主观评价卡独立加载（与配方统计互不阻塞）
   renderMeasurementCard(view);
   renderQcCard(view);
+  renderEvalCard(view);
 
   let stats;
   try {

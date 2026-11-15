@@ -30,6 +30,9 @@ from ..algorithms.core import delta_e_batch
 
 #: 复测一致性：同标签两次测量的 ΔE2000 上限
 REPEAT_MAX_DE = 0.4
+#: 复测一致性（纯密度记录，V0.6）：同标签跨记录滤色密度最大绝对差——
+#: 密度计工作流无 Lab，用密度重复性做复测对（仪器复测容差行业通行 ±0.02-0.05D，取宽口径）
+REPEAT_MAX_DENSITY = 0.05
 #: 纸白 vs 工艺 ICC 纸白的 ΔE 上限
 PAPER_WHITE_MAX_DE = 6.0
 #: 纸白本征合理性：L 下限 / a、b 上限（绝对口径下纸白允许轻微黄移）
@@ -267,11 +270,16 @@ def grade_session(session: dict, records: list[dict], paper_white_lab: list[floa
     eligible = [i for i, v in enumerate(verdicts) if v.reliability != "rejected"]
     if repeat_mode:
         by_label: dict[str, list[tuple[int, list[float]]]] = {}
+        # V0.6：纯密度记录（密度计工作流无 Lab）按密度通道做复测对
+        by_label_dens: dict[str, list[tuple[int, dict]]] = {}
         for ri in eligible:
             for pt in records[ri].get("patches", []):
                 lab = effective_lab(pt)
+                label = str(pt.get("label", "")).strip()
                 if lab is not None:
-                    by_label.setdefault(str(pt.get("label", "")).strip(), []).append((ri, lab))
+                    by_label.setdefault(label, []).append((ri, lab))
+                elif pt.get("densities"):
+                    by_label_dens.setdefault(label, []).append((ri, pt["densities"]))
         if len(eligible) >= 2:
             for label, entries in by_label.items():
                 if len(entries) < 2:
@@ -282,8 +290,26 @@ def grade_session(session: dict, records: list[dict], paper_white_lab: list[floa
                     for ri, _ in entries:
                         repeat_findings.setdefault(ri, []).append(
                             f"复测不一致：标签 {label} 跨记录 ΔE={worst:.2f} > {REPEAT_MAX_DE}")
-        # 复测模式下无任何可配对同标签（含仅 1 条记录）→ 尚不构成有效复测
-        if not any(len(v) >= 2 for v in by_label.values()):
+            # 纯密度复测对：同标签在 Lab 配对缺席时按密度通道逐项比对
+            for label, entries in by_label_dens.items():
+                if label in by_label or len(entries) < 2:
+                    continue
+                channels = set(entries[0][1].keys())
+                for _, dens in entries[1:]:
+                    channels &= set(dens.keys())
+                channels = {c for c in channels if c in ("C", "M", "Y", "K")}
+                if not channels:
+                    continue
+                worst = max(abs(float(dens[c]) - float(entries[0][1][c]))
+                            for _, dens in entries[1:] for c in channels)
+                if worst > REPEAT_MAX_DENSITY:
+                    for ri, _ in entries:
+                        repeat_findings.setdefault(ri, []).append(
+                            f"复测不一致：标签 {label} 跨记录密度差 {worst:.2f} > {REPEAT_MAX_DENSITY}")
+        # 复测模式下无任何可配对同标签（Lab 或密度，含仅 1 条记录）→ 尚不构成有效复测
+        has_pair = (any(len(v) >= 2 for v in by_label.values())
+                    or any(len(v) >= 2 for v in by_label_dens.values()))
+        if not has_pair:
             for ri in eligible:
                 repeat_findings.setdefault(ri, []).append(
                     "复测模式已声明，但未发现可配对的同标签测量（每个目标至少测 2 次）")
