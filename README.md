@@ -1,6 +1,6 @@
 # 色彩工坊 · 印前色彩管理闭环平台
 
-> 面向印前的色彩管理小软件 · V0.6（闭环后半环：从分级数据走向诊断与修正）
+> 面向印前的色彩管理小软件 · V0.7（印刷校准闭环：从校准样张到墨量修正）
 > 以 ΔE / CIEDE2000 为统一度量：**目标 LAB → 工艺 ICC 反查最优 CMYK 配方 → 打印实测 → 闭环修正 → 工艺级累积学习**，
 > 且所有测量数据先过**方法学门禁**（测前登记 → 校准确认 → 测量 → 复测一致性 → 交叉校验 → 可信度分级 → 分级数据流向）。
 
@@ -26,6 +26,7 @@
 | 补偿模型 | 自研（`app/services/compensation.py`） | 实测闭环沉淀工艺级墨量偏置（EMA 累积 + sha 失效），预测时自动应用；**V0.5 起受 verified 门禁约束** |
 | 测量可靠性 | 自研（`cgats.py` / `measurement_qa.py` / `measurements.py` / `density.py`） | CGATS.17 / Status-T 解析（编码容错）、五条校验规则分级（verified/warning/rejected）、GATF 油墨指标与 TVI |
 | QC 诊断与评价 | 自研（`diagnosis.py` / `qc_compare.py` / `evaluations.py` / `testform.py`） | 规则型诊断引擎（R1-R8 行业标准口径）、双会话指标 Δ 对比与工艺趋势、GB/T 34053 主观评价检查单、双点样张 + 目视诊断页 |
+| 印刷校准 | 自研（`calibration.py` + `testform.py` 校准版，V0.7） | ISO 12647-7 风格编号校准版、双基准报告（ICC 预期 + ISO 12647-2 固体参考）、逐通道墨量建议（写入补偿模型）、Lab 有效网点反演校正曲线、特性数据 CGATS 导出 |
 | 后端 | FastAPI + JSON 落盘（`data/`） | API 服务，工艺库/配方记录/补偿模型/测量会话重启不丢（损坏自动隔离备份） |
 | 前端 | 原生 ES Module + Canvas + three.js（vendored，无构建） | iOS 扁平风 SPA，hash 路由，亮/暗主题，2D/真 3D（WebGL）色域组件 |
 
@@ -46,6 +47,7 @@ color-mgmt/
 │   │   ├── measurement_qa.py    # 五条可靠性规则 → verified|warning|rejected
 │   │   ├── measurements.py      # 测量会话存储与导入编排（每次导入全会话重分级）
 │   │   ├── density.py           # GATF 四指标 + TVI + 反差率 K / 叠印率 / 灰平衡 / 均匀性（V0.6）
+│   │   ├── calibration.py       # 印刷校准闭环：双基准报告 / 墨量建议 / 校正曲线 / 特性数据导出（V0.7）
 │   │   ├── diagnosis.py         # 规则型印刷诊断引擎 R1-R8（行业标准口径，V0.6）
 │   │   ├── qc_compare.py        # 双会话指标 Δ 对比 + 工艺趋势时间序列（V0.6）
 │   │   ├── evaluations.py       # 主观评价检查单（GB/T 34053 方法论，V0.6）
@@ -66,7 +68,7 @@ color-mgmt/
 │   └── js/                      # api / router / icons / components / gamut-view / gamut-three / views/*
 ├── scripts/                     # 探针、冒烟、e2e、清理脚本
 ├── data/                        # 运行时数据（工艺 ICC、配方记录、补偿模型）
-└── tests/                       # pytest 154 项（API 层 + 精度基线门禁 + 测量可靠性 + 诊断 + 评价 + fixtures）
+└── tests/                       # pytest 173 项（API 层 + 精度基线门禁 + 测量可靠性 + 诊断 + 评价 + 校准 + fixtures）
 ```
 
 ## 快速开始
@@ -133,6 +135,9 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 | `/api/qc/evaluations/templates` | GET | 主观评价模板（书刊/纸包装/塑料包装）与 5 级打分制说明 |
 | `/api/qc/evaluations` | POST/GET/DELETE | 创建 / 列表 / 详情（含统计）/ 删除主观评价 |
 | `/api/qc/evaluations/entries` | POST | 录入评价人打分（JSON body `{指标: 1-5}`） |
+| `/api/qc/calibration/form` | POST | V0.7 校准版样张（编号色块矩阵）+ 预期值参考表（ICC 预期 Lab + ISO 固体参考列） |
+| `/api/qc/calibration` | GET | 双基准校准报告（逐 patch ΔE + 分量、逐通道墨量建议、校正曲线、导出文本） |
+| `/api/qc/calibration/apply` | POST | 校准建议写入补偿模型（预测立即联动；ICC 替换自动失效） |
 
 **可靠性分级与数据流向**：每条记录输出 `verified / warning / rejected` + 原因 +
 `density_ok` 通道标记。五条规则：①复测一致性（同标签 ΔE≤0.4；**V0.6 起纯密度
@@ -176,6 +181,10 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
   a\*b\* 偏移 / 实地均匀性（样本标准差 CV）全部经手算锚点对拍；诊断规则常量取自
   ISO 12647-2:2013 / GB/T 17934.2 / GATF 口径并在结论中标注依据；纯密度复测
   配对（密度差 ≤0.05）打通密度计工作流。
+- **印刷校准（V0.7）**：双基准 = 工艺 ICC 预期（模型误差）+ ISO 12647-2:2013 涂布纸固体
+  Lab（C/M/Y/K/CMY；非涂布数值来源无法交叉确认暂不收录）；校正曲线用 Lab 有效网点反演
+  （ISO 10128 校正曲线法的 Lab 口径变体，纯色差仪无密度通道也可用）；建议写入补偿模型后
+  `bias_for_predict` 立即生效；曲线反演与建议方向经手算锚点对拍（scaled-axis 构造 e(t)=0.8t）。
 - PCS 为 D50 Lab；前端色块与点云经 Bradford 色适应（D50→D65）转 sRGB / display-p3 显示。
 
 ## 版本
@@ -202,7 +211,12 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
   GATF 油墨四指标 + TVI 曲线 + GATF 色轮（只消费 verified）、A4 CMYK 双点
   重复样张生成器、ΔE 分量分解（dL/da/db/dC/dh/dE76）+ 解读文案、
   补偿模型 verified 门禁。实施记录见 `docs/V0.5-实施规划.md`
-- **V0.6（当前）**：闭环后半环——从分级数据走向诊断与修正 —— QC 指标补全
+- **V0.7（当前）**：印刷校准闭环 —— ISO 12647-7 风格编号校准版（28 色块 × 双点，A4 单页）、
+  双基准报告（实测 vs 工艺 ICC 预期 vs ISO 12647-2 固体参考，逐 patch ΔE00 + dL/da/db/dC/dh 分量）、
+  逐通道墨量建议一键写入补偿模型（预测联动）、Lab 有效网点反演校正曲线（ISO 10128 方法）、
+  特性数据 CGATS 导出（实测/校正后 → 供 ArgyllCMS / i1Profiler 生成正式 ICC）、
+  三步校准向导（工艺详情页）+ 监控页校准状态行。实施记录见 `docs/V0.7-实施规划.md`
+- **V0.6**：闭环后半环——从分级数据走向诊断与修正 —— QC 指标补全
   （反差率 K / 油墨叠印率 / 灰平衡 a\*b\* 偏移 / 实地均匀性，样张补 75% 梯级）、
   规则型诊断引擎 R1-R8（ISO 12647-2 / GB/T 17934.2 / GATF 口径，结论含
   证据/成因/建议/依据）、双会话 Δ 对比 + 工艺趋势时间序列（定期抽检监控暗调）、

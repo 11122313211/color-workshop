@@ -649,8 +649,31 @@ async function renderQcCard(view) {
       return;
     }
 
+    // V0.7：校准状态摘要（会话按校准版测量时才有内容；失败静默——不阻塞 QC 卡）
+    let calHtml = "";
+    try {
+      const cal = await apiGet(`/api/qc/calibration?session_id=${encodeURIComponent(sid)}`);
+      if (cal.matched >= 4) {
+        const badge = {
+          ok: `<span class="badge badge-green">达标</span>`,
+          suggest: `<span class="badge badge-orange">建议校准</span>`,
+          needed: `<span class="badge badge-red">需校准</span>`,
+          "n/a": `<span class="badge" style="background:var(--fill); color:var(--label-2)">无校准数据</span>`,
+        }[cal.overall] || "";
+        calHtml = `
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px">
+            <span class="card-title" style="font-size:14px; margin:0">${icon("printer")}校准状态</span>
+            ${badge}
+            <span class="swatch-meta">ΔE(ICC) max ${cal.summary.max_de_expected ?? "-"} · avg ${cal.summary.avg_de_expected ?? "-"} ·
+              命中 ${cal.matched}/${cal.patch_count_total}</span>
+            <a href="#/processes/${esc(cal.process.id)}" class="swatch-meta" style="color:var(--accent)">打印校准 →</a>
+          </div>`;
+      }
+    } catch (_) { /* 会话未绑定工艺/非 CMYK：无校准行 */ }
+
     if (!data.verified_records || !Object.keys(data.inks).length) {
       body.innerHTML = `
+        ${calHtml}
         <div class="empty">
           <div class="empty-title">本会话暂无可信（verified）测量数据</div>
           <p class="swatch-meta" style="margin-top:6px; text-align:left; line-height:2">
@@ -685,6 +708,7 @@ async function renderQcCard(view) {
     }
 
     body.innerHTML = `
+      ${calHtml}
       <div style="display:flex; gap:10px; flex-wrap:wrap">${inkKeys.map((k) => inkCard(k, data.inks[k])).join("")}</div>
       ${diagnosisBlock(data.diagnosis)}
       ${extraMetricsBlock(data)}

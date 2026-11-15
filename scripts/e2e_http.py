@@ -8,6 +8,9 @@ from pathlib import Path
 import httpx
 from PIL import Image
 
+# 控制台可能为 GBK：check 标签含 −/× 等 Unicode 字符，固定 UTF-8 输出避免编码崩溃
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # 本地固定后端地址（安全：目标硬编码为本机回环地址，不读取任何外部输入）
 client = httpx.Client(base_url="http://127.0.0.1:8765")
 WIN = Path(r"C:/Windows/System32/spool/drivers/color")
@@ -24,7 +27,7 @@ ok = True
 # 0. 静态页与 API 健康
 r = client.get("/api/health")
 ok &= check("健康检查", r.status_code == 200 and r.json()["status"] == "ok", r.text[:80])
-ok &= check("版本号 v0.6.0", r.json().get("version") == "0.6.0")
+ok &= check("版本号 v0.7.0", r.json().get("version") == "0.7.0")
 r = client.get("/", follow_redirects=False)
 ok &= check("根路径重定向", r.status_code == 307 and r.headers["location"] == "/static/index.html")
 r = client.get("/static/index.html")
@@ -422,6 +425,117 @@ ok &= check("V0.6 评价删除", r.status_code == 200 and r.json()["status"] == 
 for sid in (v6_a, v6_b):
     r = client.delete("/api/qc/measurements", params={"session_id": sid})
     ok &= check("V0.6 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
+
+# 7.6 V0.7：校准版 → 双基准报告 → 建议应用 → 导出
+r = client.post("/api/qc/calibration/form", params={"process_id": pid, "dpi": 300})
+ok &= check("V0.7 校准版生成（28 色块单页）", r.status_code == 200
+            and len(r.json()["patches"]) == 28 and r.json()["pages"] == 1
+            and r.json()["pairs_count"] == 28, r.text[:80])
+cal_form = r.json()
+ok &= check("V0.7 参考表（ISO 涂布列仅固体+CMY）",
+            cal_form["reference"]["iso_available"]
+            and sum(1 for p in cal_form["reference"]["patches"] if p["iso_ref_lab"]) == 5
+            and "CMYK_C" in cal_form["reference"]["reference_cgats"])
+
+exp7 = {p["label"]: p["expected_lab"] for p in cal_form["reference"]["patches"]}
+_j = {k: [v[0] + 0.3, v[1] - 0.2, v[2] + 0.1] for k, v in exp7.items()}
+_tsv7 = ("Color Name\tCIE Lab\t\t\tStatus T C\tM\tY\tK\r\n"
+         + "".join(f"{lb}\t{lab[0]:.2f}\t{lab[1]:.2f}\t{lab[2]:.2f}\t\t\t\t\r\n"
+                   for lb, lab in _j.items())).encode("utf-8")
+r = client.post("/api/qc/measurements/import",
+                params={"filename": "e2e_v7.txt", "instrument": "E2E-色差仪", "condition": "M1",
+                        "calibrated_at": "2026-01-01T10:00:00", "repeat_mode": "single",
+                        "process_id": pid}, content=_tsv7,
+                headers={"Content-Type": "application/octet-stream"})
+v7_sid = r.json()["session"]["id"]
+client.post("/api/qc/measurements/import",
+            params={"filename": "e2e_v7.r2", "session_id": v7_sid, "repeat_mode": "repeat"},
+            content=_tsv7, headers={"Content-Type": "application/octet-stream"})
+
+r = client.get("/api/qc/calibration", params={"session_id": v7_sid})
+rep7 = r.json()
+ok &= check("V0.7 校准报告配对 28/28", r.status_code == 200 and rep7["matched"] == 28
+            and rep7["overall"] in ("ok", "suggest", "needed"), r.text[:80])
+ok &= check("V0.7 双基准输出（ΔE ICC + ΔE ISO + 分量）",
+            all(("de_expected" in p and "comps" in p) for p in rep7["patches"])
+            and sum(1 for p in rep7["patches"] if p["de_iso"] is not None) == 5)
+ok &= check("V0.7 逐通道建议 4 条（含方向）",
+            len(rep7["ink_suggestions"]) == 4
+            and all("delta_pct" in s for s in rep7["ink_suggestions"]))
+ok &= check("V0.7 校正曲线 4 通道 × 6 档（端点固定）",
+            len(rep7["curves"]) == 4
+            and all(len(c) == 6 and c[0]["corrected"] == 0.0 and c[-1]["corrected"] == 100.0
+                    for c in rep7["curves"].values()))
+ok &= check("V0.7 导出三件套（曲线 CSV / 实测 / 校正后 CGATS）",
+            rep7["exports"]["curves_csv"].startswith("channel,t_nominal")
+            and "NUMBER_OF_SAMPLES\t28" in rep7["exports"]["characterization_cgats"]
+            and "NUMBER_OF_SAMPLES\t28" in rep7["exports"]["corrected_cgats"])
+ok &= check("V0.7 曲线手算锚点（t=0 恒等、单调）",
+            all(e["t"] <= e2["t"] and e["corrected"] <= e2["corrected"]
+                for c in rep7["curves"].values()
+                for e, e2 in zip(c, c[1:])),
+            str({k: [(e['t'], e['corrected']) for e in v] for k, v in rep7['curves'].items()})[:120])
+
+r = client.post("/api/qc/calibration/apply", params={"session_id": v7_sid})
+applied = r.json()
+ok &= check("V0.7 建议应用 → 补偿模型（n≥2，预测联动）",
+            r.status_code == 200 and applied["applied"] and applied["n"] >= 2
+            and len(applied["bias_device"]) == 4, r.text[:80])
+r = client.get(f"/api/processes/{pid}")
+ok &= check("V0.7 工艺详情返回补偿偏置",
+            r.status_code == 200 and (r.json().get("compensation") or {}).get("bias_device") == applied["bias_device"])
+
+# 守卫：未绑定工艺会话 → 422；非 CMYK 工艺校准版 → 422（内联最小合法 GRAY ICC，同 conftest 构造）
+r = client.post("/api/qc/measurements/import",
+                params={"filename": "e2e_v7_nobind.txt", "instrument": "E2E-色差仪",
+                        "calibrated_at": "2026-01-01T10:00:00", "repeat_mode": "single"},
+                content=_tsv7, headers={"Content-Type": "application/octet-stream"})
+nobind_sid = r.json()["session"]["id"]
+r = client.get("/api/qc/calibration", params={"session_id": nobind_sid})
+ok &= check("V0.7 未绑定工艺 → 422", r.status_code == 422, r.text[:60])
+
+
+def _make_gray_icc(gamma: float = 2.2) -> bytes:
+    import struct
+
+    hdr = bytearray(128)
+    struct.pack_into(">I", hdr, 8, 0x04300000)
+    hdr[12:16] = b"mntr"
+    hdr[16:20] = b"GRAY"
+    hdr[20:24] = b"XYZ "
+    hdr[24:36] = struct.pack(">6H", 2026, 1, 1, 0, 0, 0)
+    hdr[36:40] = b"acsp"
+    struct.pack_into(">i", hdr, 60, 0x0000F6D6)
+    struct.pack_into(">i", hdr, 64, 0x00010000)
+    struct.pack_into(">i", hdr, 68, 0x0000D32D)
+    curve = b"curv" + struct.pack(">II", 0, 1) + struct.pack(">H", int(gamma * 256)) + b"\x00\x00"
+    xyz = b"XYZ " + struct.pack(">I", 0) + struct.pack(">iii", 0x0000F6D6, 0x00010000, 0x0000D32D)
+    text = b"E2E Gray\x00"
+    mluc = b"mluc" + struct.pack(">II", 0, 1) + struct.pack(">HHII", 0x656E, 0x5553, len(text), 24) + text
+    body = struct.pack(">I", 3)
+    offset = 128 + len(body) + 12 * 3
+    entries = b""
+    data = b""
+    for sig, d in ((b"desc", mluc), (b"wtpt", xyz), (b"kTRC", curve)):
+        entries += sig + struct.pack(">II", offset, len(d))
+        data += d
+        offset += len(d)
+    blob = bytes(hdr) + body + entries + data
+    return struct.pack(">I", len(blob)) + blob[4:]
+
+
+r = client.post("/api/processes", params={"name": "E2E-GRAY-校准守卫", "filename": "e2e_gray.icc"},
+                content=_make_gray_icc(), headers={"Content-Type": "application/octet-stream"})
+gray_pid = r.json()["id"]
+r = client.post("/api/qc/calibration/form", params={"process_id": gray_pid})
+ok &= check("V0.7 非 CMYK 工艺校准版 → 422", r.status_code == 422, r.text[:60])
+r = client.delete(f"/api/processes/{gray_pid}")
+ok &= check("V0.7 灰度守卫工艺清理", r.status_code == 200)
+
+# V0.7 清理
+for sid in (v7_sid, nobind_sid):
+    r = client.delete("/api/qc/measurements", params={"session_id": sid})
+    ok &= check("V0.7 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
 
 # 8. 清理
 for p in (pid, pid_b):

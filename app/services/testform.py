@@ -53,6 +53,33 @@ _GRAYS = [
 ]
 _K255 = 255
 
+# ---------------------------------------------------------------------------
+# V0.7 校准版：ISO 12647-7 控制条精神的编号色块集（28 patch，双点重复）
+# ---------------------------------------------------------------------------
+
+#: 校准梯级：100/75/50/25/10（ISO 12647-7:2016 控制条布局）
+_CAL_TINT_STEPS = (100, 75, 50, 25, 10)
+#: 叠印实地（R=M100Y100 G=C100Y100 B=C100M100，与验证样张 _SOLIDS 一致）与灰平衡格
+CAL_PATCHES: list[dict] = []
+_i = 0
+for _ch, _name in enumerate("CMYK"):
+    for _t in _CAL_TINT_STEPS:
+        _i += 1
+        _vals = [0, 0, 0, 0]
+        _vals[_ch] = _t
+        CAL_PATCHES.append({"index": f"P{_i:02d}", "label": f"{_name}{_t}", "device": _vals})
+for _label, _vals in (
+    ("R", (0, 100, 100, 0)), ("G", (100, 0, 100, 0)),
+    ("B", (100, 100, 0, 0)), ("CMY", (100, 100, 100, 0)),
+    ("W", (0, 0, 0, 0)),
+    ("GB1", (50, 40, 40, 0)), ("GB2", (60, 50, 50, 0)), ("GB3", (25, 20, 20, 0)),
+):
+    _i += 1
+    CAL_PATCHES.append({"index": f"P{_i:02d}", "label": _label, "device": list(_vals)})
+
+#: 编号→标签 映射（测量导入时 P 编号与标签等价配对，大小写不敏感）
+CAL_INDEX_MAP = {p["index"].upper(): p["label"] for p in CAL_PATCHES}
+
 
 def _cmyk(value: int, channel: int) -> tuple[int, int, int, int]:
     """单通道网点值（0-100% → 0-255）。channel: 0=C 1=M 2=Y 3=K。"""
@@ -309,4 +336,107 @@ def generate_testform(process_name: str = "", dpi: int = DPI_DEFAULT) -> dict:
         "page_mm": list(PAGE_MM),
         "pages": 2,
         "steps": _INK_STEPS,
+    }
+
+
+# ---------------------------------------------------------------------------
+# V0.7 校准版：编号色块矩阵（单页，双点重复，配合色差仪逐块测量）
+# ---------------------------------------------------------------------------
+
+#: 版面几何（mm）：色块 13mm、列距 17.5mm、行距 21mm——色块间留色差仪孔位余量
+_CAL_PATCH_MM = 13.0
+_CAL_PITCH_X_MM = 17.5
+_CAL_PITCH_Y_MM = 21.0
+_CAL_COLS = 5
+
+
+def _draw_calibration_half(draw: ImageDraw.ImageDraw, x0: int, y0: int, dpi: int,
+                           font: ImageFont.FreeTypeFont) -> list[tuple[str, int, int]]:
+    """绘制一个半版的 28 个编号色块。返回 [(标签, 中心 x, y)]（页面像素坐标）。"""
+    px = lambda v: round(v / 25.4 * dpi)  # noqa: E731
+    positions: list[tuple[str, int, int]] = []
+    for i, p in enumerate(CAL_PATCHES):
+        col = i % _CAL_COLS
+        row = i // _CAL_COLS
+        x = x0 + px(col * _CAL_PITCH_X_MM)
+        y = y0 + px(row * _CAL_PITCH_Y_MM)
+        side = px(_CAL_PATCH_MM)
+        color = tuple(round(v / 100.0 * 255) for v in p["device"])
+        draw.rectangle([x, y, x + side, y + side], fill=color, outline=(0, 0, 0, 255))
+        draw.text((x + side / 2, y + side + px(1.2)), f"{p['index']} {p['label']}",
+                  font=font, fill=(0, 0, 0, 255), anchor="ma")
+        positions.append((p["label"], x + side // 2, y + side // 2))
+    return positions
+
+
+def generate_calibration_form(process_name: str = "", dpi: int = DPI_DEFAULT) -> dict:
+    """生成 A4 CMYK 校准版（单页编号色块矩阵，双点重复）。
+
+    返回 {tiff_b64, pdf_b64, preview_b64, patches, pairs, pairs_count, dpi, page_mm, pages}。
+    patches 为 [{index,label,device(0-100 CMYK)}]——参考值对照与测量配对的唯一依据。
+    """
+    w = round(PAGE_MM[0] / 25.4 * dpi)
+    h = round(PAGE_MM[1] / 25.4 * dpi)
+    margin = round(12 / 25.4 * dpi)
+    img = Image.new("CMYK", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    font_title = _load_font(round(dpi * 0.13))
+    font_meta = _load_font(round(dpi * 0.09))
+    font_foot = _load_font(round(dpi * 0.075))
+
+    title = f"色彩工坊 校准版 · {process_name}" if process_name else "色彩工坊 校准版"
+    draw.text((margin, margin), title, font=font_title, fill=(0, 0, 0, 255))
+    draw.text((w - margin, margin), date.today().isoformat(), font=font_meta,
+              fill=(0, 0, 0, 255), anchor="ra")
+
+    # 双点重复：左右两个镜像半版
+    gap = round(10 / 25.4 * dpi)
+    half_w = (w - margin * 2 - gap) // 2
+    y0 = margin + round(12 / 25.4 * dpi)
+    left = _draw_calibration_half(draw, margin, y0, dpi, font_foot)
+    right = _draw_calibration_half(draw, margin + half_w + gap, y0, dpi, font_foot)
+
+    # 角线（裁切标记）
+    mark = round(6 / 25.4 * dpi)
+    for cx, cy, dx, dy in ((margin, margin, 1, 1), (w - margin, margin, -1, 1),
+                           (margin, h - margin, 1, -1), (w - margin, h - margin, -1, -1)):
+        draw.line([(cx, cy), (cx + dx * mark, cy)], fill=(0, 0, 0, 255), width=2)
+        draw.line([(cx, cy), (cx, cy + dy * mark)], fill=(0, 0, 0, 255), width=2)
+
+    # 测量指引（页脚两行）
+    foot = ("测量指引：① 仪器校准后先测纸白（P25 W）→ ② 按 P 编号逐块测量（同编号左右两块各测一次更佳）→ "
+            "③ 导出含 CIE Lab 的文本，标签保持 P 编号或色块标签")
+    draw.text((w / 2, h - margin - round(5 / 25.4 * dpi)), foot, font=font_foot,
+              fill=(0, 0, 0, 255), anchor="ms")
+    draw.text((w / 2, h - margin), "背衬使用同一批未印刷样张 · 设备值直出（未做 ICC 转换）",
+              font=font_foot, fill=(0, 0, 0, 255), anchor="ms")
+
+    tiff_buf = io.BytesIO()
+    img.save(tiff_buf, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
+    pdf_buf = io.BytesIO()
+    img.save(pdf_buf, format="PDF", resolution=dpi)
+    preview = img.convert("RGB").resize((w // 5, h // 5))
+    preview_buf = io.BytesIO()
+    preview.save(preview_buf, format="PNG")
+
+    left_map = {label: (px, py) for label, px, py in left}
+    to_mm = lambda v: round(v / dpi * 25.4, 1)  # noqa: E731
+    pairs = []
+    for label, px, py in right:
+        if label in left_map:
+            lx, ly = left_map[label]
+            pairs.append({"label": label,
+                          "pos_a_mm": [to_mm(lx), to_mm(ly)],
+                          "pos_b_mm": [to_mm(px), to_mm(py)]})
+    return {
+        "tiff_b64": base64.b64encode(tiff_buf.getvalue()).decode(),
+        "pdf_b64": base64.b64encode(pdf_buf.getvalue()).decode(),
+        "preview_b64": "data:image/png;base64," + base64.b64encode(preview_buf.getvalue()).decode(),
+        "patches": [{**p} for p in CAL_PATCHES],
+        "pairs": pairs,
+        "pairs_count": len(pairs),
+        "dpi": dpi,
+        "page_mm": list(PAGE_MM),
+        "pages": 1,
     }

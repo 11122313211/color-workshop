@@ -1,4 +1,4 @@
-"""QC 测量可靠性闭环路由（V0.5 · M1，V0.6 诊断/对比/评价扩展）。
+"""QC 测量可靠性闭环路由（V0.5 · M1，V0.6 诊断/对比/评价，V0.7 校准闭环）。
 
 会话登记 → 导入解析 → 五条可靠性规则分级 → 分级数据流向。
 - POST /api/qc/measurements/import   导入测量文件（raw bytes，一次一个文件）
@@ -11,6 +11,9 @@
 - POST /api/qc/evaluations/entries   录入评价人打分（JSON body）
 - GET  /api/qc/evaluations           评价列表 / 详情（含统计）
 - DELETE /api/qc/evaluations         删除评价
+- POST /api/qc/calibration/form      校准版样张 + 预期值参考表（V0.7）
+- GET  /api/qc/calibration           双基准校准报告（V0.7）
+- POST /api/qc/calibration/apply     校准建议写入补偿模型（V0.7）
 """
 
 from __future__ import annotations
@@ -285,6 +288,89 @@ def make_testform(
     result = generate_testform(process_name=proc.get("name", ""), dpi=dpi)
     result["process"] = {"id": proc["id"], "name": proc.get("name", "")}
     return result
+
+
+@router.post("/calibration/form")
+def calibration_form(
+    process_id: str = Query(..., description="工艺 id"),
+    dpi: int = Query(300, ge=150, le=600, description="输出分辨率"),
+):
+    """生成 A4 CMYK 校准版（编号色块矩阵）+ 预期值参考表（V0.7 校准闭环第 1 步）。
+
+    reference.patches 含每色块的 ICC 预期 Lab 与 ISO 12647-2 固体参考列（仅涂布纸）。
+    """
+    proc = _processes.get(process_id)
+    if proc is None:
+        raise HTTPException(404, "工艺不存在")
+    if (proc.get("icc_meta") or {}).get("device_space") != "CMYK":
+        raise HTTPException(422, "校准版按四色印刷设计，仅支持 CMYK 工艺")
+    from ..services.calibration import build_reference
+    from ..services.testform import generate_calibration_form
+
+    result = generate_calibration_form(process_name=proc.get("name", ""), dpi=dpi)
+    result["process"] = {"id": proc["id"], "name": proc.get("name", "")}
+    result["reference"] = build_reference(proc)
+    return result
+
+
+@router.get("/calibration")
+def calibration_report_ep(
+    session_id: str = Query(..., description="测量会话 id（需绑定 CMYK 工艺）"),
+):
+    """双基准校准报告：逐 patch 实测 vs ICC 预期 vs ISO 12647-2 参考（V0.7 第 2 步）。
+
+    含逐通道墨量建议、校正曲线与三个导出文本（曲线 CSV / 实测特性数据 / 校正后特性数据）。
+    """
+    session = measurements.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "测量会话不存在")
+    proc = _bound_cmyk_process(session)
+    from ..services.calibration import calibration_report
+
+    report = calibration_report(proc, session)
+    report["session_id"] = session_id
+    report["process"] = {"id": proc["id"], "name": proc.get("name", "")}
+    return report
+
+
+@router.post("/calibration/apply")
+def calibration_apply(
+    session_id: str = Query(..., description="测量会话 id（校准报告已生成）"),
+):
+    """把校准报告的逐通道墨量建议写入补偿模型（V0.7 第 3 步，预测立即联动）。"""
+    session = measurements.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "测量会话不存在")
+    proc = _bound_cmyk_process(session)
+    from ..services.calibration import apply_suggestions, calibration_report
+
+    report = calibration_report(proc, session)
+    if report["overall"] == "n/a":
+        raise HTTPException(422, "会话未按校准版测量（色块命中不足），无法应用建议")
+    doc = apply_suggestions(proc, report)
+    return {
+        "applied": True,
+        "session_id": session_id,
+        "process": {"id": proc["id"], "name": proc.get("name", "")},
+        "bias_device": doc["bias_device"],
+        "n": doc["n"],
+        "updated_at": doc["updated_at"],
+        "suggestions": report["ink_suggestions"],
+        "summary": report["summary"],
+    }
+
+
+def _bound_cmyk_process(session: dict) -> dict:
+    """校准会话的工艺校验：必须绑定且为 CMYK。"""
+    pid = session.get("process_id") or ""
+    if not pid:
+        raise HTTPException(422, "会话未绑定工艺，无法校准（导入时传 process_id）")
+    proc = _processes.get(pid)
+    if proc is None:
+        raise HTTPException(404, "绑定的工艺不存在")
+    if (proc.get("icc_meta") or {}).get("device_space") != "CMYK":
+        raise HTTPException(422, "校准闭环仅支持 CMYK 工艺")
+    return proc
 
 
 @router.delete("/measurements")

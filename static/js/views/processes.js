@@ -560,6 +560,238 @@ async function openTestformModal(view, p) {
   modal.modal.querySelector("[data-tf-close]").addEventListener("click", () => modal.close());
 }
 
+/* 打印校准向导（V0.7）：① 生成校准版+参考表 → ② 导入测量+双基准报告 → ③ 应用墨量建议+导出。
+ * 双基准：工艺 ICC 预期（模型误差）+ ISO 12647-2 固体参考（绝对达标，仅涂布纸）。
+ * 校准建议一键写入补偿模型（预测联动）；校正曲线/特性数据导出供外部专业软件生成 ICC。 */
+async function openCalibrationModal(view, p) {
+  const state = { step: 1, form: null, sessionId: "", report: null, applied: null };
+  const OVERALL_BADGE = {
+    ok: `<span class="badge badge-green">${icon("check")}达标</span>`,
+    suggest: `<span class="badge badge-orange">建议校准</span>`,
+    needed: `<span class="badge badge-red">需校准</span>`,
+    "n/a": `<span class="badge" style="background:var(--fill); color:var(--label-2)">无校准数据</span>`,
+  };
+  const sw = (lab) => `<span class="swatch" style="background:${labToHex(lab)}; display:inline-block; width:22px; height:16px; border-radius:4px; border:1px solid var(--separator)"></span>`;
+
+  const modal = openModal(`
+    <h3 class="title">${icon("printer")}打印校准 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
+    <div id="cal-steps" class="swatch-meta" style="display:flex; gap:14px; margin-top:6px"></div>
+    <div id="cal-body" style="margin-top:12px"></div>
+  `);
+  const $ = (sel) => modal.modal.querySelector(sel);
+
+  const renderSteps = () => {
+    const names = ["① 生成校准版", "② 测量与报告", "③ 应用与导出"];
+    $("#cal-steps").innerHTML = names
+      .map((n, i) => `<span style="${state.step === i + 1 ? "color:var(--text); font-weight:700" : "color:var(--label-3)"}">${n}</span>`)
+      .join(`<span style="color:var(--label-3)">→</span>`);
+  };
+
+  const renderStep1 = () => {
+    renderSteps();
+    $("#cal-body").innerHTML = `
+      <p class="swatch-meta">A4 编号色块矩阵（28 色块 × 左右双点）：单色梯级 100/75/50/25/10、三色叠印、灰平衡、纸白。
+        打印后用色差仪<b>按 P 编号逐块测量两遍</b>（两遍分别导出，构成复测对——单遍数据不可信）。</p>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:12px">
+        <div class="field" style="margin:0">
+          <label>分辨率</label>
+          <select id="cal-dpi" class="input"><option>300</option><option>600</option></select>
+        </div>
+        <span style="flex:1"></span>
+        <button class="btn cal-gen" type="button">${icon("printer")}生成校准版</button>
+      </div>
+      <div id="cal-gen-result" style="margin-top:12px"></div>`;
+    $(".cal-gen").addEventListener("click", async () => {
+      const dpi = Number($("#cal-dpi").value || 300);
+      const btn = $(".cal-gen");
+      btn.disabled = true;
+      $("#cal-gen-result").innerHTML = `<p class="swatch-meta">生成中…</p>`;
+      try {
+        state.form = await apiPostRaw("/api/qc/calibration/form", { process_id: p.id, dpi }, new Uint8Array(0));
+        const ref = state.form.reference;
+        $("#cal-gen-result").innerHTML = `
+          <img src="${state.form.preview_b64}" alt="校准版预览"
+            style="width:100%; max-width:340px; display:block; margin:0 auto; border-radius:10px; border:1px solid var(--separator)">
+          <div class="swatch-meta" style="margin-top:10px">
+            ${state.form.page_mm[0]}×${state.form.page_mm[1]}mm @${dpi}dpi · 28 色块 × 2 双点 ·
+            参考基准：ICC 预期${ref.iso_available ? " + ISO 12647-2（涂布纸）" : "（纸张非涂布/未分类，ISO 列留空）"}
+          </div>
+          <div style="display:flex; gap:10px; margin-top:12px; flex-wrap:wrap">
+            <button class="btn cal-pdf" type="button">${icon("download")}下载 PDF（打印）</button>
+            <button class="btn btn-secondary cal-tiff" type="button">${icon("download")}下载 TIFF</button>
+            <button class="btn btn-secondary cal-ref" type="button">${icon("download")}下载参考表（CGATS）</button>
+          </div>
+          <div style="margin-top:14px; text-align:right">
+            <button class="btn cal-next1" type="button">下一步：测量与报告 →</button>
+          </div>`;
+        $(".cal-pdf").addEventListener("click", () =>
+          downloadDataUri(`data:application/pdf;base64,${state.form.pdf_b64}`, `calibration-${p.name}-${dpi}dpi.pdf`));
+        $(".cal-tiff").addEventListener("click", () =>
+          downloadDataUri(`data:image/tiff;base64,${state.form.tiff_b64}`, `calibration-${p.name}-${dpi}dpi.tif`));
+        $(".cal-ref").addEventListener("click", () => downloadDataUri(
+          `data:text/plain;base64,${btoa(unescape(encodeURIComponent(ref.cgats_reference || "")))}`,
+          `calibration-reference-${p.name}.txt`));
+        $(".cal-next1").addEventListener("click", renderStep2);
+      } catch (e) {
+        $("#cal-gen-result").innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
+      }
+      btn.disabled = false;
+    });
+  };
+
+  const renderStep2 = () => {
+    renderSteps();
+    const now = new Date();
+    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+    const localIso = now.toISOString().slice(0, 16);
+    $("#cal-body").innerHTML = `
+      <p class="swatch-meta">导入色差仪导出的测量文本（含 CIE Lab）。<b>两遍测量分别导出两个文件</b>依次导入，
+        同色块两点自动构成复测对；单遍数据会被判为 warning 不进入报告。</p>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px">
+        <div class="field"><label>仪器 *</label><input id="cal-instrument" class="input" value="色差仪（校准）"></div>
+        <div class="field"><label>校准时间 *</label><input id="cal-calibrated" class="input" type="datetime-local" value="${localIso}"></div>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label>测量文件（可多选，按测量顺序）</label>
+        <input id="cal-files" class="input" type="file" multiple accept=".txt,.csv,.it8,.cgats">
+      </div>
+      <div style="margin-top:10px"><button class="btn cal-import" type="button">${icon("upload")}导入并生成报告</button></div>
+      <div id="cal-report" style="margin-top:12px"></div>
+      <div style="margin-top:14px; display:flex; justify-content:space-between">
+        <button class="btn btn-secondary cal-back2" type="button">← 上一步</button>
+        <button class="btn cal-next2" type="button" disabled>下一步：应用与导出 →</button>
+      </div>`;
+    $(".cal-back2").addEventListener("click", renderStep1);
+
+    const renderReport = (rep) => {
+      const sugChips = (rep.ink_suggestions || []).map((s) => {
+        if (!s.available) return `<span class="chip chip-mono" style="color:var(--label-3)">${s.channel} 缺固体实测</span>`;
+        if (Math.abs(s.delta_pct) < 0.5) return `<span class="chip chip-mono">${s.channel} ±0%</span>`;
+        const warn = s.beyond_range ? ` ⚠超出墨量修正范围` : "";
+        return `<span class="chip chip-mono">${s.channel} ${s.delta_pct > 0 ? "+" : ""}${s.delta_pct}%${warn}</span>`;
+      }).join(" ");
+      const rows = (rep.patches || []).map((row) => `
+        <tr>
+          <td class="swatch-meta">${row.index} ${esc(row.label)}</td>
+          <td>${sw(row.measured_lab)}</td>
+          <td>${sw(row.expected_lab)}</td>
+          <td class="swatch-meta chip-mono">${row.de_expected}</td>
+          <td class="swatch-meta chip-mono">${row.de_iso ?? "-"}</td>
+          <td>${row.pass_iso === null ? `<span class="swatch-meta" style="color:var(--label-3)">-</span>`
+            : row.pass_iso ? `<span class="badge badge-green">达标</span>` : `<span class="badge badge-red">超差</span>`}</td>
+        </tr>`).join("");
+      $("#cal-report").innerHTML = `
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+          ${OVERALL_BADGE[rep.overall] || ""}
+          <span class="swatch-meta">命中 ${rep.matched}/${rep.patch_count_total} ·
+            ΔE(ICC) max ${rep.summary.max_de_expected ?? "-"} / avg ${rep.summary.avg_de_expected ?? "-"}</span>
+          ${rep.paper_class === "uncoated" || !rep.iso_available ? `<span class="swatch-meta" style="color:var(--label-3)">ISO 参考列：非涂布纸暂未收录</span>` : ""}
+        </div>
+        ${sugChips ? `<div style="margin-top:8px">${sugChips}</div>` : ""}
+        <div style="max-height:300px; overflow:auto; margin-top:10px">
+          <table class="lab-table" style="width:100%">
+            <thead><tr><th>色块</th><th>实测</th><th>预期</th><th>ΔE ICC</th><th>ΔE ISO</th><th>ISO 判定</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+      const canProceed = rep.overall !== "n/a";
+      $(".cal-next2").disabled = !canProceed;
+      if (canProceed) $(".cal-next2").addEventListener("click", renderStep3);
+    };
+
+    $(".cal-import").addEventListener("click", async () => {
+      const files = $("#cal-files").files;
+      if (!files.length) { toast("请先选择测量文件", "err"); return; }
+      const btn = $(".cal-import");
+      btn.disabled = true;
+      $("#cal-report").innerHTML = `<p class="swatch-meta">导入中…</p>`;
+      try {
+        for (let i = 0; i < files.length; i++) {
+          const bytes = new Uint8Array(await fileToArrayBuffer(files[i]));
+          const query = { filename: files[i].name, process_id: p.id, repeat_mode: "single" };
+          if (state.sessionId) {
+            query.session_id = state.sessionId;
+            query.repeat_mode = "repeat";  // 追加文件 = 复测组，会话整体重分级
+          } else {
+            query.instrument = $("#cal-instrument").value.trim() || "色差仪（校准）";
+            query.calibrated_at = $("#cal-calibrated").value;
+            query.condition = "M1";
+          }
+          const res = await apiPostRaw("/api/qc/measurements/import", query, bytes);
+          state.sessionId = res.session.id;
+        }
+        state.report = await apiGet(`/api/qc/calibration?session_id=${encodeURIComponent(state.sessionId)}`);
+        renderReport(state.report);
+      } catch (e) {
+        $("#cal-report").innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
+      }
+      btn.disabled = false;
+    });
+  };
+
+  const renderStep3 = () => {
+    renderSteps();
+    const rep = state.report;
+    const sugRows = (rep.ink_suggestions || []).filter((s) => s.available).map((s) => `
+      <div class="chip chip-mono" style="padding:8px 12px">
+        <b>${s.channel}</b>&nbsp; 实测 L ${s.measured_lab[0]} → 建议 ${s.delta_pct > 0 ? "+" : ""}${s.delta_pct}%
+        （修正后 ${s.corrected_pct}%）${s.beyond_range ? ` <span style="color:var(--orange)">⚠ 超出墨量可修正范围</span>` : ""}
+      </div>`).join("");
+    $("#cal-body").innerHTML = `
+      <p class="swatch-meta">把逐通道墨量建议写入工艺补偿模型（立即作用于后续配方预测），
+        并导出校正输出——正式 ICC 建议将导出的特性数据交给 ArgyllCMS / i1Profiler 等专业软件生成。</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px">${sugRows || `<span class="swatch-meta" style="color:var(--label-3)">无可下发的建议</span>`}</div>
+      <div style="display:flex; gap:10px; margin-top:14px; flex-wrap:wrap">
+        <button class="btn cal-apply" type="button">${icon("check")}应用到补偿模型</button>
+        <button class="btn btn-secondary cal-csv" type="button">${icon("download")}校正曲线 CSV</button>
+        <button class="btn btn-secondary cal-char" type="button">${icon("download")}实测特性数据 CGATS</button>
+        <button class="btn btn-secondary cal-corr" type="button">${icon("download")}校正后特性数据 CGATS</button>
+      </div>
+      <div id="cal-apply-result" style="margin-top:10px"></div>
+      <p class="swatch-meta" style="margin-top:12px; color:var(--label-2)">
+        建议流程：应用建议 → 重新打印校准版并测量 → 报告应转向「达标」。特性数据为「校准后设备」的一阶近似，
+        正式建 ICC 前请用应用校正后的印刷条件重新测量。</p>
+      <div style="margin-top:14px">
+        <button class="btn btn-secondary cal-back3" type="button">← 上一步</button>
+      </div>`;
+    $(".cal-back3").addEventListener("click", renderStep2);
+    $(".cal-csv").addEventListener("click", () => downloadDataUri(
+      `data:text/csv;base64,${btoa(unescape(encodeURIComponent(state.report.exports.curves_csv)))}`,
+      `calibration-curves-${p.name}.csv`));
+    $(".cal-char").addEventListener("click", () => downloadDataUri(
+      `data:text/plain;base64,${btoa(unescape(encodeURIComponent(state.report.exports.characterization_cgats)))}`,
+      `characterization-${p.name}.txt`));
+    $(".cal-corr").addEventListener("click", () => downloadDataUri(
+      `data:text/plain;base64,${btoa(unescape(encodeURIComponent(state.report.exports.corrected_cgats)))}`,
+      `characterization-corrected-${p.name}.txt`));
+    $(".cal-apply").addEventListener("click", async () => {
+      const ok = await confirmDanger({
+        title: "应用校准建议？",
+        message: "逐通道墨量偏置将写入补偿模型并立即作用于配方预测（可随时在补偿卡重置）。",
+        confirmText: "应用",
+      });
+      if (!ok) return;
+      const btn = $(".cal-apply");
+      btn.disabled = true;
+      try {
+        state.applied = await apiPostRaw("/api/qc/calibration/apply", { session_id: state.sessionId }, new Uint8Array(0));
+        const chips = (state.applied.bias_device || [])
+          .map((v, i) => Math.abs(v) < 0.0005 ? "" :
+            `<span class="chip chip-mono">${"CMYK"[i]} ${v * 100 > 0 ? "+" : ""}${(v * 100).toFixed(1)}%</span>`).join(" ");
+        $("#cal-apply-result").innerHTML = `
+          <div class="badge badge-green">${icon("check")}已写入补偿模型（n=${state.applied.n}）</div>
+          <div style="margin-top:8px">${chips || `<span class="swatch-meta" style="color:var(--label-3)">偏置≈0（无需调整）</span>`}</div>`;
+        toast("校准建议已应用", "ok");
+      } catch (e) {
+        $("#cal-apply-result").innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
+      }
+      btn.disabled = false;
+    });
+  };
+
+  renderStep1();
+}
+
 /* 色域对比模态（V0.4）：双工艺凸包叠加 + 交集多边形 + xy 面积指标 */
 async function openCompareModal(view, p) {  let others = [];
   try {
@@ -704,6 +936,9 @@ export async function renderProcessDetail(view, params) {
             <span><i class="dot legend-srgb"></i>sRGB</span>
             <span><i class="dot legend-proc"></i>工艺凸包 · 采样点按 L* 着色</span>
           </div>
+          ${p.icc_meta.device_space === "CMYK"
+            ? `<button class="btn btn-secondary btn-sm" id="btn-calibration">${icon("printer")}打印校准</button>`
+            : ""}
           <button class="btn btn-secondary btn-sm" id="btn-testform">${icon("doc")}生成验证样张</button>
           <button class="btn btn-secondary btn-sm" id="btn-compare">${icon("compare")}色域对比</button>
         </div>
@@ -770,6 +1005,8 @@ export async function renderProcessDetail(view, params) {
   );
   view.querySelector("#btn-compare").addEventListener("click", () => openCompareModal(view, p));
   view.querySelector("#btn-testform").addEventListener("click", () => openTestformModal(view, p));
+  const calBtn = view.querySelector("#btn-calibration");
+  if (calBtn) calBtn.addEventListener("click", () => openCalibrationModal(view, p));
   view.querySelector("#btn-delete").addEventListener("click", async () => {
     const ok = await confirmDanger({
       title: `删除工艺「${p.name}」？`,

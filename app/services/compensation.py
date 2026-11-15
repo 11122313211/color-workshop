@@ -75,3 +75,29 @@ class CompensationStore:
         if int(doc.get("n", 0)) < MIN_N:
             return None
         return doc.get("bias_device")
+
+    def apply_calibration(self, pid: str, icc_sha256: str, delta_device) -> dict:
+        """校准建议写入（V0.7）：直接叠加（区别于 EMA——校准是用户显式确认的动作）。
+
+        sha 不匹配时按既有语义重置（新 ICC 的墨量行为可能完全不同）；
+        n 提升至 MIN_N（显式校准视为可信样本，越过应用门槛）。
+        """
+        delta = np.clip(np.asarray(delta_device, dtype=np.float64), -BIAS_CAP, BIAS_CAP)
+        doc = self._store.get(pid)
+        if not doc or doc.get("icc_sha256") != icc_sha256:
+            doc = {"icc_sha256": icc_sha256, "n": 0, "bias_device": [0.0] * len(delta)}
+        bias = np.clip(np.asarray(doc["bias_device"], dtype=np.float64) + delta, -BIAS_CAP, BIAS_CAP)
+        doc["n"] = max(int(doc.get("n", 0)), MIN_N)
+        doc["bias_device"] = [round(float(v), 4) for v in bias]
+        doc.setdefault("history", []).append(
+            {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "source": "calibration",
+                "delta_device": [round(float(v), 4) for v in delta],
+            }
+        )
+        if len(doc["history"]) > HISTORY_MAX:
+            doc["history"] = doc["history"][-HISTORY_MAX:]
+        doc["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._store.put(pid, doc)
+        return doc
