@@ -129,3 +129,7 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
   交互基建（模态焦点圈闭 / 骨架屏 / 危险确认弹层 / 375px 适配）、
   测试体系去平台化（50 项，含 API 层与精度基线门禁）。
   路线图见 `docs/V0.3-下一阶段规划.md`（V0.4：three.js 真 3D、lcms2 浮点精度等）
+
+## 许可
+
+[MIT](LICENSE)（第三方测试 ICC 资产的许可单独见 `tests/fixtures/icc/THIRD-PARTY-LICENSES.md`）
