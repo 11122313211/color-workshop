@@ -176,7 +176,7 @@ with sync_playwright() as pw:
     pg.wait_for_timeout(500)
     pg.screenshot(path=str(OUT / "qc-wizard.png"), full_page=False)
 
-    # 4) 375px 监控页（滚动到 QC 卡）
+    # 4) 375px 监控页（QC 卡特写 + 色轮特写两段覆盖）
     pg.close()
     m = browser.new_page(viewport={"width": 375, "height": 812})
     m.goto(f"{BASE}/static/index.html#/monitor")
@@ -185,6 +185,9 @@ with sync_playwright() as pw:
     scroll_main_to(m, "#qc-ink-card")
     m.wait_for_timeout(400)
     m.screenshot(path=str(OUT / "monitor-375.png"), full_page=False)
+    scroll_main_to(m, "#qc-wheel-canvas", top_below=140)
+    m.wait_for_timeout(400)
+    m.screenshot(path=str(OUT / "monitor-375-wheel.png"), full_page=False)
     m.close()
 
     # 5) 工艺详情 → 生成样张模态
