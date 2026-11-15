@@ -1,0 +1,85 @@
+{
+  "profile": "littlecms testbed test2.icc (CMYK/Lab)",
+  "targets": [
+    {
+      "label": "中红",
+      "lab": [
+        50.0,
+        20.0,
+        5.0
+      ],
+      "delta_e": 0.196,
+      "recipe": {
+        "C": 37.5,
+        "M": 76.6,
+        "Y": 51.6,
+        "K": 14.1
+      },
+      "converged": true
+    },
+    {
+      "label": "青",
+      "lab": [
+        50.0,
+        -20.0,
+        -25.0
+      ],
+      "delta_e": 0.196,
+      "recipe": {
+        "C": 100.0,
+        "M": 6.2,
+        "Y": 6.2,
+        "K": 31.2
+      },
+      "converged": true
+    },
+    {
+      "label": "橙",
+      "lab": [
+        60.0,
+        30.0,
+        40.0
+      ],
+      "delta_e": 0.344,
+      "recipe": {
+        "C": 0.0,
+        "M": 57.8,
+        "Y": 100.0,
+        "K": 14.1
+      },
+      "converged": true
+    },
+    {
+      "label": "浅暖黄",
+      "lab": [
+        85.0,
+        -8.0,
+        30.0
+      ],
+      "delta_e": 0.322,
+      "recipe": {
+        "C": 18.8,
+        "M": 6.2,
+        "Y": 46.9,
+        "K": 0.0
+      },
+      "converged": true
+    },
+    {
+      "label": "色域外绿",
+      "lab": [
+        55.0,
+        -80.0,
+        25.0
+      ],
+      "delta_e": 9.155,
+      "recipe": {
+        "C": 100.0,
+        "M": 0.0,
+        "Y": 90.6,
+        "K": 0.0
+      },
+      "converged": false
+    }
+  ]
+}

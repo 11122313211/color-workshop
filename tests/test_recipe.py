@@ -1,64 +1,28 @@
 """配方反查引擎测试。
 
-运行: python -m pytest tests/test_recipe.py -v
-CMYK ICC 取自 Windows 系统 profile（RSWOP / JapanColor）；无系统 profile 时跳过。
+ICC 资产：tests/fixtures/icc/（littlecms testbed，MIT，跨平台）；
+GRAY profile 由 conftest 运行时构造。运行: python -m pytest tests/test_recipe.py -v
 """
 
-import io
-import os
-import sys
-from pathlib import Path
-
 import numpy as np
-from PIL import Image
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.processes import detect_device_space
-from app.services.recipe import (
-    CHANNEL_NAMES,
-    RecipeStore,
-    predict_recipe,
-    run_verification,
-)
-
-WIN_COLOR_DIR = Path(r"C:/Windows/System32/spool/drivers/color")
+from app.services.recipe import RecipeStore, predict_recipe, run_verification
 
 
-def _load_cmyk_icc() -> bytes:
-    """加载系统 CMYK profile；不存在则跳过测试。"""
-    for name in ("RSWOP.icm", "JapanColor2001Coated.icc"):
-        p = WIN_COLOR_DIR / name
-        if p.exists():
-            return p.read_bytes()
-    import pytest
-    pytest.skip("系统无 CMYK ICC profile（RSWOP/JapanColor），跳过 CMYK 反查测试")
-
-
-def _load_rgb_icc() -> bytes:
-    for name in ("sRGB Color Space Profile.icm", "AdobeRGB1998.icc"):
-        p = WIN_COLOR_DIR / name
-        if p.exists():
-            return p.read_bytes()
-    import pytest
-    pytest.skip("系统无 RGB ICC profile，跳过 RGB 反查测试")
-
-
-def test_detect_device_space():
+def test_detect_device_space(cmyk_icc, rgb_icc, gray_icc):
     """ICC 头部签名探测设备色彩空间。"""
-    icc = _load_cmyk_icc()
-    assert detect_device_space(icc) == "CMYK"
-    rgb = _load_rgb_icc()
-    assert detect_device_space(rgb) == "RGB"
+    assert detect_device_space(cmyk_icc) == "CMYK"
+    assert detect_device_space(rgb_icc) == "RGB"
+    assert detect_device_space(gray_icc) == "GRAY"
     print("[PASS] 设备色彩空间探测")
 
 
-def test_forward_physical_sanity():
+def test_forward_physical_sanity(cmyk_icc):
     """正向预测物理合理性：CMYK 四原色的 Lab 方向正确。"""
-    icc = _load_cmyk_icc()
     from app.services.recipe import _build_forward
 
-    forward = _build_forward(icc, 4)
+    forward = _build_forward(cmyk_icc, 4)
     pts = np.array([
         [0.0, 0.0, 0.0, 0.0],  # 纸色 -> L≈100
         [0.0, 1.0, 1.0, 0.0],  # M+Y 红 -> a>0
@@ -73,9 +37,8 @@ def test_forward_physical_sanity():
     print("[PASS] 正向预测物理合理性")
 
 
-def test_predict_recipe_cmyk():
+def test_predict_recipe_cmyk(cmyk_icc):
     """LAB→CMYK 反查：色域内目标应收敛到 ΔE<3。"""
-    icc = _load_cmyk_icc()
     targets = [
         [50.0, 20.0, 5.0],    # 中红
         [50.0, -20.0, -25.0],  # 青
@@ -83,41 +46,51 @@ def test_predict_recipe_cmyk():
         [85.0, -8.0, 30.0],   # 浅暖黄
     ]
     for target in targets:
-        r = predict_recipe(icc, "CMYK", target, tolerance=2.0)
+        r = predict_recipe(cmyk_icc, "CMYK", target, tolerance=2.0)
         assert set(r["recipe"].keys()) == {"C", "M", "Y", "K"}
         assert all(0.0 <= v <= 100.0 for v in r["recipe"].values())
         assert r["delta_e"] < 3.0, f"目标 {target} 预测 ΔE={r['delta_e']} 应优于 3"
         assert r["converged"] is True
         assert len(r["iterations"]) >= 1
         assert r["predictions"] > 0
-    print("[PASS] LAB→CMYK 反查收敛（4 个色域内目标全部 ΔE<3）")
+        # 轨迹应为严格递减序列（去重后）
+        assert all(a > b for a, b in zip(r["iterations"], r["iterations"][1:])), (
+            f"ΔE 轨迹应递减无重复: {r['iterations']}"
+        )
+    print("[PASS] LAB→CMYK 反查收敛（4 个色域内目标全部 ΔE<3，轨迹递减）")
 
 
-def test_predict_recipe_rgb_process():
+def test_predict_recipe_gray(gray_icc):
+    """GRAY 工艺反查（1 通道引擎泛化，P0 修复回归）。"""
+    # 生成式灰度 profile 语义为「亮度」：L 目标越高 K 通道值越大
+    r = predict_recipe(gray_icc, "GRAY", [60.0, 0.0, 0.0], tolerance=2.0)
+    assert set(r["recipe"].keys()) == {"K"}
+    assert 0.0 <= r["recipe"]["K"] <= 100.0
+    assert r["delta_e"] <= 1.5, f"灰度曲线目标应精确收敛，ΔE={r['delta_e']}"
+    print(f"[PASS] GRAY 工艺反查（ΔE={r['delta_e']}）")
+
+
+def test_predict_recipe_rgb_process(rgb_icc):
     """RGB 工艺反查（3 通道引擎泛化）。"""
-    icc = _load_rgb_icc()
     # sRGB 色域内的目标：Lab 50,20,5 ≈ 暗红
-    r = predict_recipe(icc, "RGB", [50.0, 20.0, 5.0], tolerance=2.0)
+    r = predict_recipe(rgb_icc, "RGB", [50.0, 20.0, 5.0], tolerance=2.0)
     assert set(r["recipe"].keys()) == {"R", "G", "B"}
     assert r["delta_e"] < 3.0
     print(f"[PASS] RGB 工艺反查（ΔE={r['delta_e']}）")
 
 
-def test_predict_recipe_out_of_gamut():
+def test_predict_recipe_out_of_gamut(cmyk_icc):
     """色域外目标：正常返回最优可印配方，不收敛但不应崩溃。"""
-    icc = _load_cmyk_icc()
-    r = predict_recipe(icc, "CMYK", [55.0, -80.0, 25.0], tolerance=2.0)  # 高饱和绿，胶印印不出
+    r = predict_recipe(cmyk_icc, "CMYK", [55.0, -80.0, 25.0], tolerance=2.0)  # 高饱和绿
     assert r["converged"] is False
     assert r["delta_e"] > 2.0
-    # 仍是合法配方
     assert all(0.0 <= v <= 100.0 for v in r["recipe"].values())
     print(f"[PASS] 色域外目标返回最优可印配方（ΔE={r['delta_e']}，不虚假收敛）")
 
 
-def test_verification_closed_loop():
+def test_verification_closed_loop(cmyk_icc):
     """实测验证闭环：模型误差补偿应改善 ΔE。"""
-    icc = _load_cmyk_icc()
-    r = predict_recipe(icc, "CMYK", [50.0, 20.0, 5.0], tolerance=2.0)
+    r = predict_recipe(cmyk_icc, "CMYK", [50.0, 20.0, 5.0], tolerance=2.0)
     doc = {
         "target_lab": r["target_lab"],
         "predicted_lab": r["predicted_lab"],
@@ -127,14 +100,14 @@ def test_verification_closed_loop():
     # 模拟打印实测：预测值 + 偏移
     p = r["predicted_lab"]
     measured = [p[0] + 3.0, p[1] - 2.0, p[2] + 1.5]
-    ver = run_verification(icc, "CMYK", doc, measured)
+    ver = run_verification(cmyk_icc, "CMYK", doc, measured)
     assert ver["delta_e_corrected"] < ver["delta_e_measured"], "闭环修正应改善 ΔE"
     assert ver["improved"] is True
     print(f"[PASS] 实测验证闭环（dE {ver['delta_e_measured']} -> {ver['delta_e_corrected']}）")
 
 
 def test_recipe_store_persistence():
-    """配方记录落盘与读取。"""
+    """配方记录落盘与读取（COLORFORGE_DATA_DIR 隔离环境）。"""
     store = RecipeStore()
     proc = {"id": "testproc", "name": "测试工艺", "icc_meta": {"device_space": "CMYK"}}
     result = {
@@ -156,17 +129,3 @@ def test_recipe_store_persistence():
     assert store.delete(doc["id"]) is True
     assert store.get(doc["id"]) is None
     print("[PASS] 配方记录落盘存储")
-
-
-if __name__ == "__main__":
-    print("=" * 50)
-    print("配方反查引擎测试")
-    print("=" * 50)
-    test_detect_device_space()
-    test_forward_physical_sanity()
-    test_predict_recipe_cmyk()
-    test_predict_recipe_rgb_process()
-    test_predict_recipe_out_of_gamut()
-    test_verification_closed_loop()
-    test_recipe_store_persistence()
-    print("全部测试通过!")

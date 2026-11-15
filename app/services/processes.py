@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from PIL import ImageCms
 
 from .filedb import JsonStore
@@ -202,7 +203,6 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
     if key in _gamut_cache:
         return _gamut_cache[key]
 
-    import numpy as np
     import colour
     from PIL import Image, ImageCms
 

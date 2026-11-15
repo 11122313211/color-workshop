@@ -1,17 +1,12 @@
 """色彩管理闭环 AI 平台测试。
 
 运行: python -m pytest tests/test_core.py -v
-或:  python -I tests/test_core.py
 """
 
-import sys
 import io
-import os
 
 import numpy as np
 from PIL import Image
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.algorithms import (
     convert_color,
