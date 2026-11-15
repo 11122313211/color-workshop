@@ -108,6 +108,26 @@ def list_measurements(
     return measurements.list_sessions()
 
 
+@router.get("/ink-quality")
+def ink_quality(
+    session_id: str = Query(..., description="测量会话 id（仅消费 verified 记录）"),
+):
+    """油墨质量四指标 + TVI（GATF 公式；只消费 verified 且密度通道可用的记录）。
+
+    warning/rejected 记录被排除并计数返回——数据未达 verified 时前端显示方法要求占位。
+    """
+    session = measurements.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "测量会话不存在")
+    from ..services.density import ink_quality_from_records
+
+    records = list(session.get("records", {}).values())
+    result = ink_quality_from_records(records)
+    result["session_id"] = session_id
+    result["session"] = {k: session.get(k) for k in ("instrument", "condition", "calibrated_at", "repeat_mode")}
+    return result
+
+
 @router.delete("/measurements")
 def delete_measurement(
     session_id: str = Query(..., description="会话 id"),

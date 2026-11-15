@@ -7,7 +7,7 @@
 import { apiGet, apiPostRaw, apiDelete } from "../api.js";
 import { icon } from "../icons.js";
 import {
-  emptyState, errorState, skeletonCards, esc, openModal, toast, confirmDanger,
+  emptyState, errorState, skeletonCards, esc, openModal, toast, confirmDanger, observeRedraw,
 } from "../components.js";
 
 const TOL_DEFAULT = 2.0;
@@ -243,6 +243,250 @@ async function openImportWizard(view) {
   modal.modal.querySelector("[data-close]").addEventListener("click", () => modal.close());
 }
 
+/* =========================================================
+ * V0.5 印刷 QC 卡：GATF 四指标 + TVI 曲线 + GATF 色轮
+ * 只消费 verified 数据；无 verified 时显示方法要求占位（教育用户何为可信数据）
+ * ========================================================= */
+
+const INK_COLORS = { C: "#1f7fd0", M: "#d04f9e", Y: "#c99a1e" };
+
+/* GATF 色轮理想方位（自顶部顺时针，Y/R/M/B/C/G 每 60°） */
+const WHEEL_ANGLE = { Y: 0, R: 60, M: 120, B: 180, C: 240, G: 300 };
+/* 色相偏移方向：中间滤色对应的相邻色方位（+1 顺时针 / -1 逆时针） */
+const SHIFT_SIGN = { Y_M: 1, Y_C: -1, M_Y: -1, M_C: 1, C_M: -1, C_Y: 1 };
+
+function midFilter(dens) {
+  const v = { C: dens.C, M: dens.M, Y: dens.Y };
+  return Object.keys(v).sort((a, b) => v[a] - v[b])[1];
+}
+
+function setupCanvas(canvas, w, h) {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = "100%";
+  canvas.style.maxWidth = `${w}px`;
+  canvas.style.height = "auto";
+  canvas.style.aspectRatio = `${w} / ${h}`;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  return ctx;
+}
+
+/* TVI 曲线：名义网点率 vs 网点增大（pp），理想线 y=0 */
+function drawTvi(canvas, points) {
+  const W = 460, H = 240, PAD = { l: 40, r: 14, t: 16, b: 28 };
+  const ctx = setupCanvas(canvas, W, H);
+  const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue("--label-3").trim() || "#999";
+  const sep = css.getPropertyValue("--separator").trim() || "#ddd";
+  ctx.clearRect(0, 0, W, H);
+
+  if (!points.length) {
+    ctx.fillStyle = ink;
+    ctx.font = "12px system-ui";
+    ctx.fillText("verified 数据中没有 c/m/y 网点梯尺块（标签形如 c60），无法计算 TVI", PAD.l, H / 2);
+    return;
+  }
+  const xs = points.map((p) => p.nominal);
+  const ys = points.map((p) => p.tvi * 100);
+  const xMax = Math.max(100, ...xs);
+  const yMin = Math.min(-2, ...ys) - 1;
+  const yMax = Math.max(4, ...ys) + 2;
+  const X = (v) => PAD.l + (v / xMax) * (W - PAD.l - PAD.r);
+  const Y = (v) => PAD.t + (1 - (v - yMin) / (yMax - yMin)) * (H - PAD.t - PAD.b);
+
+  // 网格与轴
+  ctx.strokeStyle = sep; ctx.lineWidth = 0.8; ctx.font = "10px system-ui";
+  for (const g of [0, 25, 50, 75, 100]) {
+    if (g > xMax) break;
+    ctx.beginPath(); ctx.moveTo(X(g), PAD.t); ctx.lineTo(X(g), H - PAD.b); ctx.stroke();
+    ctx.fillStyle = ink;
+    ctx.fillText(`${g}%`, X(g) - 8, H - PAD.b + 14);
+  }
+  for (const g of [yMin, 0, yMax]) {
+    ctx.beginPath(); ctx.moveTo(PAD.l, Y(g)); ctx.lineTo(W - PAD.r, Y(g)); ctx.stroke();
+    ctx.fillStyle = ink;
+    ctx.fillText(`${g > 0 ? "+" : ""}${g.toFixed(0)}`, 8, Y(g) + 3);
+  }
+  // 理想 TVI=0 线
+  ctx.strokeStyle = "rgba(127,127,127,0.6)"; ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(PAD.l, Y(0)); ctx.lineTo(W - PAD.r, Y(0)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 每色折线
+  for (const inkKey of ["C", "M", "Y"]) {
+    const pts = points.filter((p) => p.ink === inkKey).sort((a, b) => a.nominal - b.nominal);
+    if (!pts.length) continue;
+    ctx.strokeStyle = INK_COLORS[inkKey]; ctx.lineWidth = 2;
+    ctx.beginPath();
+    pts.forEach((p, i) => {
+      const px = X(p.nominal), py = Y(p.tvi * 100);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.stroke();
+    ctx.fillStyle = INK_COLORS[inkKey];
+    for (const p of pts) {
+      ctx.beginPath();
+      ctx.arc(X(p.nominal), Y(p.tvi * 100), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.fillStyle = ink;
+  ctx.font = "11px system-ui";
+  ctx.fillText("TVI = 实测网点面积 − 名义网点率（Murray–Davies）", PAD.l + 4, PAD.t + 12);
+}
+
+/* GATF 色轮：六方位（Y/R/M/B/C/G），色相误差旋转 + 灰度收缩半径 */
+function drawWheel(canvas, patches) {
+  const S = 300;
+  const ctx = setupCanvas(canvas, S, S);
+  const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue("--label-3").trim() || "#999";
+  const sep = css.getPropertyValue("--separator").trim() || "#ddd";
+  ctx.clearRect(0, 0, S, S);
+  const cx = S / 2, cy = S / 2, R = S / 2 - 34;
+
+  // 底圆 + 六方位辐条
+  ctx.strokeStyle = sep; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.font = "12px system-ui"; ctx.textAlign = "center";
+  for (const [label, deg] of Object.entries(WHEEL_ANGLE)) {
+    const rad = ((90 - deg) * Math.PI) / 180;
+    const px = cx + Math.cos(rad) * R, py = cy - Math.sin(rad) * R;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(px, py); ctx.stroke();
+    ctx.fillStyle = INK_COLORS[label] || ink;
+    ctx.fillText(label, cx + Math.cos(rad) * (R + 16), cy - Math.sin(rad) * (R + 16) + 4);
+  }
+
+  // 数据点：灰度→半径收缩（灰度低≈纯色→靠外），色相误差→绕理想方位旋转
+  for (const p of patches) {
+    const deg0 = WHEEL_ANGLE[p.label.toUpperCase()];
+    if (deg0 == null) continue;
+    const sign = SHIFT_SIGN[`${p.label.toUpperCase()}_${midFilter(p.densities)}`] || 0;
+    const deg = deg0 + sign * p.hue_error * 60;
+    const rad = ((90 - deg) * Math.PI) / 180;
+    const rr = Math.max(0.08, 1 - p.grayness) * R;
+    const px = cx + Math.cos(rad) * rr, py = cy - Math.sin(rad) * rr;
+    ctx.fillStyle = INK_COLORS[p.label.toUpperCase()] || ink;
+    ctx.beginPath(); ctx.arc(px, py, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+  ctx.fillStyle = ink;
+  ctx.font = "11px system-ui"; ctx.textAlign = "left";
+  ctx.fillText("半径 = 1 − 灰度 · 角偏移 = 色相误差 × 60°", 8, S - 8);
+}
+
+function inkCard(label, m) {
+  const pct = (v) => `${(v * 100).toFixed(1)}%`;
+  return `
+    <div style="flex:1; min-width:150px; border:1px solid var(--separator); border-radius:10px; padding:10px 12px">
+      <div style="display:flex; align-items:center; gap:8px">
+        <span style="width:12px; height:12px; border-radius:4px; background:${INK_COLORS[label]}"></span>
+        <b style="color:var(--label)">${esc(m.label)}</b>
+        <span class="chip chip-mono">DH ${m.strength.toFixed(2)}</span>
+      </div>
+      <div class="swatch-meta" style="margin-top:6px; line-height:1.9">
+        色相误差 <b>${pct(m.hue_error)}</b> · 灰度 <b>${pct(m.grayness)}</b><br>
+        色效率 <b>${pct(m.efficiency)}</b> · 色纯度 <b>${pct(m.purity)}</b><br>
+        滤色密度 C/M/Y <b>${m.densities.C.toFixed(2)} / ${m.densities.M.toFixed(2)} / ${m.densities.Y.toFixed(2)}</b>
+      </div>
+    </div>`;
+}
+
+async function renderQcCard(view) {
+  const holder = view.querySelector("#qc-ink-card");
+  let sessions;
+  try {
+    sessions = await apiGet("/api/qc/measurements");
+  } catch (e) {
+    holder.innerHTML = `<div class="card-title">${icon("printer")}印刷 QC（GATF）</div>
+      <div class="gamut-error" style="margin-top:10px">${esc(e.message)}</div>`;
+    return;
+  }
+  if (!sessions.length) {
+    holder.innerHTML = `
+      <div class="card-title">${icon("printer")}印刷 QC（GATF）</div>
+      <div class="empty" style="margin-top:10px">
+        <p class="swatch-meta">还没有测量会话。先在上方「测量数据」导入 Status-T 密度导出（含实地与网点梯尺块），
+        这里会自动给出色强度 / 色相误差 / 灰度 / 色效率、TVI 曲线与 GATF 色轮。</p>
+      </div>`;
+    return;
+  }
+
+  const options = sessions.map((s, i) =>
+    `<option value="${esc(s.id)}">${esc(s.instrument)} · ${esc(s.condition)} · ${esc((s.created_at || "").replace("T", " "))}</option>`
+  ).join("");
+
+  holder.innerHTML = `
+    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+      <div class="card-title" style="margin:0">${icon("printer")}印刷 QC（GATF）</div>
+      <span class="chip">仅消费 verified</span>
+      <span style="flex:1"></span>
+      <select id="qc-ink-session" class="input" style="max-width:280px">${options}</select>
+    </div>
+    <div id="qc-ink-body" style="margin-top:12px">${skeletonCards(1)}</div>
+  `;
+
+  const load = async () => {
+    const sid = holder.querySelector("#qc-ink-session").value;
+    const body = holder.querySelector("#qc-ink-body");
+    let data;
+    try {
+      data = await apiGet(`/api/qc/ink-quality?session_id=${encodeURIComponent(sid)}`);
+    } catch (e) {
+      body.innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
+      return;
+    }
+
+    if (!data.verified_records || !Object.keys(data.inks).length) {
+      body.innerHTML = `
+        <div class="empty">
+          <div class="empty-title">本会话暂无可信（verified）测量数据</div>
+          <p class="swatch-meta" style="margin-top:6px; text-align:left; line-height:2">
+            QC 指标只消费通过方法闭环的数据，要求：<br>
+            ① 复测声明开启且同标签复测 ΔE ≤ 0.4（每个目标至少测 2 次）；<br>
+            ② 纸白块正常（未漂移、背衬正确）；<br>
+            ③ Lab↔XYZ 交叉校验一致、密度在物理量程内（无 warning/rejected）。
+          </p>
+          <p class="swatch-meta">当前：${data.verified_records} 条 verified · ${data.skipped_records} 条被排除（${(data.source_records || []).join("、") || "无来源"}）</p>
+        </div>`;
+      return;
+    }
+
+    const inkKeys = ["C", "M", "Y"].filter((k) => data.inks[k]);
+    const wheelPatches = [...inkKeys.map((k) => ({ label: k, ...data.inks[k] })),
+      ...data.overprints.filter((o) => WHEEL_ANGLE[o.label.toUpperCase()] != null)];
+    body.innerHTML = `
+      <div style="display:flex; gap:10px; flex-wrap:wrap">${inkKeys.map((k) => inkCard(k, data.inks[k])).join("")}</div>
+      <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:14px">
+        <div style="flex:1; min-width:320px">
+          <div class="card-title" style="font-size:14px">TVI 网点增大曲线</div>
+          <canvas id="qc-tvi-canvas" style="margin-top:8px"></canvas>
+        </div>
+        <div style="min-width:280px">
+          <div class="card-title" style="font-size:14px">GATF 色轮</div>
+          <canvas id="qc-wheel-canvas" style="margin-top:8px"></canvas>
+        </div>
+      </div>
+      ${data.skipped_records ? `<p class="swatch-meta" style="margin-top:10px">已排除 ${data.skipped_records} 条未达 verified 的记录（warning/rejected）——QC 指标不消费未过门禁的数据。</p>` : ""}
+    `;
+
+    const tviCanvas = body.querySelector("#qc-tvi-canvas");
+    const wheelCanvas = body.querySelector("#qc-wheel-canvas");
+    drawTvi(tviCanvas, data.tvi);
+    drawWheel(wheelCanvas, wheelPatches);
+    observeRedraw(body, () => {
+      drawTvi(tviCanvas, data.tvi);
+      drawWheel(wheelCanvas, wheelPatches);
+    });
+  };
+
+  holder.querySelector("#qc-ink-session").addEventListener("change", load);
+  await load();
+}
+
 /* 主趋势图：时间序列 ΔE 折线 + 容差带（SVG，主题令牌配色） */
 function trendChart(series, tol) {
   const W = 720;
@@ -319,9 +563,11 @@ export async function renderMonitorView(view) {
     </div>
     <div id="monitor-body">${skeletonCards(4)}</div>
     <div id="qc-measure-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
+    <div id="qc-ink-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
   `;
-  // 测量数据卡独立加载（与配方统计互不阻塞）
+  // 测量数据卡与 QC 卡独立加载（与配方统计互不阻塞）
   renderMeasurementCard(view);
+  renderQcCard(view);
 
   let stats;
   try {
