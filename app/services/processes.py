@@ -125,6 +125,43 @@ class ProcessStore:
             pass
         return True
 
+    def update(self, pid: str, name=None, paper=None, ink=None, notes=None) -> dict | None:
+        """编辑工艺元数据（None 字段保持不变）。"""
+        doc = self._store.get(pid)
+        if not doc:
+            return None
+        if name is not None:
+            doc["name"] = name
+        if paper is not None:
+            doc["paper"] = paper
+        if ink is not None:
+            doc["ink"] = ink
+        if notes is not None:
+            doc["notes"] = notes
+        self._store.put(pid, doc)
+        return doc
+
+    def replace_icc(self, pid: str, icc_bytes: bytes, filename: str = "") -> dict:
+        """替换 ICC 文件：覆盖落盘 + 重解析元数据 + 更新 sha 指纹。
+
+        sha 变更会天然击穿 LUT/变换/色域的按内容哈希缓存。
+        """
+        doc = self._store.get(pid)
+        if not doc:
+            raise KeyError(pid)
+        meta = self.parse_meta(icc_bytes)
+        (PROFILE_DIR / doc["icc_file"]).write_bytes(icc_bytes)
+        doc.update(
+            {
+                "icc_original_name": filename or doc["icc_original_name"],
+                "icc_size": len(icc_bytes),
+                "icc_sha256": hashlib.sha256(icc_bytes).hexdigest()[:16],
+                "icc_meta": meta,
+            }
+        )
+        self._store.put(pid, doc)
+        return doc
+
     def icc_bytes(self, pid: str) -> bytes:
         doc = self.get(pid)
         if not doc:
@@ -270,3 +307,16 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
     }
     _gamut_cache[key] = result
     return result
+
+
+def gamut_summary(process: dict) -> dict:
+    """轻量色域摘要（列表卡片用）：低密度采样 → 体积 / sRGB 覆盖率 / 凸包坐标。
+
+    levels=4（CMYK 256 点）足够画凸包缩略图，且命中同一缓存。
+    """
+    g = sample_process_gamut(process, levels=4)
+    return {
+        "volume": g["volume"],
+        "coverage_srgb": g["coverage_srgb"],
+        "hull_xy": [g["xy_points"][i] for i in g["hull"]] if g["hull"] else [],
+    }

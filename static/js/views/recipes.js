@@ -16,8 +16,10 @@ let state = {
   results: null,   // predict response
 };
 
-export async function renderRecipesView(view) {
+export async function renderRecipesView(view, params = {}) {
   state.rows = state.rows.length ? state.rows : defaultRows();
+  // 工艺详情页「用此工艺预测」带参跳转：预选该工艺（无效 id 会被回落到第一个）
+  if (params.query && params.query.process) state.processId = params.query.process;
 
   view.innerHTML = `
     <div class="page-head">
@@ -313,9 +315,13 @@ function verificationBlock(v) {
 }
 
 function openVerifyModal(view, r, idx) {
+  const proc = state.processes.find((p) => p.id === state.processId);
+  const procChip = proc
+    ? `<span class="chip chip-mono">${esc(proc.name)}${proc.paper ? ` · ${esc(proc.paper)}` : ""}</span>`
+    : "";
   const m = openModal(`
-    <h3 class="card-title">${icon("target")}实测验证 · ${r.label || `颜色 ${idx + 1}`}</h3>
-    <p class="card-desc">将当前配方打印后，用分光光度计测量色块，把实测 LAB 填入下方。系统将计算偏差并给出修正配方。</p>
+    <h3 class="card-title">${icon("target")}实测验证 · ${r.label || `颜色 ${idx + 1}`} ${procChip}</h3>
+    <p class="card-desc">将当前配方打印后，用分光光度计测量色块，把实测 LAB 填入下方。系统将计算偏差并给出修正配方（模型误差补偿 p' = t − (m − p)）。</p>
     <div class="lab-row">
       <span class="lab-head">实测 L*</span><span class="lab-head">a*</span><span class="lab-head">b*</span><span></span><span></span>
     </div>

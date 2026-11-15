@@ -21,13 +21,17 @@ export function navigate(hash) {
 }
 
 async function resolve() {
-  const hash = location.hash || "#/recipes";
+  const raw = location.hash || "#/recipes";
+  // 拆出 query（如 #/recipes?process=xxx），路径段照常匹配
+  const [hash, queryStr = ""] = raw.split("?");
+  const query = Object.fromEntries(new URLSearchParams(queryStr));
   const view = document.getElementById("view");
   for (const r of routes) {
     const m = hash.match(r.regex);
     if (m) {
       const params = {};
       r.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1])));
+      params.query = query;
       // 侧边栏高亮：取 pattern 的第一段
       setActiveNav("#/" + hash.split("/")[1]);
       window.scrollTo(0, 0);

@@ -52,9 +52,20 @@ html[data-theme="dark"] {
   --green-soft: rgba(48, 209, 88, 0.16);
   --orange-soft: rgba(255, 159, 10, 0.16);
   --red-soft: rgba(255, 69, 58, 0.14);
+  --indigo: #5e5ce6;
   --sidebar: rgba(28, 28, 30, 0.72);
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.5);
   --shadow-pop: 0 10px 40px rgba(0, 0, 0, 0.6);
+}
+
+/* ---------- V0.3 刻度令牌（间距 / 字号） ---------- */
+:root {
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+  --space-4: 16px; --space-5: 24px; --space-6: 32px;
+  --text-xs: 11px; --text-sm: 12px; --text-base: 15px;
+  --text-lg: 17px; --text-title: 22px; --text-large: 30px;
+  --yellow: #ffcc00;
+  --radius-chip: 6px;
 }
 
 /* ---------- 基础 ---------- */
@@ -398,4 +409,192 @@ html[data-theme="dark"] .swatch { box-shadow: inset 0 0 0 1px rgba(255, 255, 255
 .result-code {
   font-family: var(--mono); font-size: 13px; background: var(--fill);
   border-radius: 10px; padding: 12px 14px; overflow-x: auto; white-space: pre; margin: 10px 0 0;
+}
+
+/* ============================================================
+   V0.3 新增：工艺工具栏 / 指标卡 / 色域视图 / 批量上传 / 骨架 / 确认弹层
+   ============================================================ */
+
+/* 键盘可达性：统一 focus 光圈 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+/* ---------- 工艺库工具栏 ---------- */
+.process-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 4px 0 14px;
+}
+.input-search-wrap { position: relative; flex: 1; min-width: 200px; }
+.input-search-wrap .icon {
+  position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+  width: 15px; height: 15px; color: var(--label-3); pointer-events: none;
+}
+.input-search-wrap .input { padding-left: 32px; }
+
+/* ---------- 工艺卡片：指标行 ---------- */
+.process-card .grow-truncate { min-width: 0; flex: 1; }
+.proc-name { font-weight: 700; font-size: var(--text-base); }
+.proc-desc {
+  font-size: var(--text-sm); color: var(--label-2); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.proc-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.process-mini-cie { width: 56px; height: 56px; flex-shrink: 0; border-radius: 12px; background: var(--fill); }
+.process-stats {
+  display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 8px;
+  border-top: 1px solid var(--separator); margin-top: 12px; padding-top: 10px;
+}
+.process-stats > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.process-stats b { font-size: 14px; font-weight: 700; font-family: var(--mono); letter-spacing: -0.3px; }
+.process-stats span { font-size: 11px; color: var(--label-3); }
+.mini-badge {
+  display: inline-flex; align-items: center; font-size: 11px; font-weight: 600;
+  border-radius: 99px; padding: 1px 7px;
+}
+.mini-badge.badge-green { background: var(--green-soft); color: var(--green); }
+.mini-badge.badge-orange { background: var(--orange-soft); color: var(--orange); }
+.mini-badge.badge-red { background: var(--red-soft); color: var(--red); }
+.pass-none { color: var(--label-3); }
+
+/* ---------- 详情页概览指标 ---------- */
+.stat-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  margin: 4px 0 14px;
+}
+.stat { padding: 14px 16px; }
+.stat .stat-val {
+  font-size: 24px; font-weight: 800; font-family: var(--mono);
+  letter-spacing: -0.5px; line-height: 1.2;
+}
+.stat .stat-label { font-size: 12px; color: var(--label-2); margin-top: 3px; }
+.head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.icon-btn.btn-back:hover { background: var(--fill-2); color: var(--label) !important; }
+.gamut-card-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.gamut-card-head .card-title { margin: 0; }
+.gamut-card-head .cie-legend { margin: 0; }
+.legend-srgb { background: var(--accent); }
+.legend-proc { background: var(--indigo); }
+
+/* ---------- 色域视图组件（2D/3D） ---------- */
+.gamut-view { display: flex; flex-direction: column; gap: 8px; }
+.gamut-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.gamut-hint { font-size: 12px; color: var(--label-3); }
+.gamut-stage {
+  position: relative; width: 100%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  display: flex; justify-content: center;
+}
+.gamut-canvas {
+  width: min(100%, 520px); aspect-ratio: 1; display: block;
+  touch-action: none; cursor: crosshair; margin: 0 auto;
+}
+.gamut-canvas.grabbing { cursor: grabbing; }
+.gamut-loading {
+  display: flex; align-items: center; gap: 10px; padding: 40px 20px;
+  color: var(--label-2); font-size: 13px;
+}
+/* class 设了 display 会覆盖 hidden 属性，显式兜底 */
+.gamut-loading[hidden], .gamut-canvas[hidden], .gamut-tip[hidden] { display: none !important; }
+.gamut-error { padding: 28px 20px; color: var(--red); font-size: 13px; }
+.gamut-tip {
+  position: absolute; z-index: 5; pointer-events: none;
+  background: var(--card); border: 1px solid var(--separator);
+  box-shadow: var(--shadow-pop); border-radius: 9px;
+  padding: 6px 10px; font-size: 12px; font-family: var(--mono);
+  white-space: nowrap; color: var(--label);
+}
+.gamut-controls {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 13px; color: var(--label-2);
+}
+.gamut-slice-toggle {
+  border: none; background: none; cursor: pointer; padding: 2px;
+}
+.gamut-slice-toggle .chip { transition: background 0.15s ease, color 0.15s ease; }
+.gamut-slice-toggle.on .chip {
+  background: var(--indigo-soft, rgba(88, 86, 214, 0.12));
+  color: var(--indigo);
+}
+.gamut-slice { flex: 0 1 200px; accent-color: var(--indigo); }
+.gamut-slice:disabled { opacity: 0.35; }
+.gamut-slice-val { font-family: var(--mono); font-size: 12px; min-width: 44px; color: var(--label); }
+.gamut-sampled { font-size: 12px; color: var(--label-3); font-family: var(--mono); }
+
+/* ---------- 批量上传队列 ---------- */
+.upload-queue { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.uq-row {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--fill); border-radius: 10px; padding: 8px 10px;
+}
+.uq-row .uq-name { height: 32px; flex: 1; min-width: 0; background: var(--card); }
+.uq-row .uq-meta { font-size: 11px; color: var(--label-3); font-family: var(--mono); white-space: nowrap; }
+.uq-row .uq-status { font-size: 12px; font-weight: 600; color: var(--label-2); white-space: nowrap; }
+.uq-row .uq-status.ok { color: var(--green); }
+.uq-row .uq-status.failed { color: var(--red); }
+
+/* ---------- ICC 替换提示 / 当前 ICC ---------- */
+.icc-current .icc-line { font-size: 13px; color: var(--label-2); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dropzone-sm { padding: 18px 16px; }
+.dropzone-sm .icon { width: 22px; height: 22px; margin-bottom: 4px; }
+.icc-diff {
+  display: flex; align-items: flex-start; gap: 8px;
+  background: var(--orange-soft); color: var(--orange);
+  font-size: 12px; font-weight: 500; border-radius: 10px;
+  padding: 9px 12px; margin-top: 10px;
+}
+.icc-diff .icon { flex-shrink: 0; margin-top: 1px; }
+
+/* ---------- 骨架屏 ---------- */
+.skeleton-card { display: flex; flex-direction: column; gap: 10px; }
+.skeleton {
+  background: var(--fill); border-radius: 8px;
+  animation: shimmer 1.2s ease-in-out infinite;
+}
+.skeleton.sk-icon { width: 56px; height: 56px; border-radius: 12px; }
+.skeleton.sk-line { height: 12px; width: 80%; }
+.skeleton.sk-line.short { width: 50%; }
+@keyframes shimmer { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+/* ---------- 危险确认弹层（iOS alert 范式） ---------- */
+.modal-confirm { width: min(300px, 100%); text-align: center; padding: 26px 22px 20px; }
+.confirm-danger .cd-icon {
+  width: 44px; height: 44px; border-radius: 50%;
+  background: var(--red-soft); color: var(--red);
+  display: flex; align-items: center; justify-content: center;
+  margin: 0 auto 12px; font-size: 20px;
+}
+.confirm-danger .cd-icon .icon { width: 22px; height: 22px; }
+.confirm-danger .cd-title { font-size: 16px; font-weight: 700; }
+.confirm-danger .cd-msg { font-size: 13px; color: var(--label-2); margin-top: 6px; line-height: 1.5; }
+
+/* ---------- toast 操作按钮 ---------- */
+.toast-action {
+  border: none; background: none; cursor: pointer;
+  color: var(--accent); font-size: 13px; font-weight: 700;
+  padding: 2px 4px; white-space: nowrap;
+}
+
+/* ---------- 移动端适配（375px） ---------- */
+@media (max-width: 768px) {
+  .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .stat .stat-val { font-size: 19px; }
+  .process-toolbar { flex-direction: column; align-items: stretch; }
+  .process-toolbar .seg { align-self: flex-start; }
+  .process-stats { grid-template-columns: repeat(3, 1fr); }
+  .head-actions { flex-wrap: wrap; }
+  .lab-row { grid-template-columns: minmax(70px, 1fr) 1fr 1fr 1fr 32px; }
+  .gamut-controls { font-size: 12px; }
+  .gamut-slice { flex-basis: 140px; }
+  .modal { width: 100%; }
+}
+
+/* ---------- 动效偏好：关停装饰动画 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton, .toast, .modal, .modal-mask, .tool-pane.active, .disclosure.open .disclosure-body,
+  .process-card, .btn { animation: none !important; transition: none !important; }
 }

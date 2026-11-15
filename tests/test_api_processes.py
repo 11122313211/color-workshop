@@ -105,6 +105,71 @@ def test_gray_process_full_flow(api_client, gray_icc):
     print(f"[PASS] GRAY 工艺全链路（ΔE={result['delta_e']}）")
 
 
+def test_process_patch_update(api_client, cmyk_icc):
+    """V0.3：PATCH 编辑工艺元数据（None 字段保持不变）。"""
+    proc = _create_process(api_client, cmyk_icc, name="待编辑", paper="旧纸")
+    r = api_client.patch(
+        f"/api/processes/{proc['id']}",
+        json={"name": "已编辑", "paper": "铜版纸 157g"},
+    )
+    assert r.status_code == 200
+    doc = r.json()
+    assert doc["name"] == "已编辑"
+    assert doc["paper"] == "铜版纸 157g"
+    assert doc["ink"] == ""  # 未传字段保持不变
+    assert api_client.patch("/api/processes/nonexistent0", json={"name": "x"}).status_code == 404
+    assert api_client.patch(f"/api/processes/{proc['id']}", json={"name": ""}).status_code == 422
+    print("[PASS] PATCH 工艺编辑")
+
+
+def test_process_replace_icc(api_client, cmyk_icc, rgb_icc):
+    """V0.3：PUT 替换 ICC → sha 变更 + 设备空间变化提示。"""
+    proc = _create_process(api_client, cmyk_icc, name="替换前")
+    old_sha = proc["icc_sha256"]
+    r = api_client.put(
+        f"/api/processes/{proc['id']}/icc",
+        params={"filename": "replaced.icc"},
+        content=rgb_icc,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "replaced"
+    assert data["space_changed"] is True  # CMYK → RGB
+    new_doc = data["process"]
+    assert new_doc["icc_sha256"] != old_sha
+    assert new_doc["icc_meta"]["device_space"] == "RGB"
+    assert new_doc["icc_original_name"] == "replaced.icc"
+    # 下载应返回新文件内容
+    dl = api_client.get(f"/api/processes/{proc['id']}/icc")
+    assert dl.content == rgb_icc
+    # 无效 ICC 拒绝
+    bad = api_client.put(f"/api/processes/{proc['id']}/icc", content=b"short")
+    assert bad.status_code == 400
+    print("[PASS] PUT 替换 ICC（sha 变更 + 空间变化提示）")
+
+
+def test_process_list_summary(api_client, process_factory):
+    """V0.3：summary=1 聚合接口 —— gamut_summary + pass_rate。"""
+    proc = process_factory("聚合摘要")
+    # 先预测一条配方，使 pass_rate 非 None
+    pr = api_client.post(
+        "/api/recipes/predict",
+        json={"process_id": proc["id"], "targets": [{"label": "聚合", "lab": [50.0, 20.0, 5.0]}]},
+    )
+    assert pr.status_code == 200
+    docs = api_client.get("/api/processes?summary=1").json()
+    mine = [d for d in docs if d["id"] == proc["id"]]
+    assert len(mine) == 1
+    doc = mine[0]
+    s = doc["gamut_summary"]
+    assert s and s["volume"] > 0
+    assert len(s["hull_xy"]) >= 3
+    assert 0.0 <= s["coverage_srgb"] <= 1.0
+    assert doc["pass_rate"] == 1.0  # 唯一一条配方已收敛
+    print(f"[PASS] summary 聚合（hull {len(s['hull_xy'])} 顶点 / 达标率 {doc['pass_rate']}）")
+
+
 def test_process_delete_cascade_removes_recipes(api_client, cmyk_icc):
     """级联删除回归：删工艺后 /api/recipes?process_id= 必须为空。"""
     proc = _create_process(api_client, cmyk_icc, name="级联删除")

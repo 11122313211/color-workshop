@@ -27,6 +27,20 @@ function applyTheme(theme) {
   document.getElementById("theme-text").textContent = theme === "dark" ? "亮色" : "暗色";
   const iconEl = document.querySelector("#theme-btn [data-icon]");
   iconEl.innerHTML = icon(theme === "dark" ? "sun" : "moon");
+  // 通知 canvas 类组件按新主题重绘（observeRedraw 监听）
+  window.dispatchEvent(new CustomEvent("themechange", { detail: { theme } }));
+}
+
+/* ---------- 全局拖拽兜底：文件拖到 dropzone 之外不得触发浏览器打开 ---------- */
+function bindGlobalDragGuard() {
+  // 拖拽经过可放置区域时浏览器默认行为会被 dropzone 自身拦截；这里兜底其余区域
+  ["dragover", "drop"].forEach((ev) => {
+    window.addEventListener(ev, (e) => {
+      if (e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files")) {
+        if (!e.defaultPrevented) e.preventDefault();
+      }
+    });
+  });
 }
 
 /* ---------- 图标注入 ---------- */
@@ -55,5 +69,6 @@ register("#/tools", renderToolsView);
 initTheme();
 injectIcons();
 bindNav();
+bindGlobalDragGuard();
 updateNavCount();
 startRouter();

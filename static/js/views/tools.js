@@ -2,7 +2,8 @@
 
 import { apiGet, apiPost } from "../api.js";
 import { icon } from "../icons.js";
-import { toast, swatch, drawCie, labToHex, fetchSpectrum } from "../components.js";
+import { toast, swatch, drawCie, labToHex, fetchSpectrum, emptyState, observeRedraw } from "../components.js";
+import { SRGB_XY } from "../gamut-view.js";
 
 let processes = [];
 
@@ -58,7 +59,6 @@ export async function renderToolsView(view) {
 function buildForward(box) {
   if (!processes.length) {
     box.innerHTML = emptyState({ iconName: "stack", title: "需要先创建工艺", desc: "正查基于工艺 ICC，先到工艺库创建。" });
-    fillEmpty(box, { title: "需要先创建工艺", desc: "正查基于工艺 ICC，先到工艺库创建。" });
     return;
   }
   box.innerHTML = `
@@ -154,17 +154,17 @@ async function buildGamut(box) {
     <canvas class="cie-canvas" id="gm-cie"></canvas>
     <div class="cie-legend">
       <span><i class="dot" style="background:linear-gradient(90deg,#4400ff,#00ff00,#ff0000)"></i>光谱轨迹</span>
-      <span><i class="dot" style="background:#ff6b6b"></i>sRGB</span>
-      <span><i class="dot" style="background:#4ecdc4"></i>Display P3</span>
-      <span><i class="dot" style="background:#ffd93d"></i>Adobe RGB</span>
-      <span><i class="dot" style="background:#8e8e93"></i>工艺采样</span>
+      <span><i class="dot legend-srgb"></i>sRGB</span>
+      <span><i class="dot" style="background:var(--teal)"></i>Display P3</span>
+      <span><i class="dot" style="background:var(--yellow)"></i>Adobe RGB</span>
+      <span><i class="dot legend-proc"></i>工艺凸包 · 采样点按 L* 着色</span>
     </div>
   `;
 
   const SPECTRA = [
-    { color: "#ff6b6b", spaces: ["srgb"] },
-    { color: "#4ecdc4", spaces: ["dci-p3"] },
-    { color: "#ffd93d", spaces: ["adobe-rgb"] },
+    { color: "var(--accent)", spaces: ["srgb"] },
+    { color: "var(--teal)", spaces: ["dci-p3"] },
+    { color: "var(--yellow)", spaces: ["adobe-rgb"] },
   ];
   const canvas = box.querySelector("#gm-cie");
   let spectrum = null;
@@ -173,9 +173,12 @@ async function buildGamut(box) {
   } catch (_) { /* 光谱数据失败仍可画色域 */ }
   const draw = async () => {
     const series = [];
+    // sRGB 参考色域以嵌套底图为准（与工艺库详情页同源）
+    series.push({ points: SRGB_XY, color: "var(--accent)", fill: true, fillAlpha: 0.13 });
     try {
-      const data = await apiGet("/api/visualization/gamut?spaces=srgb,dci-p3,adobe-rgb");
+      const data = await apiGet("/api/visualization/gamut?spaces=dci-p3,adobe-rgb");
       for (const s of SPECTRA) {
+        if (s.spaces[0] === "srgb") continue;
         const poly = s.spaces.flatMap((sp) => data.gamut_polygons[sp] || []);
         if (poly.length) series.push({ points: poly, color: s.color, fill: true });
       }
@@ -184,10 +187,22 @@ async function buildGamut(box) {
     if (pid) {
       try {
         const g = await apiGet(`/api/processes/${pid}/gamut?levels=7`);
-        series.push({ points: g.xy_points, color: "#8e8e93" });
-      } catch (_) { /* 忽略 */ }
+        series.push({
+          points: g.xy_points,
+          labPoints: g.lab_points,
+          hull: g.hull,
+          color: "var(--indigo)",
+          pointSize: 1.8,
+        });
+      } catch (e) {
+        toast(`工艺色域加载失败：${e.message}`, "err");
+      }
     }
     drawCie(canvas, series, { spectrum });
+    if (!canvas.dataset.observed) {
+      canvas.dataset.observed = "1";
+      observeRedraw(canvas, draw);
+    }
   };
   canvas.style.maxWidth = "440px";
   draw();
