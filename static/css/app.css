@@ -181,7 +181,8 @@ svg.icon { width: 1.15em; height: 1.15em; fill: none; stroke: currentColor; stro
 .card + .card { margin-top: 14px; }
 /* 网格容器内卡片间距由 gap 负责：清零 .card + .card 的上边距，
    否则每行首卡（无前驱兄弟）会比同行卡片高出 14px（轨道被 margin-box 撑大） */
-.card-grid > .card { margin-top: 0; }
+.card-grid > .card,
+.stat-grid > .card { margin-top: 0; }
 .card-title { font-size: 16px; font-weight: 700; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
 .card-desc { font-size: 13px; color: var(--label-2); margin: 0 0 14px; }
 .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
