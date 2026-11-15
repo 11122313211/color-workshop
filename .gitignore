@@ -1,0 +1,23 @@
+# 运行时数据（工艺 ICC、配方记录）
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# 环境
+.env
+
+# 工具产物
+.mimosa/
+.video_agent/
+.zcode/
+.DS_Store
+Thumbs.db
+
+# 依赖备份
+*.corrupt-*
+*.tmp

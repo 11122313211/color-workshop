@@ -1,0 +1,13 @@
+# 色彩工坊依赖（Python 3.12+ 实测 3.14）
+# 算法层：lcms2 经 Pillow ImageCms + colour-science + coloraide
+fastapi==0.162.5
+uvicorn==0.48.0
+pillow==12.3.0
+numpy==2.5.3
+colour-science==0.4.7
+coloraide==8.14.1
+pydantic==2.14.3
+
+# 测试
+pytest==9.2.0
+httpx==0.28.1
