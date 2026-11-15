@@ -287,12 +287,26 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
         np.mean([_point_in_srgb_triangle(p) for p in xy])
     ) if len(xy) else 0.0
 
+    # 表面网格：Lab 空间凸包包络三角索引（scipy Qhull；GRAY 等低维色域无表面）。
+    # V0.5 再考虑非凸等值面（voxel 边界提取）。
+    surface = None
+    if channels >= 3 and len(lab) >= 4:
+        try:
+            from scipy.spatial import ConvexHull
+
+            ch = ConvexHull(lab)
+            surface = {"triangles": [[int(a), int(b), int(c)] for a, b, c in ch.simplices]}
+        except Exception:  # noqa: BLE001 —— Qhull 退化时跳过网格，仅渲染点云
+            surface = None
+
     result = {
         "xy_points": [[round(float(x), 4), round(float(y), 4)] for x, y in xy],
         "lab_points": [
             [round(float(l), 1), round(float(a), 1), round(float(b), 1)]
             for l, a, b in lab
         ],
+        "grid": {"levels": levels, "channels": channels},
+        "surface": surface,
         "hull": hull_idx,
         "coverage_srgb": round(coverage, 4),
         "volume": float(

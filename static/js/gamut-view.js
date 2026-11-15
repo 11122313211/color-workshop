@@ -1,11 +1,12 @@
-/* 色域视图组件：2D CIE 凸包图 + 伪 3D Lab 体积 + L* 切片 + hover 读数。
+/* 色域视图组件：2D CIE 凸包图 + 3D 体积 + L* 切片 + hover 读数。
  *
- * 渲染器注册表（V0.4 three.js 预留）：注册同名渲染器即可替换渲染层，
- * 视图状态、tooltip、切片滑块、事件层全部复用：
- *   registerRenderer("three", {
- *     mount(stage) -> canvasLike, draw(data, viewState), hitTest(px, py, viewState), dispose()
- *   })
- * DOM 契约恒定：.gamut-stage > canvas + .gamut-tip；.gamut-toolbar / .gamut-controls。
+ * 渲染器注册表：同名渲染器可替换渲染层，视图状态、tooltip、切片滑块、事件层全部复用：
+ *   - 'canvas2d'：2D CIE 图 + 斜投影伪 3D（V0.3，零依赖，始终可用）
+ *   - 'three'：  WebGL 真 3D（V0.4，gamut-three.js 首次切 3D 时动态 import，
+ *                失败/无 WebGL 自动回退 canvas2d 伪 3D 并在角标标注）
+ * DOM 契约：.gamut-stage > canvas.gamut-canvas(2D) + canvas.gamut-canvas-gl(3D, 惰性创建)
+ *           + .gamut-tip；.gamut-toolbar / .gamut-controls。
+ * 两类 canvas 不能共存于同一元素（2D/WebGL 上下文互斥），故 3D 用独立元素按 hidden 切换。
  */
 
 import { drawCie, fetchSpectrum, labToCss, resolveToken, withAlpha, observeRedraw, esc } from "./components.js";
@@ -188,6 +189,7 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
   let mode = "2d";
   let theta = 35;
   let phi = 25;
+  let zoom = 2.2;
   let slice = null;
   let hoverCb = null;
   let data = null;
@@ -218,6 +220,7 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       <input type="range" class="gamut-slice" min="0" max="100" step="1" value="55" disabled aria-label="L* 切片明度">
       <span class="gamut-slice-val">关</span>
       <span style="flex:1"></span>
+      <span class="gamut-render-badge chip" hidden></span>
       <span class="gamut-sampled"></span>
     </div>
   `;
@@ -231,16 +234,83 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
   const sliceToggle = el.querySelector(".gamut-slice-toggle");
   const sliceVal = el.querySelector(".gamut-slice-val");
 
-  const renderer = renderers.get("canvas2d");
+  /* —— 渲染器选择：2D 恒为 canvas2d；3D 优先 three（WebGL），失败回退 canvas2d —— */
+  let threeState = "none"; // none | loading | ready | failed
+  let glCanvas = null;
 
-  /* —— 绘制（rAF 节流）—— */
+  function webglAvailable() {
+    try {
+      const probe = document.createElement("canvas");
+      return !!(
+        window.WebGLRenderingContext &&
+        (probe.getContext("webgl2") || probe.getContext("webgl"))
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function ensureThree() {
+    if (threeState !== "none") return;
+    threeState = "loading";
+    try {
+      await import("./gamut-three.js"); // 模块顶层自注册 'three'
+      threeState = renderers.has("three") && webglAvailable() ? "ready" : "failed";
+    } catch (_) {
+      threeState = "failed";
+    }
+    updateBadge();
+    schedule();
+  }
+
+  function updateBadge() {
+    stage.classList.toggle("mode-3d", mode === "3d");
+    const b = el.querySelector(".gamut-render-badge");
+    if (!b) return;
+    if (mode !== "3d") {
+      b.hidden = true;
+      return;
+    }
+    b.hidden = false;
+    b.textContent = threeState === "ready" ? "WebGL · three.js" : "Canvas 回退";
+  }
+
+  /* —— 绘制（rAF 节流；按模式选 canvas 与渲染器）—— */
   let rafId = 0;
   function schedule() {
     if (rafId || disposed || !data) return;
     rafId = requestAnimationFrame(() => {
       rafId = 0;
       if (disposed || !data) return;
-      screenPts = renderer.draw(canvas, data, { mode, theta, phi, slice }, spectrum);
+      if (mode === "3d" && threeState === "ready") {
+        if (!glCanvas) {
+          glCanvas = document.createElement("canvas");
+          glCanvas.className = "gamut-canvas gamut-canvas-gl";
+          glCanvas.setAttribute("aria-hidden", "true");
+          stage.insertBefore(glCanvas, tip);
+        }
+        canvas.hidden = true;
+        glCanvas.hidden = false;
+        screenPts = renderers
+          .get("three")
+          .draw(glCanvas, data, { mode, theta, phi, slice, zoom }, spectrum);
+        if (screenPts === null) {
+          // WebGL 上下文创建失败 → 回退伪 3D
+          threeState = "failed";
+          updateBadge();
+          glCanvas.hidden = true;
+          canvas.hidden = false;
+          screenPts = renderers
+            .get("canvas2d")
+            .draw(canvas, data, { mode, theta, phi, slice }, spectrum);
+        }
+      } else {
+        if (glCanvas) glCanvas.hidden = true;
+        canvas.hidden = false;
+        screenPts = renderers
+          .get("canvas2d")
+          .draw(canvas, data, { mode, theta, phi, slice }, spectrum);
+      }
     });
   }
 
@@ -276,8 +346,13 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     }
   }
 
-  /* —— 交互 —— */
-  canvas.addEventListener("pointermove", (e) => {
+  /* —— 交互（绑定在 stage 上，2D/3D 两个 canvas 共用同一套手感）—— */
+  const activeCanvas = () =>
+    mode === "3d" && threeState === "ready" && glCanvas && !glCanvas.hidden
+      ? glCanvas
+      : canvas;
+
+  stage.addEventListener("pointermove", (e) => {
     if (mode === "3d" && dragging) {
       const dx = e.clientX - lastPointer.x;
       const dy = e.clientY - lastPointer.y;
@@ -287,8 +362,8 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       schedule();
       return;
     }
-    const rect = canvas.getBoundingClientRect();
-    const hit = renderer.hitTest(
+    const rect = activeCanvas().getBoundingClientRect();
+    const hit = renderers.get("canvas2d").hitTest(
       screenPts,
       e.clientX - rect.left,
       e.clientY - rect.top,
@@ -296,26 +371,32 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     );
     showTip(hit, e.clientX, e.clientY);
   });
-  canvas.addEventListener("pointerleave", () => {
+  stage.addEventListener("pointerleave", () => {
     tip.hidden = true;
     if (hoverCb) hoverCb(null);
   });
-  canvas.addEventListener("pointerdown", (e) => {
+  stage.addEventListener("pointerdown", (e) => {
     if (mode !== "3d") return;
     dragging = true;
     lastPointer = { x: e.clientX, y: e.clientY };
-    canvas.setPointerCapture(e.pointerId);
-    canvas.classList.add("grabbing");
+    stage.setPointerCapture(e.pointerId);
+    stage.classList.add("grabbing");
   });
-  canvas.addEventListener("pointerup", (e) => {
+  stage.addEventListener("pointerup", (e) => {
     dragging = false;
-    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
-    canvas.classList.remove("grabbing");
+    try { stage.releasePointerCapture(e.pointerId); } catch (_) {}
+    stage.classList.remove("grabbing");
   });
-  canvas.addEventListener("dblclick", () => {
+  stage.addEventListener("wheel", (e) => {
+    if (mode !== "3d" || threeState !== "ready") return;
+    e.preventDefault();
+    zoom = Math.min(4, Math.max(1.4, zoom * (e.deltaY > 0 ? 1.08 : 0.92)));
+    schedule();
+  }, { passive: false });
+  stage.addEventListener("dblclick", () => {
     if (mode !== "3d") return;
     // prefers-reduced-motion 下直接置位，无动画
-    theta = 35; phi = 25;
+    theta = 35; phi = 25; zoom = 2.2;
     schedule();
   });
 
@@ -327,6 +408,8 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       b.classList.toggle("active", b === btn)
     );
     tip.hidden = true;
+    if (mode === "3d") ensureThree();
+    updateBadge();
     schedule();
   });
 
@@ -361,6 +444,8 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       el.querySelectorAll('[data-role="mode"] button').forEach((b) =>
         b.classList.toggle("active", b.dataset.mode === m)
       );
+      if (mode === "3d") ensureThree();
+      updateBadge();
       schedule();
     },
     setSlice(v) {
@@ -380,6 +465,8 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       disposed = true;
       if (rafId) cancelAnimationFrame(rafId);
       disposers.forEach((d) => d());
+      const threeR = renderers.get("three");
+      if (threeR && threeR.dispose) threeR.dispose();
       el.innerHTML = "";
     },
   };

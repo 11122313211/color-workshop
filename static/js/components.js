@@ -118,6 +118,23 @@ export function labToHex(lab) {
   return "#" + rgb.map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
+/** CIELAB（D50 PCS）→ linear sRGB [0,1]^3（WebGL 顶点色用，不经过 gamma） */
+export function labToLinearRgb(lab) {
+  const [L, a, b] = lab;
+  const fy = (L + 16) / 116;
+  const fx = fy + a / 500;
+  const fz = fy - b / 200;
+  const f2inv = (f) => (f ** 3 > 0.008856 ? f ** 3 : (f - 4 / 29) / 7.787);
+  const xyzD50 = [
+    f2inv(fx) * XYZ_D50[0],
+    (L > 8 ? ((L + 16) / 116) ** 3 : L / (116 * 7.787)) * XYZ_D50[1],
+    f2inv(fz) * XYZ_D50[2],
+  ];
+  const rel = mul3(M_ADAPT, xyzD50);
+  const xyzD65 = rel.map((v, i) => (v * XYZ_D65[i]) / XYZ_D50[i]);
+  return mul3(M_XYZ2RGB, xyzD65).map((c) => Math.min(1, Math.max(0, c)));
+}
+
 export function swatch(lab, { size = "", label = "" } = {}) {
   const hex = labToHex(lab);
   return `<div class="swatch ${size}" style="background:${labToCss(lab)}" title="Lab(${lab.map((v) => Math.round(v * 10) / 10).join(", ")})">

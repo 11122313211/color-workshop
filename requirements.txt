@@ -7,6 +7,11 @@ numpy==2.5.3
 colour-science==0.4.7
 coloraide==8.14.1
 pydantic==2.14.3
+scipy==1.18.1  # 色域表面网格 Qhull 凸包（3D 渲染）
+
+# V0.4 印前
+pypdf==6.17.0        # PDF 预检
+pypdfium2==5.13.0    # PDF 首页缩略图（可选，缺失时自动降级）
 
 # 测试
 pytest==9.2.0
