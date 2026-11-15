@@ -28,7 +28,7 @@ from .routers import (
 app = FastAPI(
     title="色彩管理闭环 AI 平台",
     description="软硬件一体的通用色彩管理闭环 AI 平台：测—析—校—验—迭代端到端自动化",
-    version="0.2.0",
+    version="0.4.0",
 )
 
 app.add_middleware(

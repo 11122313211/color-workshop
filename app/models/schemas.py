@@ -342,6 +342,10 @@ class PreflightReport(BaseModel):
     dominant_colors: list[str] = []
     issues: list[PreflightIssue] = []
     status: str = "pass"
+    # V0.4 PDF 预检扩展（图像预检时均为缺省）
+    pages: Optional[int] = None
+    pdf: Optional[dict] = None
+    thumbnail_b64: Optional[str] = None
 
 
 class FileConvertRequest(BaseModel):

@@ -24,6 +24,7 @@ ok = True
 # 0. 静态页与 API 健康
 r = client.get("/api/health")
 ok &= check("健康检查", r.status_code == 200 and r.json()["status"] == "ok", r.text[:80])
+ok &= check("版本号 v0.4.0", r.json().get("version") == "0.4.0")
 r = client.get("/", follow_redirects=False)
 ok &= check("根路径重定向", r.status_code == 307 and r.headers["location"] == "/static/index.html")
 r = client.get("/static/index.html")
@@ -126,9 +127,63 @@ ok &= check("LAB 色差", r.status_code == 200 and r.json()["delta_e"] > 0, f"Δ
 r = client.get("/api/visualization/gamut", params={"spaces": "srgb,dci-p3"})
 ok &= check("色域可视化", r.status_code == 200 and "gamut_polygons" in r.json())
 
+# 6.5 V0.4：gamut 新字段 / three.js 静态资产
+r = client.get(f"/api/processes/{pid}/gamut?levels=6")
+g = r.json()
+ok &= check("gamut grid+surface 字段", g.get("grid", {}).get("channels") == 4 and bool(g.get("surface", {}).get("triangles")), f"三角面={len(g.get('surface', {}).get('triangles', []))}")
+for path in ("/static/js/gamut-three.js", "/static/vendor/three/three.module.js", "/static/js/views/monitor.js"):
+    r = client.get(path)
+    ok &= check(f"V0.4 静态资产 {path}", r.status_code == 200)
+
+# 6.6 V0.4：补偿模型沉淀（一次有效验证 → n=1）
+r = client.get(f"/api/processes/{pid}")
+comp = r.json().get("compensation")
+ok &= check("补偿模型沉淀 n=1", bool(comp) and comp["n"] == 1 and any(v != 0 for v in comp["bias_device"]))
+
+# 6.7 V0.4：监控 stats 聚合
+r = client.get("/api/recipes/stats")
+s = r.json()
+ok &= check(
+    "监控 stats 聚合",
+    r.status_code == 200 and s["total"] >= 2 and len(s["series"]) == s["total"] and s["converged_rate"] == 1.0,
+    f"total={s['total']} mean={s['mean_de']} p95={s['p95_de']}",
+)
+created = [p["created_at"] for p in s["series"]]
+ok &= check("stats 时间序列升序", created == sorted(created))
+
+# 6.8 V0.4：色域对比（同 ICC 双工艺 → 交集重合）
+icc2 = (WIN / "RSWOP.icm").read_bytes()
+r = client.post("/api/processes", params={"name": "E2E-SWOP-B", "filename": "RSWOP.icm"}, content=icc2, headers={"Content-Type": "application/octet-stream"})
+pid_b = r.json()["id"]
+r = client.get(f"/api/processes/{pid}/gamut/compare", params={"other": pid_b, "levels": 5})
+cmp = r.json()
+ok &= check(
+    "色域对比（同 ICC 重合）",
+    r.status_code == 200 and cmp["area_inter_over_a"] > 0.99 and len(cmp["inter_poly"]) >= 3,
+    f"交集/A={cmp['area_inter_over_a']}",
+)
+
+# 6.9 V0.4：PDF 预检
+pbuf = io.BytesIO()
+Image.new("RGB", (420, 595), (120, 60, 160)).save(pbuf, format="PDF")
+pb64 = base64.b64encode(pbuf.getvalue()).decode()
+r = client.post("/api/files/preflight", json={"image_b64": pb64, "filename": "e2e.pdf"})
+prep = r.json()
+ok &= check(
+    "PDF 预检（页数/输出意图告警/缩略图）",
+    r.status_code == 200 and prep["format"] == "PDF" and prep["pages"] == 1
+    and prep["pdf"]["has_output_intent"] is False and (prep["thumbnail_b64"] or "").startswith("data:image/png"),
+    f"status={prep['status']}",
+)
+
+# 6.10 V0.4：补偿模型重置
+r = client.delete(f"/api/processes/{pid}/compensation")
+ok &= check("补偿模型重置", r.status_code == 200 and r.json()["status"] == "reset")
+
 # 7. 清理
-r = client.delete(f"/api/processes/{pid}")
-ok &= check("清理工艺", r.status_code == 200)
+for p in (pid, pid_b):
+    r = client.delete(f"/api/processes/{p}")
+    ok &= check("清理工艺", r.status_code == 200)
 r = client.get("/api/recipes", params={"process_id": pid})
 ok &= check("配方记录清理", r.status_code == 200 and r.json() == [])
 

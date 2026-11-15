@@ -96,7 +96,7 @@ function uploadBody(view) {
     return `<div class="step-card">
       <div class="dropzone" id="dz">${icon("upload")}
         <div style="font-weight:600">点击或拖入客户文件</div>
-        <div style="font-size:12px;margin-top:4px">支持 PNG / JPEG / TIFF 图像</div>
+        <div style="font-size:12px;margin-top:4px">支持 PNG / JPEG / TIFF 图像与 PDF 文档</div>
       </div>
     </div>`;
   }
@@ -107,20 +107,43 @@ function uploadBody(view) {
     )
     .join("");
   const badge = r.status === "pass" ? `<span class="badge badge-green">${icon("check")}预检通过</span>` : `<span class="badge badge-orange">${icon("warn")}有建议项</span>`;
+  const isPdf = r.format === "PDF";
+  const pdfBlock = isPdf && r.pdf ? `
+    <div style="display:flex; gap:14px; margin-top:12px; flex-wrap:wrap; align-items:flex-start">
+      ${r.thumbnail_b64 ? `<img src="${r.thumbnail_b64}" alt="PDF 首页缩略图" style="max-width:180px; max-height:240px; border:1px solid var(--separator); border-radius:10px">` : ""}
+      <dl class="kv" style="flex:1; min-width:220px">
+        <dt>页数</dt><dd>${r.pages}</dd>
+        <dt>页面尺寸</dt><dd>${r.pdf.page_sizes_mm.map((s) => `${s[0]}×${s[1]} mm`).slice(0, 3).join(" · ")}${r.pdf.page_sizes_mm.length > 3 ? " …" : ""}</dd>
+        <dt>输出意图</dt><dd>${r.pdf.has_output_intent ? `<span class="badge badge-green">已嵌入</span>` : `<span class="badge badge-orange">未嵌入</span>`}</dd>
+        <dt>图像对象</dt><dd>${r.pdf.images.length ? r.pdf.images.slice(0, 4).map((im) => `第${im.page}页 ${im.px[0]}×${im.px[1]} ${esc(im.colorspace)}`).join("；") + (r.pdf.images.length > 4 ? "…" : "") : "无位图对象"}</dd>
+        <dt>专色</dt><dd>${r.pdf.spot_colors.length ? r.pdf.spot_colors.map(esc).join("、") : "—"}</dd>
+        <dt>字体 / 透明对象</dt><dd>${r.pdf.fonts} 个字体对象${r.pdf.transparency ? " · 含透明" : ""}</dd>
+      </dl>
+    </div>` : "";
+  const chip = isPdf
+    ? `<span class="chip chip-mono">PDF · ${r.pages} 页 · ${r.size[0]}×${r.size[1]} mm</span>`
+    : `<span class="chip chip-mono">${r.format} · ${r.mode} · ${r.size[0]}×${r.size[1]}${r.dpi ? ` · ${r.dpi} DPI` : ""}</span>`;
   return `<div class="step-card">
     <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px">
       ${badge}
       <b>${esc(r.filename || "未命名")}</b>
-      <span class="chip chip-mono">${r.format} · ${r.mode} · ${r.size[0]}×${r.size[1]}${r.dpi ? ` · ${r.dpi} DPI` : ""}</span>
+      ${chip}
     </div>
     <div class="issue-list">${issues || '<div class="issue issue-info">' + icon("check") + "<span>未发现问题</span></div>"}</div>
-    ${r.dominant_colors.length ? `<div class="dom-colors">${r.dominant_colors.map((c) => `<div class="swatch swatch-sm" style="background:${c}" title="${c}"></div>`).join("")}<span style="font-size:12px;color:var(--label-2);align-self:center;margin-left:4px">主导色</span></div>` : ""}
+    ${pdfBlock}
+    ${!isPdf && r.dominant_colors.length ? `<div class="dom-colors">${r.dominant_colors.map((c) => `<div class="swatch swatch-sm" style="background:${c}" title="${c}"></div>`).join("")}<span style="font-size:12px;color:var(--label-2);align-self:center;margin-left:4px">主导色</span></div>` : ""}
     <div style="margin-top:12px"><button class="btn btn-ghost btn-sm" id="reupload">${icon("upload")}换一个文件</button></div>
   </div>`;
 }
 
 /* ---------- 阶段 2：色彩设定 ---------- */
 function setupBody(view) {
+  if (state.report && state.report.format === "PDF") {
+    return `<div class="step-card">
+      <div class="issue issue-info">${icon("info")}<span>PDF 已完成印前预检。转换功能暂不支持 PDF（仅支持 PNG / JPEG / TIFF 图像），如需色彩转换请导出页面图像后再上传。</span></div>
+      <div style="margin-top:12px"><button class="btn btn-secondary btn-sm" id="reupload">${icon("upload")}换一个文件</button></div>
+    </div>`;
+  }
   if (!state.processes.length) {
     return `<div class="step-card">${emptyState({
       iconName: "stack", title: "需要先创建工艺",

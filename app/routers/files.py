@@ -35,7 +35,7 @@ def run_preflight(req: PreflightRequest):
     try:
         report = preflight(image_bytes, req.filename)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"无法解析图像文件: {e}") from e
+        raise HTTPException(400, f"无法解析文件（图像或 PDF 均失败）: {e}") from e
     return PreflightReport(**report)
 
 
