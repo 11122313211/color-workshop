@@ -14,13 +14,21 @@ from ..models.schemas import (
     RecipeVerifyRequest,
     RecipeVerifyResponse,
 )
+from ..services.compensation import CompensationStore
 from ..services.processes import ProcessStore
-from ..services.recipe import RecipeStore, forward_query, predict_recipe, run_verification
+from ..services.recipe import (
+    CHANNEL_NAMES,
+    RecipeStore,
+    forward_query,
+    predict_recipe,
+    run_verification,
+)
 
 router = APIRouter(prefix="/api/recipes", tags=["recipes"])
 
 recipe_store = RecipeStore()
 _processes = ProcessStore()
+_compensations = CompensationStore()
 
 
 @router.post("/predict", response_model=RecipePredictResponse)
@@ -31,6 +39,11 @@ def predict(req: RecipePredictRequest):
 
     icc_bytes = _processes.icc_bytes(req.process_id)
     device_space = proc["icc_meta"]["device_space"]
+
+    # 工艺级补偿模型：sha 匹配且样本达标时作用于种子
+    bias = _compensations.bias_for_predict(req.process_id, proc["icc_sha256"])
+    comp_doc = _compensations.get(req.process_id)
+    comp_n = int(comp_doc["n"]) if comp_doc else 0
 
     started = time.perf_counter()
     results: list[RecipeResult] = []
@@ -43,10 +56,12 @@ def predict(req: RecipePredictRequest):
             tolerance=req.tolerance,
             method=req.method.value,
             max_rounds=req.max_rounds,
+            device_bias=bias,
         )
         r["method"] = req.method.value
         r["tolerance"] = req.tolerance
         r["label"] = t.label
+        r["compensation"] = {"n": comp_n, "applied": bias is not None}
         total_predictions += r["predictions"]
         results.append(RecipeResult(**r))
         # 每个目标存一条配方历史
@@ -127,6 +142,18 @@ def verify(req: RecipeVerifyRequest):
         method=doc.get("method", "cie2000"),
     )
     recipe_store.append_verification(req.recipe_id, verification)
+
+    # 工艺级补偿模型：修正有效时把「修正配方 − 原配方」累积进设备空间偏置
+    if verification["improved"]:
+        channels = proc["icc_meta"]["channels"]
+        names = CHANNEL_NAMES.get(channels, [])
+        if names:
+            delta_device = [
+                (verification["corrected_recipe"].get(n, 0.0) - doc["recipe"].get(n, 0.0)) / 100.0
+                for n in names
+            ]
+            _compensations.accumulate(doc["process_id"], proc["icc_sha256"], delta_device)
+
     return RecipeVerifyResponse(
         recipe_id=req.recipe_id,
         delta_e_measured=verification["delta_e_measured"],

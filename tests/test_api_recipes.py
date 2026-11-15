@@ -130,3 +130,46 @@ def test_verify_after_process_deleted_404(api_client, cmyk_icc):
     r = api_client.post("/api/recipes/verify", json={"recipe_id": rid, "measured_lab": [50, 20, 5]})
     assert r.status_code == 404
     print("[PASS] 工艺删除后 verify 404")
+
+
+def test_compensation_accumulate_apply_reset(api_client, cmyk_icc):
+    """V0.4 工艺级补偿模型：verify 沉淀 → n≥2 起 predict 应用 → 重置失效。"""
+    proc = _make_process(api_client, cmyk_icc, name="补偿闭环工艺")
+    target = [50.0, 20.0, 5.0]
+
+    def _predict() -> dict:
+        return api_client.post(
+            "/api/recipes/predict",
+            json={"process_id": proc["id"], "targets": [{"label": "补偿", "lab": target}]},
+        ).json()["results"][0]
+
+    # 第一次：n=0，未应用
+    r0 = _predict()
+    assert r0["compensation"] == {"n": 0, "applied": False}
+
+    # 两次有效验证 → n=2
+    for _ in range(2):
+        res = _predict()
+        p = res["predicted_lab"]
+        measured = [p[0] + 3.0, p[1] - 2.0, p[2] + 1.5]
+        rid = api_client.get(f"/api/recipes?process_id={proc['id']}").json()[0]["id"]
+        ver = api_client.post("/api/recipes/verify", json={"recipe_id": rid, "measured_lab": measured})
+        assert ver.status_code == 200 and ver.json()["improved"] is True
+
+    det = api_client.get(f"/api/processes/{proc['id']}").json()
+    assert det["compensation"]["n"] == 2
+    assert any(v != 0.0 for v in det["compensation"]["bias_device"])
+
+    # n≥2 → predict 应用偏置
+    r2 = _predict()
+    assert r2["compensation"] == {"n": 2, "applied": True}
+    assert r2["delta_e"] < 3.0  # 应用偏置后仍正常收敛
+
+    # 重置 → 失效
+    rst = api_client.delete(f"/api/processes/{proc['id']}/compensation")
+    assert rst.status_code == 200 and rst.json()["status"] == "reset"
+    det2 = api_client.get(f"/api/processes/{proc['id']}").json()
+    assert det2["compensation"] is None
+    r3 = _predict()
+    assert r3["compensation"]["applied"] is False
+    print("[PASS] 补偿模型沉淀→应用→重置全链路")

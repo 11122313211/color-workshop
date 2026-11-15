@@ -170,6 +170,18 @@ def test_process_list_summary(api_client, process_factory):
     print(f"[PASS] summary 聚合（hull {len(s['hull_xy'])} 顶点 / 达标率 {doc['pass_rate']}）")
 
 
+def test_compensation_reset_unknown_404(api_client):
+    """V0.4：补偿模型重置端点 —— 未知工艺 404。"""
+    assert api_client.delete("/api/processes/nonexistent0/compensation").status_code == 404
+
+
+def test_compensation_in_detail_payload(api_client, process_factory):
+    """V0.4：工艺详情响应携带 compensation 字段（无模型时为 null）。"""
+    proc = process_factory("详情补偿字段")
+    doc = api_client.get(f"/api/processes/{proc['id']}").json()
+    assert "compensation" in doc and doc["compensation"] is None
+
+
 def test_process_delete_cascade_removes_recipes(api_client, cmyk_icc):
     """级联删除回归：删工艺后 /api/recipes?process_id= 必须为空。"""
     proc = _create_process(api_client, cmyk_icc, name="级联删除")

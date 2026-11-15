@@ -6,11 +6,13 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from ..services.compensation import CompensationStore
 from ..services.processes import ProcessStore, gamut_summary, sample_process_gamut
 
 router = APIRouter(prefix="/api/processes", tags=["processes"])
 
 process_store = ProcessStore()
+_compensations = CompensationStore()
 
 
 class ProcessUpdateRequest(BaseModel):
@@ -69,6 +71,7 @@ def get_process(pid: str):
     doc = process_store.get(pid)
     if not doc:
         raise HTTPException(404, "工艺不存在")
+    doc = {**doc, "compensation": _compensations.get(pid)}
     return doc
 
 
@@ -99,6 +102,8 @@ async def replace_icc(
         process_store.replace_icc(pid, data, filename)
     except Exception as e:  # noqa: BLE001 —— 无效 ICC 文件
         raise HTTPException(400, f"无法解析 ICC 文件: {e}") from e
+    # ICC 更换 → 补偿模型即刻失效（新 ICC 墨量行为可能完全不同）
+    _compensations.reset(pid)
     new_doc = process_store.get(pid)
     return {
         "status": "replaced",
@@ -111,11 +116,21 @@ async def replace_icc(
 def delete_process(pid: str):
     if not process_store.delete(pid):
         raise HTTPException(404, "工艺不存在")
-    # 级联清理该工艺的配方记录
+    # 级联清理该工艺的配方记录与补偿模型
     from ..services.recipe import RecipeStore
 
     RecipeStore().remove_process(pid)
+    _compensations.reset(pid)
     return {"status": "deleted"}
+
+
+@router.delete("/{pid}/compensation")
+def reset_compensation(pid: str):
+    """重置工艺级误差补偿模型（换纸张/墨水等场景下人工干预）。"""
+    if not process_store.get(pid):
+        raise HTTPException(404, "工艺不存在")
+    _compensations.reset(pid)
+    return {"status": "reset"}
 
 
 @router.get("/{pid}/icc")

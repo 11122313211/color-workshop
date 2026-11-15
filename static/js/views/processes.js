@@ -480,6 +480,30 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
 
 /* ---------- 工艺详情 ---------- */
 
+/* 补偿模型卡（V0.4）：实测闭环沉淀的工艺级墨量偏置 */
+function compensationCard(p) {
+  const c = p.compensation;
+  const names = { CMYK: ["C", "M", "Y", "K"], RGB: ["R", "G", "B"], GRAY: ["K"] }[
+    p.icc_meta.device_space
+  ] || [];
+  const chips = (c.bias_device || [])
+    .map((v, i) => {
+      if (Math.abs(v) < 0.0005) return "";
+      const pct = v * 100;
+      return `<span class="chip chip-mono">${names[i] ?? i} ${pct > 0 ? "+" : ""}${pct.toFixed(1)}%</span>`;
+    })
+    .join("");
+  return `
+    <div class="card" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:12px 16px">
+      <span class="card-title" style="margin:0; display:inline-flex; align-items:center; gap:6px">
+        ${icon("refresh")}工艺补偿模型 <span class="chip">n=${c.n}</span>
+      </span>
+      <span class="page-sub" style="margin:0; flex:1; min-width:180px">实测闭环沉淀的墨量偏置，预测时自动应用</span>
+      ${chips || `<span class="chip chip-mono">偏置≈0</span>`}
+      <button class="btn btn-secondary btn-sm" id="btn-comp-reset">重置</button>
+    </div>`;
+}
+
 export async function renderProcessDetail(view, params) {
   view.innerHTML = `<div class="spinner"></div>`;
   let p;
@@ -515,6 +539,8 @@ export async function renderProcessDetail(view, params) {
       <div class="card stat"><div class="stat-val" id="st-cov"><span class="spinner"></span></div><div class="stat-label">sRGB 覆盖率</div></div>
       <div class="card stat"><div class="stat-val" id="st-pass"><span class="spinner"></span></div><div class="stat-label">配方达标率（近 20 条）</div></div>
     </div>
+
+    ${p.compensation && p.compensation.n > 0 ? compensationCard(p) : ""}
 
     <div class="card gamut-card">
       <div class="gamut-card-head">
@@ -557,6 +583,25 @@ export async function renderProcessDetail(view, params) {
   `;
 
   const reload = () => renderProcessDetail(view, params);
+
+  const compResetBtn = view.querySelector("#btn-comp-reset");
+  if (compResetBtn) {
+    compResetBtn.addEventListener("click", async () => {
+      const ok = await confirmDanger({
+        title: "重置补偿模型？",
+        message: "累积的墨量偏置将被清除，需重新通过实测验证沉淀。",
+        confirmText: "重置",
+      });
+      if (!ok) return;
+      try {
+        await apiDelete(`/api/processes/${p.id}/compensation`);
+        toast("补偿模型已重置", "ok");
+        reload();
+      } catch (e) {
+        toast(e.message, "err");
+      }
+    });
+  }
 
   view.querySelector(".btn-back").addEventListener("click", () => (location.hash = "#/processes"));
   view.querySelector("#btn-use").addEventListener("click", () => (location.hash = `#/recipes?process=${p.id}`));

@@ -41,9 +41,17 @@ LUT_LEVELS = 17
 # 8-bit LAB 量化地板：ΔE 低于此值停止精搜（继续搜索无意义）
 DE_FLOOR = 0.5
 
-# 进程内缓存：按 profile 内容哈希复用变换与粗查表
+# 插值精搜层：插值面（LUT 多线性插值，连续）负责排序与引导步长，真实 forward 定夺；
+# 真实 ΔE 低于此值即提前收手（继续搜索收益趋零）
+REFINE_FLOOR = 0.10
+REFINE_STEP_MIN = 1.0 / 2048.0  # ≈0.05% 墨量
+# 总开关（测试对照用：False 时完全走 V0.3 粗搜路径）
+REFINE_ENABLED = True
+
+# 进程内缓存：按 profile 内容哈希复用变换、粗查表与插值器
 _transforms: dict[str, ImageCms.ImageCmsTransform] = {}
 _luts: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+_interps: dict[str, Callable] = {}
 
 
 def _sha(icc_bytes: bytes) -> str:
@@ -104,6 +112,34 @@ def _build_forward(icc_bytes: bytes, channels: int) -> Callable:
     return forward
 
 
+def _make_interp(pts: np.ndarray, labs: np.ndarray, levels: int, channels: int) -> Callable:
+    """基于粗查表格点的多线性插值连续正向估计器。
+
+    LUT 格点按 meshgrid(indexing="ij") 行主序排列（与 _build_forward 的采样顺序一致）。
+    8-bit 格点值携带 ±0.4 量化噪声，插值等价于对该噪声做低通，并使目标函数连续化——
+    可分辨 8-bit 评价下无法区分的更优配方。
+    """
+    lut_labs = labs.reshape((levels,) * channels + (3,))
+    strides = np.array([levels ** (channels - 1 - k) for k in range(channels)])
+
+    def interp(values: np.ndarray) -> np.ndarray:
+        v = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+        n = v.shape[0]
+        g = v * (levels - 1)
+        i0 = np.clip(np.floor(g).astype(np.int64), 0, levels - 2)
+        w = g - i0  # [0,1]；v=1 时 w=1，全部权重落在上角点
+        lab = np.zeros((n, 3), dtype=np.float64)
+        for mask in range(1 << channels):
+            bits = np.array([(mask >> k) & 1 for k in range(channels)])
+            corner_w = np.where(bits == 1, w, 1.0 - w)
+            prod = corner_w.prod(axis=1)
+            flat = (i0 + bits) @ strides
+            lab += prod[:, None] * lut_labs.reshape(-1, 3)[flat]
+        return lab
+
+    return interp
+
+
 def predict_recipe(
     icc_bytes: bytes,
     device_space: str,
@@ -111,13 +147,16 @@ def predict_recipe(
     tolerance: float = 2.0,
     method: str = "cie2000",
     max_rounds: int = 6,
+    device_bias=None,
 ) -> dict:
     """给定目标 LAB，反查最优墨量配方。
+
+    device_bias: 工艺级补偿偏置（0-1 单位，长度=通道数），作用于搜索种子。
 
     返回:
         target_lab / predicted_lab / recipe(通道名→百分比) / delta_e /
         converged / iterations(ΔE 轨迹) / predictions(本次正向预测数) /
-        lut_points(粗查表规模)
+        lut_points(粗查表规模) / refine_predictions(插值精搜评估数)
     """
     channels = SPACE_CHANNELS.get(device_space, 3)
     forward = _build_forward(icc_bytes, channels)
@@ -131,6 +170,15 @@ def predict_recipe(
         pts = np.stack([g.ravel() for g in grids], axis=1)
         _luts[lut_key] = (pts, forward(pts))
     lut_pts, lut_labs = _luts[lut_key]
+    if lut_key not in _interps:
+        _interps[lut_key] = _make_interp(lut_pts, lut_labs, LUT_LEVELS, channels)
+    interp = _interps[lut_key]
+
+    bias = (
+        np.clip(np.asarray(device_bias, dtype=np.float64), -0.15, 0.15)
+        if device_bias is not None
+        else None
+    )
 
     predictions = 0
     # Lab 最近邻粗排，取 3 个种子并行精搜
@@ -140,6 +188,8 @@ def predict_recipe(
     best: dict | None = None
     for si in seed_idx:
         cur_val = lut_pts[si].copy()
+        if bias is not None:
+            cur_val = np.clip(cur_val + bias, 0.0, 1.0)
         cur_lab = lut_labs[si].copy()
         cur_de = float(delta_e(cur_lab, target, method))
         traj = [round(cur_de, 3)]
@@ -176,6 +226,48 @@ def predict_recipe(
                 "trajectory": traj,
             }
 
+    # —— 插值精搜：连续插值目标引导更细步长的下降，候选经真实 forward 定夺 ——
+    # 插值面只是真实映射的低通近似，其极小值可能偏离真实极小值；因此以插值排序、
+    # 真实 ΔE 定夺：每轮对插值最优的 top-2 候选做真实评估，记录真实更优者。
+    refine_preds = 0
+    if REFINE_ENABLED and best is not None and best["delta_e"] > REFINE_FLOOR:
+        cur_val = best["value"].copy()
+        cur_de_i = float(delta_e(interp(cur_val[None, :])[0], target, method))
+        bt_val, bt_lab, bt_de = best["value"].copy(), best["lab"].copy(), best["delta_e"]
+        step = (1.0 / (LUT_LEVELS - 1)) / 4.0  # 1/64 ≈ 1.56%
+        for _ in range(max_rounds * 2):
+            offsets = np.array([-step, 0.0, step])
+            grids = np.meshgrid(*([offsets] * channels), indexing="ij")
+            cand = np.clip(
+                np.stack([g.ravel() for g in grids], axis=1) + cur_val, 0.0, 1.0
+            )
+            des_i = delta_e_batch(interp(cand), target, method)
+            refine_preds += len(cand)
+            # 插值 top-2 候选做真实评估（每轮 ≤2 次 forward 调用；重复候选去重）
+            last_checked = None
+            for k in np.argsort(des_i)[:2]:
+                kv = cand[int(k)]
+                if last_checked is not None and np.array_equal(kv, last_checked):
+                    continue
+                last_checked = kv
+                tl = forward(kv.reshape(1, channels))[0]
+                predictions += 1
+                td = float(delta_e(tl, target, method))
+                if td + 1e-9 < bt_de:
+                    bt_val, bt_lab, bt_de = kv.copy(), tl, td
+            if des_i.min() + 1e-12 < cur_de_i:
+                cur_de_i = float(des_i.min())
+                cur_val = cand[int(np.argmin(des_i))].copy()
+            else:
+                step /= 2.0
+                if step < REFINE_STEP_MIN:
+                    break
+            if bt_de <= REFINE_FLOOR:
+                break
+        if bt_de + 1e-9 < best["delta_e"]:
+            best["value"], best["lab"], best["delta_e"] = bt_val, bt_lab, bt_de
+            best["trajectory"].append(round(bt_de, 3))
+
     assert best is not None
     names = CHANNEL_NAMES.get(channels, [f"CH{i}" for i in range(channels)])
     return {
@@ -190,6 +282,7 @@ def predict_recipe(
         "iterations": best["trajectory"],
         "predictions": predictions + int(len(lut_pts)),
         "lut_points": int(len(lut_pts)),
+        "refine_predictions": refine_preds,
     }
 
 

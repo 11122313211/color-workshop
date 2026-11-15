@@ -271,7 +271,9 @@ function resultCard(r, idx) {
   return `
   <div class="card" id="result-${idx}">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:14px">
-      <div class="card-title">${r.label ? esc(r.label) : `颜色 ${idx + 1}`}</div>
+      <div class="card-title">${r.label ? esc(r.label) : `颜色 ${idx + 1}`}
+        ${r.compensation && r.compensation.applied ? `<span class="chip" title="实测闭环沉淀的工艺级墨量偏置已作用于本次预测">补偿 n=${r.compensation.n}</span>` : ""}
+      </div>
       ${statusBadge(r.delta_e, r.tolerance)}
     </div>
 

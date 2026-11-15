@@ -106,6 +106,58 @@ def test_verification_closed_loop(cmyk_icc):
     print(f"[PASS] 实测验证闭环（dE {ver['delta_e_measured']} -> {ver['delta_e_corrected']}）")
 
 
+def test_interp_exact_on_linear_function():
+    """插值精搜层单元：多线性插值对线性函数应处处精确（网格无关）。"""
+    from app.services.recipe import _make_interp
+
+    levels, channels = 5, 2
+    axes = np.linspace(0.0, 1.0, levels)
+    g = np.meshgrid(*([axes] * channels), indexing="ij")
+    pts = np.stack([x.ravel() for x in g], axis=1)
+    # 线性真值映射：Lab = M·pt + b（多线性插值对线性函数无近似误差）
+    mat = np.array([[60.0, -25.0], [3.0, 7.5], [18.0, -40.0]])  # (3 Lab 维, 2 通道维)
+    offset = np.array([35.0, -4.0, 2.0])
+    labs = pts @ mat.T + offset
+
+    interp = _make_interp(pts, labs, levels, channels)
+    # 全部格点精确
+    assert np.allclose(interp(pts), labs, atol=1e-9)
+    # 非格点随机查询同样精确（线性函数被多线性插值完全重构）
+    rng = np.random.default_rng(7)
+    q = rng.random((200, channels))
+    assert np.allclose(interp(q), q @ mat.T + offset, atol=1e-9)
+    # 越界裁剪到边界值
+    edge = interp(np.array([[-0.5, -0.5], [1.5, 1.5]]))
+    assert np.allclose(edge[0], labs[0], atol=1e-9)
+    assert np.allclose(edge[1], labs[-1], atol=1e-9)
+    print("[PASS] 插值器对线性函数处处精确")
+
+
+def test_refinement_never_worse(cmyk_icc):
+    """插值精搜守门：开启精搜的真实 ΔE 不得劣于 V0.3 粗搜路径。"""
+    import app.services.recipe as R
+
+    targets = [
+        [50.0, 20.0, 5.0],
+        [50.0, -20.0, -25.0],
+        [60.0, 30.0, 40.0],
+        [85.0, -8.0, 30.0],
+    ]
+    try:
+        for target in targets:
+            R.REFINE_ENABLED = False
+            old = R.predict_recipe(cmyk_icc, "CMYK", target)
+            R.REFINE_ENABLED = True
+            new = R.predict_recipe(cmyk_icc, "CMYK", target)
+            assert new["delta_e"] <= old["delta_e"] + 1e-6, (
+                f"目标 {target}：精搜后 ΔE {new['delta_e']} 不应劣于粗搜 {old['delta_e']}"
+            )
+            assert new["refine_predictions"] >= 0
+    finally:
+        R.REFINE_ENABLED = True
+    print("[PASS] 精搜不劣化守门（4 目标全部 ≤ 粗搜基线）")
+
+
 def test_recipe_store_persistence():
     """配方记录落盘与读取（COLORFORGE_DATA_DIR 隔离环境）。"""
     store = RecipeStore()

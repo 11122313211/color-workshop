@@ -292,6 +292,8 @@ class RecipeResult(BaseModel):
     iterations: list[float]
     predictions: int
     lut_points: int
+    refine_predictions: int = 0
+    compensation: dict | None = Field(None, description="{n, applied} 工艺补偿模型应用状态")
 
 
 class RecipePredictResponse(BaseModel):
