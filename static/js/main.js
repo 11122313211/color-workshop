@@ -5,6 +5,7 @@ import { icon } from "./icons.js";
 import { renderRecipesView } from "./views/recipes.js";
 import { renderProcessesView, renderProcessDetail } from "./views/processes.js";
 import { renderFilesView } from "./views/files.js";
+import { renderMonitorView } from "./views/monitor.js";
 import { renderToolsView } from "./views/tools.js";
 import { updateNavCount } from "./views/shell.js";
 
@@ -64,6 +65,7 @@ register("#/recipes", renderRecipesView);
 register("#/files", renderFilesView);
 register("#/processes", renderProcessesView);
 register("#/processes/:id", renderProcessDetail);
+register("#/monitor", renderMonitorView);
 register("#/tools", renderToolsView);
 
 initTheme();

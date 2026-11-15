@@ -157,3 +157,22 @@ def process_gamut(pid: str, levels: int = 6):
         return sample_process_gamut(doc, levels=max(3, min(levels, 10)))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"色域采样失败: {e}") from e
+
+
+@router.get("/{pid}/gamut/compare")
+def gamut_compare(pid: str, other: str = Query(..., description="对比工艺 ID"), levels: int = 6):
+    """双工艺色域对比：xy 凸包叠加归属 + 交集多边形与近似面积。"""
+    doc = process_store.get(pid)
+    if not doc:
+        raise HTTPException(404, "工艺不存在")
+    other_doc = process_store.get(other)
+    if not other_doc:
+        raise HTTPException(404, "对比工艺不存在")
+    if other == pid:
+        raise HTTPException(400, "对比工艺不能与自身相同")
+    from ..services.processes import compare_gamuts
+
+    try:
+        return compare_gamuts(doc, other_doc, levels=max(3, min(levels, 10)))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"色域对比失败: {e}") from e

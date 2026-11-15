@@ -182,6 +182,34 @@ def test_compensation_in_detail_payload(api_client, process_factory):
     assert "compensation" in doc and doc["compensation"] is None
 
 
+def test_gamut_compare(api_client, cmyk_icc):
+    """V0.4 色域对比：同 ICC 双工艺 → 交集 = 全部（占比 1.0，归属全覆盖）。"""
+    a = _create_process(api_client, cmyk_icc, name="对比A")
+    b = _create_process(api_client, cmyk_icc, name="对比B")
+    r = api_client.get(f"/api/processes/{a['id']}/gamut/compare?other={b['id']}&levels=5")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["a"]["sampled"] == 5 ** 4
+    assert data["b"]["sampled"] == 5 ** 4
+    assert len(data["inter_poly"]) >= 3
+    assert data["area_inter_over_a"] > 0.99  # 同一 profile → 包络重合
+    assert data["area_inter_over_b"] > 0.99
+    # 有效色度点（排除退化原点）应全部落入对方包络
+    assert data["a_tested"] > 0
+    assert len(data["a_in_b"]) == data["a_tested"]
+    print(f"[PASS] 色域对比（交集/A={data['area_inter_over_a']}）")
+
+
+def test_gamut_compare_errors(api_client, cmyk_icc):
+    """V0.4 色域对比错误路径：404 / 自身对比 400。"""
+    a = _create_process(api_client, cmyk_icc, name="对比错误")
+    assert api_client.get(f"/api/processes/{a['id']}/gamut/compare?other=nope").status_code == 404
+    assert api_client.get("/api/processes/nope/gamut/compare?other=nope2").status_code == 404
+    r = api_client.get(f"/api/processes/{a['id']}/gamut/compare?other={a['id']}")
+    assert r.status_code == 400
+    print("[PASS] 对比错误路径（404 / 自身 400）")
+
+
 def test_process_delete_cascade_removes_recipes(api_client, cmyk_icc):
     """级联删除回归：删工艺后 /api/recipes?process_id= 必须为空。"""
     proc = _create_process(api_client, cmyk_icc, name="级联删除")

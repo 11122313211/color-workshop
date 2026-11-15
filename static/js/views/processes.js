@@ -10,7 +10,7 @@ import {
 import { icon } from "../icons.js";
 import {
   toast, emptyState, errorState, skeletonCards, esc,
-  labToHex, sparkline, openModal, confirmDanger,
+  labToHex, sparkline, openModal, confirmDanger, drawCie, fetchSpectrum,
 } from "../components.js";
 import { createGamutView, SRGB_XY } from "../gamut-view.js";
 import { updateNavCount } from "./shell.js";
@@ -504,6 +504,104 @@ function compensationCard(p) {
     </div>`;
 }
 
+/* 色域对比模态（V0.4）：双工艺凸包叠加 + 交集多边形 + xy 面积指标 */
+async function openCompareModal(view, p) {
+  let others = [];
+  try {
+    others = (await apiGet("/api/processes")).filter((x) => x.id !== p.id);
+  } catch (_) { /* 列表失败也可手动刷新重试 */ }
+
+  const { modal, close } = openModal(`
+    <div class="card-title" style="display:flex; align-items:center; gap:8px">
+      ${icon("compare")}色域对比 · <span style="color:var(--label-2)">${esc(p.name)}</span>
+    </div>
+    <div id="cmp-setup" style="margin-top:12px">
+      ${others.length ? `
+        <label class="page-sub" style="margin:0">对比工艺</label>
+        <select id="cmp-other" style="width:100%; margin-top:8px; padding:9px 12px; border:1px solid var(--separator); border-radius:var(--radius-btn); background:var(--fill); color:var(--label); font-size:14px">
+          ${others.map((x) => `<option value="${x.id}">${esc(x.name)}（${x.icc_meta.device_space}）</option>`).join("")}
+        </select>
+        <div style="display:flex; gap:10px; margin-top:14px; justify-content:flex-end">
+          <button class="btn btn-secondary btn-sm" id="cmp-cancel">关闭</button>
+          <button class="btn btn-sm" id="cmp-go">${icon("compare")}开始对比</button>
+        </div>`
+      : `<div class="issue issue-warn">${icon("warn")}<span>工艺库中目前只有这一个工艺，先创建另一个工艺再对比。</span></div>`}
+    </div>
+    <div id="cmp-result"></div>
+  `);
+
+  modal.querySelector("#cmp-cancel")?.addEventListener("click", close);
+  const goBtn = modal.querySelector("#cmp-go");
+  if (goBtn) {
+    goBtn.addEventListener("click", async () => {
+      const otherId = modal.querySelector("#cmp-other").value;
+      const otherName = others.find((x) => x.id === otherId)?.name || "";
+      goBtn.disabled = true;
+      goBtn.innerHTML = `<span class="spinner"></span>采样中…`;
+      try {
+        const data = await apiGet(
+          `/api/processes/${p.id}/gamut/compare?other=${otherId}&levels=6`
+        );
+        modal.querySelector("#cmp-setup").hidden = true;
+        renderCompareResult(modal.querySelector("#cmp-result"), p, otherName, data);
+      } catch (e) {
+        toast(e.message, "err");
+        goBtn.disabled = false;
+        goBtn.innerHTML = `${icon("compare")}开始对比`;
+      }
+    });
+  }
+}
+
+function renderCompareResult(el, p, otherName, data) {
+  const a = data.a;
+  const b = data.b;
+  const pct = (v) => (v == null ? "—" : `${(v * 100).toFixed(1)}%`);
+  el.innerHTML = `
+    <div style="display:flex; justify-content:center">
+      <canvas class="cie-canvas" id="cmp-canvas" style="max-width:none; width:min(100%, 460px)"></canvas>
+    </div>
+    <div class="cie-legend" style="margin-top:10px; justify-content:center">
+      <span><i class="dot" style="background:var(--indigo)"></i>${esc(p.name)}</span>
+      <span><i class="dot" style="background:var(--orange)"></i>${esc(otherName)}</span>
+      <span><i class="dot" style="background:var(--teal)"></i>xy 交集</span>
+    </div>
+    <dl class="kv" style="margin-top:12px">
+      <dt>xy 包络面积占比</dt>
+      <dd>交集 / A = <b>${pct(data.area_inter_over_a)}</b> · 交集 / B = <b>${pct(data.area_inter_over_b)}</b></dd>
+      <dt>采样点归属</dt>
+      <dd>A 有 ${data.a_in_b.length}/${a.sampled} 点落入 B 包络 · B 有 ${data.b_in_a.length}/${b.sampled} 点落入 A 包络</dd>
+      <dt>色域体积（Lab 包围盒）</dt>
+      <dd>A ${formatVolume(a.volume)} · B ${formatVolume(b.volume)}</dd>
+      <dt>sRGB 覆盖率</dt>
+      <dd>A ${(a.coverage_srgb * 100).toFixed(0)}% · B ${(b.coverage_srgb * 100).toFixed(0)}%</dd>
+    </dl>
+  `;
+  fetchSpectrum().catch(() => null).then((spectrum) => {
+    const series = [
+      { points: SRGB_XY, color: "var(--accent)", fill: true, fillAlpha: 0.13 },
+      // A/B 各拆两个系列：凸包填充多边形（仅顶点）+ 采样点云
+      {
+        points: a.hull.map((i) => a.xy_points[i]), hull: a.hull.map((_, i) => i),
+        color: "var(--indigo)", fill: true, fillAlpha: 0.16, hullWidth: 2, hullAlpha: 0.16,
+      },
+      { points: a.xy_points, color: "var(--indigo)", dotAlpha: 0.3, pointSize: 1.4 },
+      {
+        points: b.hull.map((i) => b.xy_points[i]), hull: b.hull.map((_, i) => i),
+        color: "var(--orange)", fill: true, fillAlpha: 0.16, hullWidth: 2, hullAlpha: 0.16,
+      },
+      { points: b.xy_points, color: "var(--orange)", dotAlpha: 0.3, pointSize: 1.4 },
+    ];
+    if (data.inter_poly && data.inter_poly.length >= 3) {
+      series.push({
+        points: data.inter_poly, color: "var(--teal)",
+        fill: true, fillAlpha: 0.42, hullWidth: 1.4,
+      });
+    }
+    drawCie(el.querySelector("#cmp-canvas"), series, { spectrum });
+  });
+}
+
 export async function renderProcessDetail(view, params) {
   view.innerHTML = `<div class="spinner"></div>`;
   let p;
@@ -545,10 +643,13 @@ export async function renderProcessDetail(view, params) {
     <div class="card gamut-card">
       <div class="gamut-card-head">
         <div class="card-title">${icon("target")}工艺色域</div>
-        <div class="cie-legend">
-          <span><i class="dot" style="background:linear-gradient(90deg,#4400ff,#00ff00,#ff0000)"></i>光谱轨迹</span>
-          <span><i class="dot legend-srgb"></i>sRGB</span>
-          <span><i class="dot legend-proc"></i>工艺凸包 · 采样点按 L* 着色</span>
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+          <div class="cie-legend">
+            <span><i class="dot" style="background:linear-gradient(90deg,#4400ff,#00ff00,#ff0000)"></i>光谱轨迹</span>
+            <span><i class="dot legend-srgb"></i>sRGB</span>
+            <span><i class="dot legend-proc"></i>工艺凸包 · 采样点按 L* 着色</span>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="btn-compare">${icon("compare")}色域对比</button>
         </div>
       </div>
       <div id="gamut-view"></div>
@@ -611,6 +712,7 @@ export async function renderProcessDetail(view, params) {
   view.querySelector("#btn-replace").addEventListener("click", () =>
     openProcessEditor(view, { mode: "edit", process: p, onDone: reload })
   );
+  view.querySelector("#btn-compare").addEventListener("click", () => openCompareModal(view, p));
   view.querySelector("#btn-delete").addEventListener("click", async () => {
     const ok = await confirmDanger({
       title: `删除工艺「${p.name}」？`,

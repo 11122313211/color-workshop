@@ -119,6 +119,70 @@ def test_verify_unknown_recipe_404(api_client):
     assert r.status_code == 404
 
 
+def test_stats_aggregation(api_client, cmyk_icc):
+    """V0.4 监控聚合：总量/达标率/mean/P95/时间序列升序/分工艺。"""
+    proc = _make_process(api_client, cmyk_icc, name="监控聚合工艺")
+    api_client.post(
+        "/api/recipes/predict",
+        json={
+            "process_id": proc["id"],
+            "targets": [
+                {"label": "红", "lab": [50.0, 20.0, 5.0]},
+                {"label": "青", "lab": [50.0, -20.0, -25.0]},
+                {"label": "黄", "lab": [85.0, -8.0, 30.0]},
+            ],
+        },
+    )
+    s = api_client.get("/api/recipes/stats").json()
+    assert s["total"] >= 3
+    assert 0.0 <= s["converged_rate"] <= 1.0
+    assert s["mean_de"] is not None and s["p95_de"] is not None
+    assert len(s["series"]) == s["total"]
+    created = [p["created_at"] for p in s["series"]]
+    assert created == sorted(created), "时间序列应为升序"
+    mine = [p for p in s["processes"] if p["process_id"] == proc["id"]]
+    assert mine and mine[0]["n"] >= 3
+    assert mine[0]["pass_rate"] == 1.0
+    print(f"[PASS] stats 聚合（total={s['total']} / mean ΔE={s['mean_de']}）")
+
+
+def test_stats_drift_flag(api_client, cmyk_icc):
+    """V0.4 漂移检测：最近 5 条 ΔE 显著抬升 → flag。直接写库构造序列。"""
+    proc = _make_process(api_client, cmyk_icc, name="漂移工艺")
+    from datetime import datetime, timedelta
+
+    from app.services.recipe import RecipeStore
+
+    store = RecipeStore()
+    base = datetime(2026, 1, 1)
+    for i in range(12):
+        de = 0.2 if i < 7 else 2.0  # 前 7 条优、后 5 条劣化
+        store.create(
+            {"id": proc["id"], "name": "漂移工艺", "icc_meta": {"device_space": "CMYK"}},
+            {
+                "target_lab": [50, 20, 5], "predicted_lab": [50, 20, 5],
+                "recipe": {"C": 1, "M": 1, "Y": 1, "K": 1},
+                "delta_e": de, "converged": de <= 2.0,
+                "iterations": [de], "predictions": 10, "lut_points": 1,
+                "method": "cie2000", "tolerance": 2.0,
+            },
+        )
+        # 覆写创建时间制造先后序
+        doc = store.list(proc["id"])
+        # create 用 now()，直接改最后一行的 created_at
+        rid = max(store.list(proc["id"]), key=lambda d: d["created_at"])["id"]
+        d = store.get(rid)
+        d["created_at"] = (base + timedelta(hours=i)).isoformat(timespec="seconds")
+        store._store.put(rid, d)
+
+    s = api_client.get(f"/api/recipes/stats?process_id={proc['id']}").json()
+    mine = [p for p in s["processes"] if p["process_id"] == proc["id"]]
+    assert mine and mine[0]["n"] == 12
+    assert mine[0]["drift_flag"] is True, f"应触发漂移告警: {mine[0]}"
+    assert s["flags"], "全局 flags 应含告警"
+    print(f"[PASS] 漂移告警触发（drift={mine[0]['drift']}）")
+
+
 def test_verify_after_process_deleted_404(api_client, cmyk_icc):
     proc = _make_process(api_client, cmyk_icc, name="删除工艺后verify")
     pr = api_client.post(

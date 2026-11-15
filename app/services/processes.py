@@ -281,8 +281,11 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
     xy = colour.XYZ_to_xyY(xyz)[:, :2]
     xy = np.clip(xy, 0.0, 0.8)
 
-    # 凸包仅统计有实际亮度的点（Y≈0 的暗色在 xy 图上聚在原点，会破坏凸包形状）
-    hull_idx = _convex_hull_indices(xy[xyz[:, 1] > 1e-6])
+    # 凸包仅统计有效色度点：Y≈0 的暗色 xy 是 0/0 比值噪声（0,0 或撞上 clip 边界），
+    # 色度上无意义且会把包络拖向原点。注意：单调链返回的是「过滤后数组」的局部索引，
+    # 必须映射回全量 xy_points 索引，否则消费方按全量数组取点会错位（V0.3 遗留 bug）。
+    bright = np.where((xy[:, 0] > 1e-3) & (xy[:, 1] > 1e-3))[0]
+    hull_idx = [int(bright[i]) for i in _convex_hull_indices(xy[bright])] if len(bright) >= 3 else []
     coverage = float(
         np.mean([_point_in_srgb_triangle(p) for p in xy])
     ) if len(xy) else 0.0
@@ -333,4 +336,116 @@ def gamut_summary(process: dict) -> dict:
         "volume": g["volume"],
         "coverage_srgb": g["coverage_srgb"],
         "hull_xy": [g["xy_points"][i] for i in g["hull"]] if g["hull"] else [],
+    }
+
+
+# ---------- 多工艺色域对比（V0.4） ----------
+
+def _ensure_ccw(poly: np.ndarray) -> np.ndarray:
+    poly = np.asarray(poly, dtype=np.float64)
+    x, y = poly[:, 0], poly[:, 1]
+    area2 = float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    return poly if area2 >= 0 else poly[::-1]
+
+
+def _polygon_area(poly: np.ndarray) -> float:
+    x, y = poly[:, 0], poly[:, 1]
+    return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) / 2.0
+
+
+def _points_in_convex(points: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """点在凸多边形内判定（全向量化；对 CCW 多边形，内部点叉积恒 ≥0）。"""
+    poly = _ensure_ccw(poly)
+    x1, y1 = poly[:, 0], poly[:, 1]
+    x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
+    px = points[:, 0:1]
+    py = points[:, 1:2]
+    cross = (x2 - x1)[None, :] * (py - y1[None, :]) - (y2 - y1)[None, :] * (px - x1[None, :])
+    return (cross >= -1e-12).all(axis=1)
+
+
+def _line_intersect(p1, p2, a, b):
+    d1 = (p2[0] - p1[0], p2[1] - p1[1])
+    d2 = (b[0] - a[0], b[1] - a[1])
+    denom = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(denom) < 1e-15:
+        return p2
+    t = ((a[0] - p1[0]) * d2[1] - (a[1] - p1[1]) * d2[0]) / denom
+    return (p1[0] + t * d1[0], p1[1] + t * d1[1])
+
+
+def _clip_convex(subject: np.ndarray, clip: np.ndarray) -> list:
+    """Sutherland–Hodgman：subject 凸多边形被 clip 凸多边形逐边裁剪，返回交集顶点。"""
+    clip = _ensure_ccw(np.asarray(clip, dtype=np.float64))
+    out = [tuple(map(float, p)) for p in _ensure_ccw(np.asarray(subject, dtype=np.float64))]
+    n = len(clip)
+    for i in range(n):
+        if not out:
+            break
+        a, b = clip[i], clip[(i + 1) % n]
+
+        def side(p):
+            return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+
+        inp, out = out, []
+        for j in range(len(inp)):
+            cur, prev = inp[j], inp[j - 1]
+            cs, ps = side(cur), side(prev)
+            if cs >= 0:
+                if ps < 0:
+                    out.append(_line_intersect(prev, cur, a, b))
+                out.append(tuple(cur))
+            elif ps >= 0:
+                out.append(_line_intersect(prev, cur, a, b))
+    return out
+
+
+def compare_gamuts(a_doc: dict, b_doc: dict, levels: int = 6) -> dict:
+    """双工艺色域对比：xy 平面凸包归属 + 凸包交集多边形与面积。
+
+    a_in_b/b_in_a：对方凸包覆盖的采样点索引（指向各自 lab_points/xy_points）；
+    inter_poly：两凸包 xy 交集多边形；面积均为 xy 色度平面近似面积。
+    """
+    ga = sample_process_gamut(a_doc, levels)
+    gb = sample_process_gamut(b_doc, levels)
+    a_xy = np.asarray(ga["xy_points"], dtype=np.float64)
+    b_xy = np.asarray(gb["xy_points"], dtype=np.float64)
+
+    hull_a = np.asarray([ga["xy_points"][i] for i in ga["hull"]]) if len(ga["hull"]) >= 3 else None
+    hull_b = np.asarray([gb["xy_points"][i] for i in gb["hull"]]) if len(gb["hull"]) >= 3 else None
+    a_in_b = b_in_a = None
+    a_tested = b_tested = 0
+    inter_poly: list = []
+    area_a = area_b = area_inter = 0.0
+    if hull_a is not None and hull_b is not None:
+        # 归属判定只在有效色度点（排除 0/0 比值噪声）上进行；容差放宽到 1e-4，
+        # 吸收响应 4dp 舍入在包络边界上的抖动
+        a_keep = np.where((a_xy[:, 0] > 1e-3) & (a_xy[:, 1] > 1e-3))[0]
+        b_keep = np.where((b_xy[:, 0] > 1e-3) & (b_xy[:, 1] > 1e-3))[0]
+        a_tested, b_tested = len(a_keep), len(b_keep)
+        a_in_b = _points_in_convex(a_xy[a_keep], hull_b)
+        b_in_a = _points_in_convex(b_xy[b_keep], hull_a)
+        inter = _clip_convex(hull_a, hull_b)
+        if len(inter) >= 3:
+            inter_poly = [[round(float(x), 6), round(float(y), 6)] for x, y in inter]
+            area_inter = _polygon_area(np.asarray(inter))
+        area_a = _polygon_area(hull_a)
+        area_b = _polygon_area(hull_b)
+
+    a_in_b_idx = [int(a_keep[i]) for i in np.where(a_in_b)[0]] if a_in_b is not None else []
+    b_in_a_idx = [int(b_keep[i]) for i in np.where(b_in_a)[0]] if b_in_a is not None else []
+
+    return {
+        "a": ga,
+        "b": gb,
+        "a_in_b": a_in_b_idx,
+        "b_in_a": b_in_a_idx,
+        "a_tested": a_tested,
+        "b_tested": b_tested,
+        "inter_poly": inter_poly,
+        "area_a": round(area_a, 8),
+        "area_b": round(area_b, 8),
+        "area_inter": round(area_inter, 8),
+        "area_inter_over_a": round(area_inter / area_a, 4) if area_a > 0 else None,
+        "area_inter_over_b": round(area_inter / area_b, 4) if area_b > 0 else None,
     }
