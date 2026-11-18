@@ -116,11 +116,13 @@ async def replace_icc(
 def delete_process(pid: str):
     if not process_store.delete(pid):
         raise HTTPException(404, "工艺不存在")
-    # 级联清理该工艺的配方记录与补偿模型
+    # 级联清理该工艺的配方记录、补偿模型与校准轮次（V0.8）
+    from ..services.calibration_history import CalibrationStore
     from ..services.recipe import RecipeStore
 
     RecipeStore().remove_process(pid)
     _compensations.reset(pid)
+    CalibrationStore().remove_process(pid)
     return {"status": "deleted"}
 
 

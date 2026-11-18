@@ -24,12 +24,14 @@ from .routers import (
     router_recipes,
     router_files,
     router_qc,
+    router_signoffs,
+    router_displays,
 )
 
 app = FastAPI(
     title="色彩管理闭环 AI 平台",
     description="软硬件一体的通用色彩管理闭环 AI 平台：测—析—校—验—迭代端到端自动化",
-    version="0.7.0",
+    version="0.9.0",
 )
 
 app.add_middleware(
@@ -45,6 +47,8 @@ app.include_router(router_processes)
 app.include_router(router_recipes)
 app.include_router(router_files)
 app.include_router(router_qc)
+app.include_router(router_signoffs)
+app.include_router(router_displays)
 app.include_router(router_devices)
 app.include_router(router_measurements)
 app.include_router(router_color_checker)

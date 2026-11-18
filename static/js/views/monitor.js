@@ -649,7 +649,7 @@ async function renderQcCard(view) {
       return;
     }
 
-    // V0.7：校准状态摘要（会话按校准版测量时才有内容；失败静默——不阻塞 QC 卡）
+    // V0.7/V0.8：校准状态摘要（会话按校准版测量时才有内容；失败静默——不阻塞 QC 卡）
     let calHtml = "";
     try {
       const cal = await apiGet(`/api/qc/calibration?session_id=${encodeURIComponent(sid)}`);
@@ -660,10 +660,22 @@ async function renderQcCard(view) {
           needed: `<span class="badge badge-red">需校准</span>`,
           "n/a": `<span class="badge" style="background:var(--fill); color:var(--label-2)">无校准数据</span>`,
         }[cal.overall] || "";
+        let roundHtml = "";
+        try {
+          const hist = await apiGet(`/api/qc/calibration/history?process_id=${encodeURIComponent(cal.process.id)}`);
+          if (hist.round_no > 0) {
+            const conv = hist.convergence || {};
+            const convCls = { converged: "badge-green", improving: "badge-blue", worsening: "badge-red", flat: "badge-orange" }[conv.status];
+            roundHtml = `<span class="chip chip-mono">第 ${hist.round_no} 轮</span>` +
+              (convCls ? `<span class="badge ${convCls}">${esc(conv.status_label)}</span>` : "") +
+              (cal.prev_round_compare ? `<span class="swatch-meta">较上轮 ${esc(cal.prev_round_compare.verdict_label)}</span>` : "");
+          }
+        } catch (_) { /* 历史不可用不影响状态行 */ }
         calHtml = `
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px">
             <span class="card-title" style="font-size:14px; margin:0">${icon("printer")}校准状态</span>
             ${badge}
+            ${roundHtml}
             <span class="swatch-meta">ΔE(ICC) max ${cal.summary.max_de_expected ?? "-"} · avg ${cal.summary.avg_de_expected ?? "-"} ·
               命中 ${cal.matched}/${cal.patch_count_total}</span>
             <a href="#/processes/${esc(cal.process.id)}" class="swatch-meta" style="color:var(--accent)">打印校准 →</a>

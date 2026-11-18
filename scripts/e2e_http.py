@@ -1,6 +1,7 @@
 """HTTP 端到端验证：走通 工艺创建→配方预测→实测验证→预检→转换→清理。"""
 
 import base64
+import hashlib
 import io
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ ok = True
 # 0. 静态页与 API 健康
 r = client.get("/api/health")
 ok &= check("健康检查", r.status_code == 200 and r.json()["status"] == "ok", r.text[:80])
-ok &= check("版本号 v0.7.0", r.json().get("version") == "0.7.0")
+ok &= check("版本号 v0.9.0", r.json().get("version") == "0.9.0")
 r = client.get("/", follow_redirects=False)
 ok &= check("根路径重定向", r.status_code == 307 and r.headers["location"] == "/static/index.html")
 r = client.get("/static/index.html")
@@ -178,6 +179,116 @@ ok &= check(
     and prep["pdf"]["has_output_intent"] is False and (prep["thumbnail_b64"] or "").startswith("data:image/png"),
     f"status={prep['status']}",
 )
+
+# 6.9.1 V0.9 P0-2：PDF/X-4 结构封装（Pillow PDF 为 RGB，宽松模式应生成并告警）
+r = client.post(
+    "/api/files/pdfx",
+    params={"process_id": pid, "filename": "e2e.pdf", "strict": "0"},
+    content=pbuf.getvalue(),
+    headers={"Content-Type": "application/pdf"},
+)
+px = r.json()
+ok &= check(
+    "PDF/X-4 封装（宽松模式）",
+    r.status_code == 200 and px["mode"] == "PDF/X-4"
+    and px["output_intent"]["channels"] == 4 and px["status"] in ("pass", "warn"),
+    f"status={px.get('status')} checks={len(px.get('checks', []))}",
+)
+from pypdf import PdfReader  # noqa: E402
+
+_root = PdfReader(io.BytesIO(base64.b64decode(px["file_b64"].split(",", 1)[1]))).trailer["/Root"]
+_oi = _root["/OutputIntents"][0].get_object()
+_xmp = _root["/Metadata"].get_object().get_data().decode("utf-8", "replace")
+ok &= check(
+    "PDF/X-4 OutputIntent + XMP",
+    str(_oi["/S"]) == "/GTS_PDFX"
+    and int(_oi["/DestOutputProfile"].get_object()["/N"]) == 4
+    and "PDF/X-4" in _xmp,
+)
+r = client.post(
+    "/api/files/pdfx",
+    params={"process_id": pid, "strict": "1"},
+    content=pbuf.getvalue(),
+    headers={"Content-Type": "application/pdf"},
+)
+ok &= check("PDF/X-4 严格模式拒绝 RGB 图像", r.status_code == 422, r.text[:80])
+
+# 6.9.2 V0.9 P0-4：显示器档案 + 软打样门禁
+from datetime import date as _date  # noqa: E402
+
+_today = _date.today().isoformat()
+r = client.post("/api/displays", json={
+    "name": "E2E 显示器", "is_active": True,
+    "targets": {"white_point": "D50", "luminance_cd_m2": 120, "contrast_ratio": 1000},
+    "calibration": {
+        "calibrated_at": _today, "valid_months": 6,
+        "calibrator": "i1Display Pro", "profile_name": "e2e-display.icc",
+    },
+})
+disp = r.json()
+ok &= check(
+    "显示器档案创建（校准有效）",
+    r.status_code == 200 and disp["status"]["status"] == "ok" and disp["is_active"],
+    f"status={disp.get('status', {}).get('status')}",
+)
+r = client.get("/api/displays/active-status")
+ok &= check("软打样门禁 active-status 可信", r.status_code == 200 and r.json()["calibrated"] is True)
+r = client.post("/api/files/convert", json={
+    "image_b64": b64, "process_id": pid, "display_id": disp["id"],
+})
+ok &= check(
+    "转换响应带软打样门禁",
+    r.status_code == 200 and r.json()["softproof"]["status"] == "ok",
+    f"softproof={r.json().get('softproof', {}).get('status') if r.status_code == 200 else r.text[:60]}",
+)
+E2E_DISPLAY_CGATS = b"""CGATS.17
+NUMBER_OF_FIELDS 4
+NUMBER_OF_SETS 2
+BEGIN_DATA_FORMAT
+SAMPLE_NAME XYZ_X XYZ_Y XYZ_Z
+END_DATA_FORMAT
+BEGIN_DATA
+White 95.05 100.0 108.90
+Black 0.0100 0.0100 0.0100
+END_DATA
+"""
+r = client.post(
+    f"/api/displays/{disp['id']}/measurements",
+    params={"filename": "e2e-screen.cgats", "white_luminance_cd_m2": 120},
+    content=E2E_DISPLAY_CGATS,
+    headers={"Content-Type": "text/plain"},
+)
+ok &= check(
+    "屏幕测量导入（CGATS XYZ → 白点/对比度）",
+    r.status_code == 200
+    and r.json()["measurement"]["xyz_patches"] == 2
+    and abs(r.json()["measurement"]["white_xy"][0] - 0.3127) < 0.001
+    and r.json()["calibration"]["contrast_ratio"] == 10000.0,
+    r.text[:80] if r.status_code != 200 else "",
+)
+r = client.get(f"/api/displays/{disp['id']}/measurements/latest")
+ok &= check(
+    "屏幕测量原样导出（sha256 一致）",
+    r.status_code == 200 and r.content == E2E_DISPLAY_CGATS
+    and r.headers.get("x-content-sha256") == hashlib.sha256(E2E_DISPLAY_CGATS).hexdigest()[:16],
+)
+r = client.post("/api/displays", json={
+    "name": "E2E 过期显示器", "is_active": False,
+    "calibration": {"calibrated_at": "2020-01-01", "valid_months": 6},
+})
+expired = r.json()
+ok &= check(
+    "过期校准 → 不可信",
+    r.status_code == 200 and expired["status"]["status"] == "expired"
+    and expired["status"]["calibrated"] is False,
+)
+client.post(f"/api/displays/{expired['id']}/activate")
+r = client.get("/api/displays/active-status")
+ok &= check("过期显示器 active-status 拦截", r.json()["status"] == "expired")
+r = client.get(f"/api/displays/{disp['id']}/report")
+ok &= check("显示器校准报告导出", r.status_code == 200 and r.json()["status"]["status"] == "ok")
+for did in (disp["id"], expired["id"]):
+    client.delete(f"/api/displays/{did}")
 
 # 6.10 V0.4：补偿模型重置
 r = client.delete(f"/api/processes/{pid}/compensation")
@@ -532,10 +643,53 @@ ok &= check("V0.7 非 CMYK 工艺校准版 → 422", r.status_code == 422, r.tex
 r = client.delete(f"/api/processes/{gray_pid}")
 ok &= check("V0.7 灰度守卫工艺清理", r.status_code == 200)
 
-# V0.7 清理
-for sid in (v7_sid, nobind_sid):
+# 7.7 V0.8：校准轮次落库 → 历史收敛 → 新会话对比上一轮
+r = client.get("/api/qc/calibration/history", params={"process_id": pid})
+h8 = r.json()
+ok &= check("V0.8 V0.7 轮次已落库（apply 即存档）",
+            r.status_code == 200 and h8["round_no"] == 1
+            and h8["rounds"][0]["session_id"] == v7_sid
+            and h8["convergence"]["status"] == "n/a", r.text[:100])
+
+# 改善会话：抖动减半 → 报告自带 prev_round_compare → apply verdict=improved
+_j2 = {k: [v[0] + 0.1, v[1] - 0.05, v[2] + 0.05] for k, v in exp7.items()}
+_tsv8 = ("Color Name\tCIE Lab\t\t\tStatus T C\tM\tY\tK\r\n"
+         + "".join(f"{lb}\t{lab[0]:.2f}\t{lab[1]:.2f}\t{lab[2]:.2f}\t\t\t\t\r\n"
+                   for lb, lab in _j2.items())).encode("utf-8")
+r = client.post("/api/qc/measurements/import",
+                params={"filename": "e2e_v8.txt", "instrument": "E2E-色差仪", "condition": "M1",
+                        "calibrated_at": "2026-01-01T10:00:00", "repeat_mode": "single",
+                        "process_id": pid}, content=_tsv8,
+                headers={"Content-Type": "application/octet-stream"})
+v8_sid = r.json()["session"]["id"]
+client.post("/api/qc/measurements/import",
+            params={"filename": "e2e_v8.r2", "session_id": v8_sid, "repeat_mode": "repeat"},
+            content=_tsv8, headers={"Content-Type": "application/octet-stream"})
+rep8 = client.get("/api/qc/calibration", params={"session_id": v8_sid}).json()
+cmp8 = rep8.get("prev_round_compare") or {}
+ok &= check("V0.8 新会话报告自带较上轮判定",
+            cmp8.get("verdict") == "improved"
+            and cmp8.get("prev_max_de_expected") is not None
+            and cmp8["prev_max_de_expected"] > rep8["summary"]["max_de_expected"],
+            f"verdict={cmp8.get('verdict')} prev={cmp8.get('prev_max_de_expected')} cur={rep8['summary']['max_de_expected']}")
+ok &= check("V0.8 轮次对比含逐通道 Δ",
+            any(x.get("d") is not None for x in cmp8.get("per_channel", [])))
+r = client.post("/api/qc/calibration/apply", params={"session_id": v8_sid})
+a8 = r.json()
+ok &= check("V0.8 第二轮 apply（round_no=2，verdict=improved）",
+            r.status_code == 200 and a8["round_no"] == 2
+            and a8["verdict"]["verdict"] == "improved", r.text[:100])
+r = client.get("/api/qc/calibration/history", params={"process_id": pid})
+h8 = r.json()
+ok &= check("V0.8 两轮历史 + 收敛判定（趋势/收敛）",
+            h8["round_no"] == 2 and len(h8["trend"]) == 2
+            and h8["convergence"]["status"] in ("converged", "improving")
+            and h8["convergence"]["rounds"] == 2, r.text[:120])
+
+# V0.8 清理（轮次随工艺删除级联，见第 8 节）
+for sid in (v8_sid,):
     r = client.delete("/api/qc/measurements", params={"session_id": sid})
-    ok &= check("V0.7 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
+    ok &= check("V0.8 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
 
 # 8. 清理
 for p in (pid, pid_b):

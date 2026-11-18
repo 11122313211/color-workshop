@@ -319,17 +319,23 @@ def calibration_report_ep(
 ):
     """双基准校准报告：逐 patch 实测 vs ICC 预期 vs ISO 12647-2 参考（V0.7 第 2 步）。
 
-    含逐通道墨量建议、校正曲线与三个导出文本（曲线 CSV / 实测特性数据 / 校正后特性数据）。
+    含逐通道墨量建议、校正曲线与三个导出文本（曲线 CSV / 实测特性数据 / 校正后特性数据）；
+    V0.8：该工艺存在已落库轮次时，附 prev_round_compare（较上轮 改善/持平/恶化）。
     """
     session = measurements.get_session(session_id)
     if session is None:
         raise HTTPException(404, "测量会话不存在")
     proc = _bound_cmyk_process(session)
     from ..services.calibration import calibration_report
+    from ..services.calibration_history import CalibrationStore, compare_rounds
 
     report = calibration_report(proc, session)
     report["session_id"] = session_id
     report["process"] = {"id": proc["id"], "name": proc.get("name", "")}
+    prev = CalibrationStore().latest_for_process(proc["id"], proc.get("icc_sha256"),
+                                                 exclude_session=session_id)
+    if prev is not None:
+        report["prev_round_compare"] = compare_rounds(report, prev)
     return report
 
 
@@ -337,17 +343,33 @@ def calibration_report_ep(
 def calibration_apply(
     session_id: str = Query(..., description="测量会话 id（校准报告已生成）"),
 ):
-    """把校准报告的逐通道墨量建议写入补偿模型（V0.7 第 3 步，预测立即联动）。"""
+    """把校准报告的逐通道墨量建议写入补偿模型（V0.7 第 3 步，预测立即联动）。
+
+    V0.8：同时落库为校准轮次（同会话幂等更新），响应含轮次号与「较上轮」判定。
+    """
     session = measurements.get_session(session_id)
     if session is None:
         raise HTTPException(404, "测量会话不存在")
     proc = _bound_cmyk_process(session)
     from ..services.calibration import apply_suggestions, calibration_report
+    from ..services.calibration_history import (
+        CalibrationStore,
+        compare_rounds,
+        round_no_for,
+    )
+    from ..services.compensation import CompensationStore
 
     report = calibration_report(proc, session)
     if report["overall"] == "n/a":
         raise HTTPException(422, "会话未按校准版测量（色块命中不足），无法应用建议")
+    store = CalibrationStore()
+    prev = store.latest_for_process(proc["id"], proc.get("icc_sha256"),
+                                    exclude_session=session_id)
+    verdict = compare_rounds(report, prev) if prev else None
+    bias_before = (CompensationStore().get(proc["id"]) or {}).get("bias_device")
     doc = apply_suggestions(proc, report)
+    round_doc = store.save_round(proc["id"], proc.get("icc_sha256"), session_id, report,
+                                 bias_before or [], doc["bias_device"])
     return {
         "applied": True,
         "session_id": session_id,
@@ -357,6 +379,33 @@ def calibration_apply(
         "updated_at": doc["updated_at"],
         "suggestions": report["ink_suggestions"],
         "summary": report["summary"],
+        "round_id": round_doc["id"],
+        "round_no": round_no_for(store, proc["id"], session_id, proc.get("icc_sha256")),
+        "verdict": verdict,
+    }
+
+
+@router.get("/calibration/history")
+def calibration_history(
+    process_id: str = Query(..., description="工艺 id"),
+):
+    """工艺的校准轮次历史与收敛判定（V0.8；仅计入与当前 ICC sha 一致的轮次）。"""
+    proc = _processes.get(process_id)
+    if proc is None:
+        raise HTTPException(404, "工艺不存在")
+    from ..services.calibration_history import (
+        CalibrationStore,
+        convergence_for_process,
+        trend_series,
+    )
+
+    rounds = CalibrationStore().list_for_process(process_id, proc.get("icc_sha256"))
+    return {
+        "process": {"id": proc["id"], "name": proc.get("name", "")},
+        "rounds": rounds,
+        "round_no": len(rounds),
+        "convergence": convergence_for_process(rounds),
+        "trend": trend_series(rounds),
     }
 
 

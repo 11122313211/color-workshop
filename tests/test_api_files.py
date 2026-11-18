@@ -159,3 +159,160 @@ def test_convert_rejects_pdf(api_client, cmyk_icc):
     assert r.status_code == 400
     assert "PDF" in r.json()["detail"]
     print("[PASS] PDF 转换明确拒绝（400）")
+
+
+# ---------- V0.9 PDF 预检深水区：字体 / 出血 / 有效 DPI / 开本 ----------
+
+def _synthetic_pdf(*, trim: bool = True, bleed_mm: float = 3.0,
+                   embedded_font: bool = False, image_px=None,
+                   draw_pt: float = 100.0,
+                   image_colorspace: str = "/DeviceCMYK") -> bytes:
+    """构造可控 PDF：A4 成品 + 指定出血、字体嵌入状态、图像绘制尺寸。"""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject,
+        NameObject, NumberObject,
+    )
+
+    mm = 72.0 / 25.4
+    a4_w, a4_h = 210.0 * mm, 297.0 * mm
+    pad = bleed_mm * mm
+    media = [-pad, -pad, a4_w + pad, a4_h + pad]
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=media[2] - media[0], height=media[3] - media[1])
+    page[NameObject("/MediaBox")] = ArrayObject([FloatObject(v) for v in media])
+    page[NameObject("/BleedBox")] = ArrayObject([FloatObject(v) for v in media])
+    if trim:
+        page[NameObject("/TrimBox")] = ArrayObject([
+            FloatObject(0), FloatObject(0), FloatObject(a4_w), FloatObject(a4_h),
+        ])
+
+    if embedded_font:
+        font_file = DecodedStreamObject()
+        font_file.set_data(b"\x00" * 32)
+        desc = DictionaryObject({
+            NameObject("/Type"): NameObject("/FontDescriptor"),
+            NameObject("/FontName"): NameObject("/TestEmbedded"),
+            NameObject("/Flags"): NumberObject(4),
+            NameObject("/FontBBox"): ArrayObject([NumberObject(0)] * 4),
+            NameObject("/ItalicAngle"): NumberObject(0),
+            NameObject("/Ascent"): NumberObject(800),
+            NameObject("/Descent"): NumberObject(-200),
+            NameObject("/CapHeight"): NumberObject(700),
+            NameObject("/StemV"): NumberObject(80),
+            NameObject("/FontFile2"): writer._add_object(font_file),
+        })
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/TrueType"),
+            NameObject("/BaseFont"): NameObject("/TestEmbedded"),
+            NameObject("/FontDescriptor"): writer._add_object(desc),
+        })
+    else:
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })
+
+    resources = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({
+            NameObject("/F1"): writer._add_object(font),
+        }),
+    })
+    ops = b"BT /F1 12 Tf 20 20 Td (Test) Tj ET"
+
+    if image_px:
+        iw, ih = image_px
+        img = DecodedStreamObject()
+        img[NameObject("/Type")] = NameObject("/XObject")
+        img[NameObject("/Subtype")] = NameObject("/Image")
+        img[NameObject("/Width")] = NumberObject(iw)
+        img[NameObject("/Height")] = NumberObject(ih)
+        img[NameObject("/ColorSpace")] = NameObject(image_colorspace)
+        img[NameObject("/BitsPerComponent")] = NumberObject(8)
+        channels = 3 if image_colorspace == "/DeviceRGB" else 4
+        img.set_data(bytes(iw * ih * channels))
+        resources[NameObject("/XObject")] = DictionaryObject({
+            NameObject("/Im0"): writer._add_object(img),
+        })
+        ops += f" q {draw_pt} 0 0 {draw_pt} 0 0 cm /Im0 Do Q".encode()
+
+    page[NameObject("/Resources")] = resources
+    content = DecodedStreamObject()
+    content.set_data(ops)
+    page[NameObject("/Contents")] = writer._add_object(content)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def _post_pdf(api_client, data: bytes):
+    return api_client.post(
+        "/api/files/preflight",
+        json={"image_b64": base64.b64encode(data).decode(), "filename": "synthetic.pdf"},
+    )
+
+
+def test_pdf_preflight_font_not_embedded_warns(api_client):
+    """未嵌入的 Type1 字体 → 明确列出字体名并告警。"""
+    data = _post_pdf(api_client, _synthetic_pdf(embedded_font=False)).json()
+    fe = data["pdf"]["font_embedding"]
+    assert fe["total"] == 1 and fe["embedded"] == 0
+    assert fe["not_embedded"][0]["name"] == "Helvetica"
+    assert fe["not_embedded"][0]["subtype"] == "Type1"
+    assert any("字体未嵌入" in i["message"] for i in data["issues"])
+
+
+def test_pdf_preflight_font_embedded_passes(api_client):
+    """FontDescriptor + FontFile2 → 判定嵌入，不再告警。"""
+    data = _post_pdf(api_client, _synthetic_pdf(embedded_font=True)).json()
+    fe = data["pdf"]["font_embedding"]
+    assert fe["total"] == 1 and fe["embedded"] == 1
+    assert fe["not_embedded"] == []
+    assert not any("字体未嵌入" in i["message"] for i in data["issues"])
+
+
+def test_pdf_preflight_bleed_and_format_ok(api_client):
+    """A4 成品 + 3mm 出血 → 出血达标、开本匹配。"""
+    data = _post_pdf(api_client, _synthetic_pdf(bleed_mm=3.0)).json()
+    pdf = data["pdf"]
+    assert pdf["bleed"]["ok"] is True
+    assert pdf["bleed"]["min_mm"] == 3.0
+    assert pdf["page_format"]["name"] == "A4"
+    assert pdf["page_boxes"][0]["bleed_sides_mm"] == [3.0, 3.0, 3.0, 3.0]
+    assert not any("出血不足" in i["message"] for i in data["issues"])
+
+
+def test_pdf_preflight_bleed_insufficient_warns(api_client):
+    """TrimBox 与 MediaBox 重合（0 出血）→ 告警。"""
+    data = _post_pdf(api_client, _synthetic_pdf(bleed_mm=0.0)).json()
+    assert data["pdf"]["bleed"]["ok"] is False
+    assert data["pdf"]["bleed"]["min_mm"] == 0.0
+    assert any("出血不足" in i["message"] for i in data["issues"])
+
+
+def test_pdf_preflight_trim_missing_warns(api_client):
+    """未设 TrimBox → 无法判定成品尺寸，给出设定指引。"""
+    data = _post_pdf(api_client, _synthetic_pdf(trim=False)).json()
+    assert any("未设置 TrimBox" in i["message"] for i in data["issues"])
+    assert data["pdf"]["bleed"]["checked"] is True  # 有 MediaBox，仍可计算
+
+
+def test_pdf_preflight_effective_dpi_low(api_client):
+    """50px 图像绘制到 100pt → 36 DPI，按最差绘制尺寸告警。"""
+    data = _post_pdf(api_client, _synthetic_pdf(image_px=(50, 50), draw_pt=100.0)).json()
+    assert data["pdf"]["effective_dpi"]["min"] == 36.0
+    assert data["pdf"]["effective_dpi"]["low_count"] == 1
+    assert data["pdf"]["images"][0]["effective_dpi"] == 36.0
+    assert any("低于 300 DPI" in i["message"] for i in data["issues"])
+
+
+def test_pdf_preflight_effective_dpi_ok(api_client):
+    """500px 图像绘制到 100pt → 360 DPI，不告警。"""
+    data = _post_pdf(api_client, _synthetic_pdf(image_px=(500, 500), draw_pt=100.0)).json()
+    assert data["pdf"]["effective_dpi"]["min"] == 360.0
+    assert data["pdf"]["effective_dpi"]["low_count"] == 0
+    assert not any("低于 300 DPI" in i["message"] for i in data["issues"])

@@ -358,6 +358,7 @@ class FileConvertRequest(BaseModel):
     image_b64: str
     process_id: str
     intent: str = "relative_colorimetric"
+    display_id: str = ""
 
 
 class FileConvertResponse(BaseModel):
@@ -366,3 +367,73 @@ class FileConvertResponse(BaseModel):
     file_format: str
     output_mode: str
     source_profile: str = ""
+    softproof: dict = {}
+
+
+# V0.9 P0-2 · PDF/X-4 结构封装
+class FilePdfxResponse(BaseModel):
+    file_b64: str
+    filename: str
+    mode: str
+    status: str = "pass"
+    compliant: bool = True
+    checks: list[PreflightIssue] = []
+    output_intent: dict = {}
+    pages: int = 0
+    notes: list[str] = []
+
+
+# V0.9 P0-4 · 显示器档案与软打样门禁
+class DisplayTargets(BaseModel):
+    white_point: str = "D50"
+    luminance_cd_m2: float = 120.0
+    contrast_ratio: float = 1000.0
+    gamut_coverage: dict = {}
+
+
+class DisplayCalibrationRequest(BaseModel):
+    calibrated_at: str = ""
+    valid_months: int = 6
+    calibrator: str = ""
+    software: str = ""
+    luminance_cd_m2: Optional[float] = None
+    black_luminance_cd_m2: Optional[float] = None
+    contrast_ratio: Optional[float] = None
+    white_point: str = "D50"
+    gamut_coverage: dict = {}
+    profile_name: str = ""
+    profile_sha256: str = ""
+    notes: str = ""
+
+
+class DisplayCreateRequest(BaseModel):
+    name: str
+    model: str = ""
+    serial: str = ""
+    notes: str = ""
+    is_active: bool = True
+    targets: DisplayTargets = Field(default_factory=DisplayTargets)
+    calibration: Optional[DisplayCalibrationRequest] = None
+
+
+class DisplayUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    model: Optional[str] = None
+    serial: Optional[str] = None
+    notes: Optional[str] = None
+    is_active: Optional[bool] = None
+    targets: Optional[dict] = None
+
+
+# V0.9 签样工作流（P0-3）
+class SignoffCreateRequest(BaseModel):
+    process_id: str
+    title: str = ""
+    job_no: str = ""
+    created_by: str = ""
+    evidence: dict = {}
+
+
+class SignoffActionRequest(BaseModel):
+    actor: str = ""
+    note: str = ""

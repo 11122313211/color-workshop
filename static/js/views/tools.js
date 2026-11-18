@@ -1,24 +1,35 @@
-/* 工具箱视图：CMYK→LAB 正查 · ΔE 对比 · 色域对比 · 色彩转换器 */
+/* 工具箱视图：CMYK→LAB 正查 · ΔE 对比 · 色域对比 · 色彩转换器 · 显示器档案 */
 
-import { apiGet, apiPost } from "../api.js";
+import { apiGet, apiPost, apiDelete, apiPostRaw, downloadDataUri } from "../api.js";
 import { icon } from "../icons.js";
-import { toast, swatch, drawCie, labToHex, fetchSpectrum, emptyState, observeRedraw } from "../components.js";
+import {
+  toast, swatch, drawCie, labToHex, fetchSpectrum, emptyState, observeRedraw,
+  openModal, confirmDanger,
+} from "../components.js";
 import { SRGB_XY } from "../gamut-view.js";
 
 let processes = [];
+let displays = [];
 
 const TOOLS = [
   ["forward", "CMYK→LAB 正查", "给定墨量配方预测颜色"],
   ["deltae", "ΔE 对比", "两组 Lab 颜色色差检测"],
   ["gamut", "色域对比", "CIE 1931 色度图"],
   ["convert", "色彩转换器", "常见色彩空间互转"],
+  ["display", "显示器", "校准档案与软打样门禁"],
 ];
 
 export async function renderToolsView(view) {
   try {
-    processes = await apiGet("/api/processes");
+    const [procs, disps] = await Promise.all([
+      apiGet("/api/processes"),
+      apiGet("/api/displays").catch(() => []),
+    ]);
+    processes = procs;
+    displays = disps;
   } catch (_) {
     processes = [];
+    displays = [];
   }
 
   view.innerHTML = `
@@ -53,6 +64,7 @@ export async function renderToolsView(view) {
   buildDeltaE(view.querySelector("#tool-deltae"));
   buildGamut(view.querySelector("#tool-gamut"));
   buildConvert(view.querySelector("#tool-convert"));
+  buildDisplay(view.querySelector("#tool-display"));
 }
 
 /* ---------- CMYK→LAB 正查 ---------- */
@@ -251,6 +263,256 @@ function buildConvert(box) {
     } catch (e) {
       toast(e.message, "err");
     }
+  });
+}
+
+/* ---------- 显示器档案与软打样门禁（V0.9 P0-4） ---------- */
+const DISP_STATUS_BADGE = {
+  ok: "badge badge-green",
+  expiring: "badge badge-orange",
+  expired: "badge badge-red",
+  uncalibrated: "badge badge-gray",
+  none: "badge badge-gray",
+};
+
+function todayLocal() {
+  const d = new Date();
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+}
+
+function dispStatusBadge(st) {
+  return `<span class="${DISP_STATUS_BADGE[st?.status] || "badge badge-gray"}">${esc(st?.status_label || "未校准")}</span>`;
+}
+
+function buildDisplay(box) {
+  if (!box) return;
+  const rows = displays.map((d) => {
+    const st = d.status || {};
+    const meas = d.measurement;
+    const measLine = meas
+      ? `<div class="row-sub">测量：${meas.patches} 块 · 白点 (${(meas.white_xy || []).map((v) => Number(v).toFixed(4)).join(", ") || "—"}) · 对比度 ${meas.contrast_ratio ?? "—"}:1${meas.luminance_cd_m2 != null ? ` · ${meas.luminance_cd_m2} cd/m²` : ""} · ${esc(meas.filename)}</div>`
+      : "";
+    return `<div class="group-row" data-disp-id="${d.id}">
+      <div class="grow">
+        <div class="row-title">${esc(d.name)}${d.is_active ? '<span class="badge badge-blue" style="margin-left:6px">当前</span>' : ""} ${dispStatusBadge(st)}</div>
+        <div class="row-sub">${esc(d.model || "型号未填")} · 目标 ${esc(d.targets.white_point)} / ${d.targets.luminance_cd_m2} cd/m² / ${d.targets.contrast_ratio}:1${st.expires_at ? ` · 到期 ${esc(st.expires_at)}` : ""}</div>
+        <div class="row-sub">${esc(st.message || "")}</div>
+        ${measLine}
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${d.is_active ? "" : `<button class="btn btn-secondary btn-sm" data-disp-act="activate">设为当前</button>`}
+        <button class="btn btn-secondary btn-sm" data-disp-act="calibrate">校准确认</button>
+        <button class="btn btn-secondary btn-sm" data-disp-act="measure">导入测量</button>
+        ${meas ? `<button class="btn btn-ghost btn-sm" data-disp-act="export-measure">导出测量</button>` : ""}
+        <button class="btn btn-ghost btn-sm" data-disp-act="report">报告</button>
+        <button class="btn btn-ghost btn-sm" data-disp-act="delete" style="color:var(--red)">删除</button>
+      </div>
+    </div>`;
+  }).join("");
+  box.innerHTML = `
+    <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <div class="card-desc" style="margin:0">软打样门禁：校准有效（到期前 30 天提醒）才标记为可信预览；系统不生成显示器 ICC。</div>
+      <button class="btn btn-sm" id="disp-add">${icon("plus")}新增显示器</button>
+    </div>
+    ${rows || emptyState({
+      iconName: "eye", title: "尚未登记显示器",
+      desc: "登记显示器与校准确认后，软打样预览才会标记为可信；未登记时预览仅参考。",
+    })}`;
+  box.querySelector("#disp-add")?.addEventListener("click", () => openDisplayCreate(box));
+  box.querySelectorAll("[data-disp-act]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const row = btn.closest("[data-disp-id]");
+      const id = row?.dataset.dispId;
+      const act = btn.dataset.dispAct;
+      const disp = displays.find((d) => d.id === id);
+      if (act === "activate") {
+        try {
+          await apiPost(`/api/displays/${id}/activate`, {});
+          toast("已切换当前显示器", "ok");
+          refreshDisplayPane(box);
+        } catch (e) { toast(e.message, "err"); }
+      } else if (act === "calibrate") {
+        openDisplayCalibration(disp, box);
+      } else if (act === "measure") {
+        openDisplayMeasurement(disp, box);
+      } else if (act === "export-measure") {
+        try {
+          const resp = await fetch(`/api/displays/${id}/measurements/latest`);
+          if (!resp.ok) {
+            let detail = "下载失败";
+            try { detail = (await resp.json()).detail || detail; } catch (_) { /* 保留默认 */ }
+            throw new Error(detail);
+          }
+          const text = await resp.text();
+          downloadDataUri(
+            "data:text/plain;charset=utf-8," + encodeURIComponent(text),
+            disp.measurement?.filename || "display-measurement.txt",
+          );
+        } catch (e) { toast(e.message, "err"); }
+      } else if (act === "report") {
+        try {
+          const report = await apiGet(`/api/displays/${id}/report`);
+          downloadDataUri(
+            "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(report, null, 2)),
+            `显示器校准-${report.display.name}.json`,
+          );
+        } catch (e) { toast(e.message, "err"); }
+      } else if (act === "delete") {
+        const ok = await confirmDanger({
+          title: `删除显示器「${disp?.name || ""}」？`,
+          message: "档案与校准历史将被移除，软打样门禁退回「未登记」。",
+          confirmText: "删除",
+        });
+        if (!ok) return;
+        try {
+          await apiDelete(`/api/displays/${id}`);
+          toast("显示器档案已删除", "ok");
+          refreshDisplayPane(box);
+        } catch (e) { toast(e.message, "err"); }
+      }
+    });
+  });
+}
+
+async function refreshDisplayPane(box) {
+  displays = await apiGet("/api/displays").catch(() => []);
+  buildDisplay(box);
+}
+
+function openDisplayCreate(box) {
+  const m = openModal(`
+    <h3 class="card-title">${icon("eye")}新增显示器</h3>
+    <div class="field-row">
+      <div class="field"><label>名称 *</label><input class="input" id="dp-name" maxlength="80" placeholder="如 Eizo CG2700X（主）"></div>
+      <div class="field"><label>型号</label><input class="input" id="dp-model" maxlength="80"></div>
+    </div>
+    <div class="field-row" style="margin-top:10px">
+      <div class="field"><label>目标白点</label><select class="input" id="dp-wp"><option>D50</option><option>D55</option><option>D65</option></select></div>
+      <div class="field"><label>目标亮度 cd/m²</label><input class="input" id="dp-lum" type="number" value="120" min="40" max="400"></div>
+      <div class="field"><label>目标对比度</label><input class="input" id="dp-contrast" type="number" value="1000" min="100"></div>
+    </div>
+    <div class="field-row" style="margin-top:10px">
+      <div class="field"><label>校准日期</label><input class="input" id="dp-cal" type="date" value="${todayLocal()}"></div>
+      <div class="field"><label>有效期（月）</label><input class="input" id="dp-months" type="number" value="6" min="1" max="60"></div>
+    </div>
+    <div class="field-row" style="margin-top:10px">
+      <div class="field"><label>校准器</label><input class="input" id="dp-calibrator" maxlength="80" placeholder="i1Display Pro"></div>
+      <div class="field"><label>显示器 ICC 名称</label><input class="input" id="dp-profile" maxlength="120" placeholder="Eizo_D50.icc"></div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button class="btn btn-ghost" data-cancel>取消</button>
+      <button class="btn" id="dp-save">${icon("plus")}创建</button>
+    </div>
+  `);
+  m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
+  m.modal.querySelector("#dp-save").addEventListener("click", async () => {
+    const name = m.modal.querySelector("#dp-name").value.trim();
+    if (!name) return toast("请填写显示器名称", "warn");
+    const whitePoint = m.modal.querySelector("#dp-wp").value;
+    const calDate = m.modal.querySelector("#dp-cal").value;
+    const calibration = calDate ? {
+      calibrated_at: calDate,
+      valid_months: Number(m.modal.querySelector("#dp-months").value) || 6,
+      calibrator: m.modal.querySelector("#dp-calibrator").value.trim(),
+      white_point: whitePoint,
+      profile_name: m.modal.querySelector("#dp-profile").value.trim(),
+    } : null;
+    try {
+      await apiPost("/api/displays", {
+        name,
+        model: m.modal.querySelector("#dp-model").value.trim(),
+        is_active: true,
+        targets: {
+          white_point: whitePoint,
+          luminance_cd_m2: Number(m.modal.querySelector("#dp-lum").value) || 120,
+          contrast_ratio: Number(m.modal.querySelector("#dp-contrast").value) || 1000,
+        },
+        calibration,
+      });
+      toast("显示器档案已创建", "ok");
+      m.close();
+      refreshDisplayPane(box);
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+function openDisplayCalibration(disp, box) {
+  if (!disp) return;
+  const whitePoint = disp.targets?.white_point || "D50";
+  const m = openModal(`
+    <h3 class="card-title">${icon("check")}校准确认 · <span style="color:var(--label-2)">${esc(disp.name)}</span></h3>
+    <div class="field-row">
+      <div class="field"><label>校准日期 *</label><input class="input" id="dc-cal" type="date" value="${todayLocal()}"></div>
+      <div class="field"><label>有效期（月）</label><input class="input" id="dc-months" type="number" value="6" min="1" max="60"></div>
+    </div>
+    <div class="field-row" style="margin-top:10px">
+      <div class="field"><label>校准器</label><input class="input" id="dc-calibrator" maxlength="80" value="${esc(disp.calibration?.calibrator || "")}"></div>
+      <div class="field"><label>软件</label><input class="input" id="dc-software" maxlength="80" value="${esc(disp.calibration?.software || "")}" placeholder="DisplayCAL"></div>
+    </div>
+    <div class="field-row" style="margin-top:10px">
+      <div class="field"><label>实测亮度 cd/m²</label><input class="input" id="dc-lum" type="number" step="0.1" min="0"></div>
+      <div class="field"><label>实测对比度</label><input class="input" id="dc-contrast" type="number" step="1" min="0"></div>
+    </div>
+    <div class="field" style="margin-top:10px"><label>显示器 ICC 名称</label><input class="input" id="dc-profile" maxlength="120" value="${esc(disp.calibration?.profile_name || "")}" placeholder="外部工具生成的显示器 profile"></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button class="btn btn-ghost" data-cancel>取消</button>
+      <button class="btn" id="dc-save">${icon("check")}保存确认</button>
+    </div>
+  `);
+  m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
+  m.modal.querySelector("#dc-save").addEventListener("click", async () => {
+    const calDate = m.modal.querySelector("#dc-cal").value;
+    if (!calDate) return toast("请填写校准日期", "warn");
+    const lum = m.modal.querySelector("#dc-lum").value;
+    const contrast = m.modal.querySelector("#dc-contrast").value;
+    try {
+      await apiPost(`/api/displays/${disp.id}/calibrations`, {
+        calibrated_at: calDate,
+        valid_months: Number(m.modal.querySelector("#dc-months").value) || 6,
+        calibrator: m.modal.querySelector("#dc-calibrator").value.trim(),
+        software: m.modal.querySelector("#dc-software").value.trim(),
+        white_point: whitePoint,
+        luminance_cd_m2: lum === "" ? null : Number(lum),
+        contrast_ratio: contrast === "" ? null : Number(contrast),
+        profile_name: m.modal.querySelector("#dc-profile").value.trim(),
+      });
+      toast("校准确认已保存", "ok");
+      m.close();
+      refreshDisplayPane(box);
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+function openDisplayMeasurement(disp, box) {
+  if (!disp) return;
+  const m = openModal(`
+    <h3 class="card-title">${icon("upload")}导入屏幕测量 · <span style="color:var(--label-2)">${esc(disp.name)}</span></h3>
+    <div class="field"><label>测量文件（CGATS.17 / TSV）*</label><input class="input" id="dm-file" type="file" accept=".txt,.cgats,.ti3,.tsv,.csv"></div>
+    <div class="field" style="margin-top:10px"><label>白场绝对亮度 cd/m²（可选）</label><input class="input" id="dm-lum" type="number" step="0.1" min="0" placeholder="如 120；文件头含 LUMINANCE_CD_M2 可留空"></div>
+    <div class="issue issue-info" style="margin-top:12px">${icon("info")}<span>需至少 2 个含 XYZ 的色块（白 / 黑）；系统据此推导白点与对比度，并原样留存文件供导出复核。</span></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button class="btn btn-ghost" data-cancel>取消</button>
+      <button class="btn" id="dm-save">${icon("upload")}导入</button>
+    </div>
+  `);
+  m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
+  m.modal.querySelector("#dm-save").addEventListener("click", async () => {
+    const input = m.modal.querySelector("#dm-file");
+    const file = input.files && input.files[0];
+    if (!file) return toast("请选择测量文件", "warn");
+    const lum = m.modal.querySelector("#dm-lum").value;
+    const query = { filename: file.name };
+    if (lum !== "") query.white_luminance_cd_m2 = lum;
+    try {
+      await apiPostRaw(
+        `/api/displays/${disp.id}/measurements`,
+        query,
+        new Uint8Array(await file.arrayBuffer()),
+      );
+      toast("屏幕测量已导入", "ok");
+      m.close();
+      refreshDisplayPane(box);
+    } catch (e) { toast(e.message, "err"); }
   });
 }
 

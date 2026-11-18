@@ -15,6 +15,8 @@ from .processes import router as router_processes
 from .recipes import router as router_recipes
 from .files import router as router_files
 from .qc import router as router_qc
+from .signoffs import router as router_signoffs
+from .displays import router as router_displays
 
 __all__ = [
     "router_devices",
@@ -31,4 +33,6 @@ __all__ = [
     "router_recipes",
     "router_files",
     "router_qc",
+    "router_signoffs",
+    "router_displays",
 ]

@@ -6,7 +6,7 @@
 
 import {
   apiGet, apiPatch, apiDelete, apiUploadICC, apiReplaceICC, fileToArrayBuffer,
-  apiPostRaw, downloadDataUri,
+  apiPostRaw, apiPost, downloadDataUri,
 } from "../api.js";
 import { icon } from "../icons.js";
 import {
@@ -560,9 +560,211 @@ async function openTestformModal(view, p) {
   modal.modal.querySelector("[data-tf-close]").addEventListener("click", () => modal.close());
 }
 
+/* 校准轮次历史卡（V0.8）：收敛判定 + max ΔE 趋势 + 最近轮次列表 */
+function calibrationHistoryCard(hist) {
+  const conv = hist.convergence || {};
+  const convCls = { converged: "badge-green", improving: "badge-blue", worsening: "badge-red", flat: "badge-orange", "n/a": "" }[conv.status] || "";
+  const convChip = conv.status && conv.status !== "n/a"
+    ? `<span class="badge ${convCls}">${esc(conv.status_label)}</span>`
+    : `<span class="chip chip-mono" style="color:var(--label-3)">${esc(conv.status_label || "轮次不足")}</span>`;
+  const rows = (hist.rounds || []).slice(0, 5).map((r, i) => `
+    <div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-top:${i ? "1px solid var(--separator)" : "none"}">
+      <span class="chip chip-mono">第 ${(hist.rounds.length - i).toLocaleString()} 轮</span>
+      ${r.overall === "ok" ? `<span class="badge badge-green">达标</span>`
+        : r.overall === "suggest" ? `<span class="badge badge-orange">建议校准</span>`
+        : `<span class="badge badge-red">需校准</span>`}
+      <span class="swatch-meta chip-mono">max ${r.summary?.max_de_expected ?? "-"} · avg ${r.summary?.avg_de_expected ?? "-"}</span>
+      <span style="flex:1"></span>
+      <span class="swatch-meta">${esc((r.created_at || "").replace("T", " "))}</span>
+    </div>`).join("");
+  return `
+    <div class="card" style="padding:12px 16px; margin-top:12px">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+        <span class="card-title" style="margin:0; display:inline-flex; align-items:center; gap:6px">
+          ${icon("printer")}校准历史 <span class="chip">${hist.round_no} 轮</span>
+        </span>
+        ${convChip}
+        <span style="flex:1"></span>
+        ${sparkline(hist.trend || [], { width: 130, height: 26, tolerance: 3.5 })}
+        <button class="btn btn-secondary btn-sm" data-cal-open type="button">${icon("printer")}打印校准</button>
+      </div>
+      <div style="margin-top:6px">${rows}</div>
+    </div>`;
+}
+
+/* ---------- 签样与放行（V0.9 · P0-3）：draft→pending→approved→locked ---------- */
+
+const SIGNOFF_STATE = {
+  draft: ["草稿", "badge badge-gray"],
+  pending: ["待确认", "badge badge-orange"],
+  approved: ["已批准", "badge badge-green"],
+  rejected: ["已驳回", "badge badge-red"],
+  locked: ["已锁定", "badge badge-blue"],
+};
+
+const SIGNOFF_ACTION = {
+  submit: { title: "提交签样", desc: "提交后等待客户/主管批准。", confirm: "提交", icon: "check" },
+  approve: { title: "批准签样", desc: "批准后该工艺可作为下游放行依据。", confirm: "批准", icon: "check" },
+  reject: { title: "驳回签样", desc: "请填写驳回理由，便于返工后重新提交。", confirm: "驳回", icon: "xmark" },
+  withdraw: { title: "撤回签样", desc: "签样回到草稿状态，可修改依据后重新提交。", confirm: "撤回", icon: "refresh" },
+  lock: { title: "锁定签样", desc: "锁定后记录不可变更，并生成放行令牌。", confirm: "锁定", icon: "check" },
+};
+
+function evidenceText(ev = {}) {
+  const bits = [];
+  if (ev.calibration_session_id) bits.push(`校准会话 ${esc(ev.calibration_session_id)}`);
+  if (ev.measurement_session_id) bits.push(`测量会话 ${esc(ev.measurement_session_id)}`);
+  if (ev.evaluation_id) bits.push(`主观评价 ${esc(ev.evaluation_id)}`);
+  if (ev.file_name) bits.push(`文件 ${esc(ev.file_name)}`);
+  if (ev.testform) bits.push("测量样张");
+  return bits.length ? bits.join(" · ") : "未关联依据";
+}
+
+function signoffActions(latest) {
+  if (!latest) return `<button class="btn btn-sm" data-sg="create">${icon("plus")}新建签样</button>`;
+  const state = latest.state;
+  if (state === "draft") {
+    return `<button class="btn btn-sm" data-sg="submit">${icon("check")}提交确认</button>
+      <button class="btn btn-secondary btn-sm" data-sg="delete">${icon("trash")}删除</button>`;
+  }
+  if (state === "pending") {
+    return `<button class="btn btn-sm" data-sg="approve">${icon("check")}批准</button>
+      <button class="btn btn-secondary btn-sm" data-sg="reject">${icon("xmark")}驳回</button>
+      <button class="btn btn-ghost btn-sm" data-sg="withdraw">撤回</button>`;
+  }
+  if (state === "approved") return `<button class="btn btn-sm" data-sg="lock">${icon("check")}锁定签样</button>`;
+  if (state === "rejected") {
+    return `<button class="btn btn-sm" data-sg="submit">${icon("refresh")}重新提交</button>`;
+  }
+  if (state === "locked") {
+    return `<button class="btn btn-secondary btn-sm" data-sg="manifest">${icon("download")}交接清单</button>`;
+  }
+  return "";
+}
+
+function signoffCard(rows, gate) {
+  const latest = rows[0];
+  const [label, cls] = latest
+    ? (SIGNOFF_STATE[latest.state] || ["未知", "badge badge-gray"])
+    : ["未签样", "badge badge-gray"];
+  const gateLine = gate.allowed
+    ? `<span style="color:var(--green);display:inline-flex;align-items:center;gap:6px">${icon("check")}${esc(gate.message)}</span>`
+    : `<span style="color:var(--orange);display:inline-flex;align-items:center;gap:6px">${icon("warn")}${esc(gate.message)}</span>`;
+  const detail = latest ? `
+    <dl class="kv" style="margin-top:10px">
+      <dt>标题 / 工单</dt><dd>${esc(latest.title)}${latest.job_no ? ` · ${esc(latest.job_no)}` : ""}</dd>
+      <dt>依据</dt><dd>${evidenceText(latest.evidence)}</dd>
+      <dt>快照 ICC</dt><dd><span class="chip chip-mono">${(latest.snapshot.icc_sha256 || "").slice(0, 8)}</span></dd>
+      ${latest.decision ? `<dt>${latest.decision.action === "approve" ? "批准" : "驳回"}</dt><dd>${esc(latest.decision.by)} · ${esc(latest.decision.at)}${latest.decision.note ? ` · ${esc(latest.decision.note)}` : ""}</dd>` : ""}
+      <dt>最近更新</dt><dd>${esc(latest.updated_at)}</dd>
+    </dl>`
+    : `<div style="font-size:12px;color:var(--label-2);margin-top:8px">签样记录客户确认与版本依据；未签样时下游交接清单会被门禁拦截。</div>`;
+  return `
+    <div class="card" style="padding:12px 16px; margin-top:12px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="card-title" style="margin:0;display:inline-flex;align-items:center;gap:6px">
+          ${icon("check")}签样放行 <span class="${cls}">${label}</span>
+        </span>
+        <span style="flex:1"></span>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">${signoffActions(latest)}</div>
+      </div>
+      <div style="margin-top:8px;font-size:13px">${gateLine}</div>
+      ${detail}
+    </div>`;
+}
+
+function openSignoffCreate(p, onDone) {
+  const m = openModal(`
+    <h3 class="card-title">${icon("check")}新建签样 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
+    <div class="field"><label>签样标题</label><input class="input" id="sg-title" maxlength="80" value="${esc(p.name)} 签样"></div>
+    <div class="field-row" style="margin-top:10px">
+      <div class="field"><label>工单号</label><input class="input" id="sg-job" maxlength="60" placeholder="可选"></div>
+      <div class="field"><label>创建人</label><input class="input" id="sg-by" maxlength="40" placeholder="姓名"></div>
+    </div>
+    <div class="field" style="margin-top:10px"><label>样张 / 文件标识</label><input class="input" id="sg-file" maxlength="120" placeholder="如 封面-v3.pdf、校准样张第 2 轮"></div>
+    <div class="field" style="margin-top:10px"><label>关联测量会话（可选）</label><input class="input" id="sg-session" placeholder="sess_xxx"></div>
+    <div class="field" style="margin-top:10px"><label>关联主观评价（可选）</label><input class="input" id="sg-eval" placeholder="ev_xxx"></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button class="btn btn-ghost" data-cancel>取消</button>
+      <button class="btn" id="sg-create">${icon("plus")}创建草稿</button>
+    </div>
+  `);
+  m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
+  m.modal.querySelector("#sg-create").addEventListener("click", async () => {
+    const evidence = {};
+    const file = m.modal.querySelector("#sg-file").value.trim();
+    const session = m.modal.querySelector("#sg-session").value.trim();
+    const evalId = m.modal.querySelector("#sg-eval").value.trim();
+    if (file) evidence.file_name = file;
+    if (session) evidence.measurement_session_id = session;
+    if (evalId) evidence.evaluation_id = evalId;
+    if (!Object.keys(evidence).length) return toast("请至少填写一项依据（文件 / 会话 / 评价）", "warn");
+    try {
+      await apiPost("/api/signoffs", {
+        process_id: p.id,
+        title: m.modal.querySelector("#sg-title").value.trim(),
+        job_no: m.modal.querySelector("#sg-job").value.trim(),
+        created_by: m.modal.querySelector("#sg-by").value.trim(),
+        evidence,
+      });
+      toast("签样草稿已创建", "ok");
+      m.close();
+      onDone();
+    } catch (e) {
+      toast(e.message, "err");
+    }
+  });
+}
+
+function openSignoffAction(action, latest, onDone) {
+  const meta = SIGNOFF_ACTION[action];
+  if (!meta) return;
+  const needReason = action === "reject";
+  const m = openModal(`
+    <h3 class="card-title">${icon(meta.icon)}${meta.title}</h3>
+    <div style="font-size:12px;color:var(--label-2);margin:6px 0 12px">${meta.desc}</div>
+    <div class="field"><label>操作人 *</label><input class="input" id="sg-actor" maxlength="40" placeholder="姓名"></div>
+    <div class="field" style="margin-top:10px"><label>${needReason ? "驳回理由 *" : "备注"}</label><textarea class="input" id="sg-note" rows="3" maxlength="300"></textarea></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button class="btn btn-ghost" data-cancel>取消</button>
+      <button class="btn ${needReason ? "btn-danger" : ""}" id="sg-do">${meta.confirm}</button>
+    </div>
+  `);
+  m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
+  m.modal.querySelector("#sg-do").addEventListener("click", async () => {
+    const actor = m.modal.querySelector("#sg-actor").value.trim();
+    const note = m.modal.querySelector("#sg-note").value.trim();
+    if (!actor) return toast("请填写操作人", "warn");
+    if (needReason && !note) return toast("驳回必须填写理由", "warn");
+    try {
+      await apiPost(`/api/signoffs/${latest.id}/${action}`, { actor, note });
+      toast(`签样已${meta.confirm}`, "ok");
+      m.close();
+      onDone();
+    } catch (e) {
+      toast(e.message, "err");
+    }
+  });
+}
+
+async function downloadSignoffManifest(p) {
+  try {
+    const data = await apiGet(`/api/signoffs/release-manifest?process_id=${encodeURIComponent(p.id)}`);
+    const name = data.signoff.job_no || data.signoff.id;
+    downloadDataUri(
+      "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(data, null, 2)),
+      `签样交接-${p.name}-${name}.json`,
+    );
+    toast("交接清单已生成", "ok");
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
 /* 打印校准向导（V0.7）：① 生成校准版+参考表 → ② 导入测量+双基准报告 → ③ 应用墨量建议+导出。
  * 双基准：工艺 ICC 预期（模型误差）+ ISO 12647-2 固体参考（绝对达标，仅涂布纸）。
- * 校准建议一键写入补偿模型（预测联动）；校正曲线/特性数据导出供外部专业软件生成 ICC。 */
+ * 校准建议一键写入补偿模型（预测联动）；校正曲线/特性数据导出供外部专业软件生成 ICC。
+ * V0.8：轮次化——apply 落库轮次，报告自动对比上一轮（改善/持平/恶化），收敛判定。 */
 async function openCalibrationModal(view, p) {
   const state = { step: 1, form: null, sessionId: "", report: null, applied: null };
   const OVERALL_BADGE = {
@@ -670,6 +872,14 @@ async function openCalibrationModal(view, p) {
         const warn = s.beyond_range ? ` ⚠超出墨量修正范围` : "";
         return `<span class="chip chip-mono">${s.channel} ${s.delta_pct > 0 ? "+" : ""}${s.delta_pct}%${warn}</span>`;
       }).join(" ");
+      // V0.8：轮次对比卡（较上轮）
+      const cmp = rep.prev_round_compare;
+      const cmpCard = cmp ? `
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px; padding:8px 12px; border:1px solid var(--separator); border-radius:10px">
+          <span class="swatch-meta">较上一轮（${esc((cmp.prev_created_at || "").replace("T", " "))}）</span>
+          <span class="badge ${cmp.verdict === "improved" ? "badge-green" : cmp.verdict === "worsened" ? "badge-red" : "badge-orange"}">${esc(cmp.verdict_label)}</span>
+          <span class="swatch-meta chip-mono">max ΔE ${cmp.prev_max_de_expected ?? "-"} → ${rep.summary.max_de_expected ?? "-"}${cmp.d_max_de_expected !== null ? `（${cmp.d_max_de_expected > 0 ? "+" : ""}${cmp.d_max_de_expected}）` : ""}</span>
+        </div>` : "";
       const rows = (rep.patches || []).map((row) => `
         <tr>
           <td class="swatch-meta">${row.index} ${esc(row.label)}</td>
@@ -687,6 +897,7 @@ async function openCalibrationModal(view, p) {
             ΔE(ICC) max ${rep.summary.max_de_expected ?? "-"} / avg ${rep.summary.avg_de_expected ?? "-"}</span>
           ${rep.paper_class === "uncoated" || !rep.iso_available ? `<span class="swatch-meta" style="color:var(--label-3)">ISO 参考列：非涂布纸暂未收录</span>` : ""}
         </div>
+        ${cmpCard}
         ${sugChips ? `<div style="margin-top:8px">${sugChips}</div>` : ""}
         <div style="max-height:300px; overflow:auto; margin-top:10px">
           <table class="lab-table" style="width:100%">
@@ -778,8 +989,15 @@ async function openCalibrationModal(view, p) {
         const chips = (state.applied.bias_device || [])
           .map((v, i) => Math.abs(v) < 0.0005 ? "" :
             `<span class="chip chip-mono">${"CMYK"[i]} ${v * 100 > 0 ? "+" : ""}${(v * 100).toFixed(1)}%</span>`).join(" ");
+        const vd = state.applied.verdict;
+        const verdictChip = vd ? `
+          <span class="badge ${vd.verdict === "improved" ? "badge-green" : vd.verdict === "worsened" ? "badge-red" : "badge-orange"}">较上轮 ${esc(vd.verdict_label)}</span>` : "";
         $("#cal-apply-result").innerHTML = `
-          <div class="badge badge-green">${icon("check")}已写入补偿模型（n=${state.applied.n}）</div>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+            <div class="badge badge-green">${icon("check")}已写入补偿模型（n=${state.applied.n}）</div>
+            <span class="chip chip-mono">已记录为第 ${state.applied.round_no} 轮校准</span>
+            ${verdictChip}
+          </div>
           <div style="margin-top:8px">${chips || `<span class="swatch-meta" style="color:var(--label-3)">偏置≈0（无需调整）</span>`}</div>`;
         toast("校准建议已应用", "ok");
       } catch (e) {
@@ -926,6 +1144,8 @@ export async function renderProcessDetail(view, params) {
     </div>
 
     ${p.compensation && p.compensation.n > 0 ? compensationCard(p) : ""}
+    ${p.icc_meta.device_space === "CMYK" ? `<div id="cal-history-slot">${skeletonCards(1)}</div>` : ""}
+    <div id="signoff-slot">${skeletonCards(1)}</div>
 
     <div class="card gamut-card">
       <div class="gamut-card-head">
@@ -1007,6 +1227,61 @@ export async function renderProcessDetail(view, params) {
   view.querySelector("#btn-testform").addEventListener("click", () => openTestformModal(view, p));
   const calBtn = view.querySelector("#btn-calibration");
   if (calBtn) calBtn.addEventListener("click", () => openCalibrationModal(view, p));
+
+  // V0.8：校准轮次历史（异步填充；失败静默——无轮次不显示卡片）
+  const calSlot = view.querySelector("#cal-history-slot");
+  if (calSlot) {
+    (async () => {
+      try {
+        const hist = await apiGet(`/api/qc/calibration/history?process_id=${encodeURIComponent(p.id)}`);
+        if (!hist.rounds.length) { calSlot.innerHTML = ""; return; }
+        calSlot.innerHTML = calibrationHistoryCard(hist);
+        calSlot.querySelector("[data-cal-open]")?.addEventListener("click", () =>
+          openCalibrationModal(view, { ...p, compensation: undefined }));
+      } catch (_) { calSlot.innerHTML = ""; }
+    })();
+  }
+
+  // V0.9：签样卡（状态机 + 放行门禁；ICC 变更后门禁自动失效）
+  const sgSlot = view.querySelector("#signoff-slot");
+  if (sgSlot) {
+    (async () => {
+      try {
+        const [rows, gate] = await Promise.all([
+          apiGet(`/api/signoffs?process_id=${encodeURIComponent(p.id)}`),
+          apiGet(`/api/signoffs/gate?process_id=${encodeURIComponent(p.id)}`),
+        ]);
+        if (!view.isConnected) return;
+        sgSlot.innerHTML = signoffCard(rows, gate);
+        const card = sgSlot.querySelector(".card");
+        const reload = () => renderProcessDetail(view, params);
+        card.querySelectorAll("[data-sg]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const action = btn.dataset.sg;
+            if (action === "create") return openSignoffCreate(p, reload);
+            if (action === "manifest") return downloadSignoffManifest(p);
+            if (action === "delete") {
+              const ok = await confirmDanger({
+                title: "删除签样草稿？",
+                message: "草稿及其证据关联将被移除，此操作不可撤销。",
+                confirmText: "删除",
+              });
+              if (!ok) return;
+              try {
+                await apiDelete(`/api/signoffs/${rows[0].id}`);
+                toast("签样草稿已删除", "ok");
+                reload();
+              } catch (e) {
+                toast(e.message, "err");
+              }
+              return;
+            }
+            return openSignoffAction(action, rows[0], reload);
+          });
+        });
+      } catch (_) { sgSlot.innerHTML = ""; }
+    })();
+  }
   view.querySelector("#btn-delete").addEventListener("click", async () => {
     const ok = await confirmDanger({
       title: `删除工艺「${p.name}」？`,
