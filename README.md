@@ -1,21 +1,30 @@
-# 色彩工坊 · 印前色彩管理闭环平台
+# 色彩工坊 · 印前色彩管理闭环平台（V0.10 已实现）
 
-> 面向印前的色彩管理小软件 · V0.9（预检深水区 · PDF/X-4 封装 · 签样放行 · 显示器软打样门禁）
-> 以 ΔE / CIEDE2000 为统一度量：**目标 LAB → 工艺 ICC 反查最优 CMYK 配方 → 打印实测 → 闭环修正 → 工艺级累积学习**，
+> 面向印前的色彩管理小软件 · V0.10 已实现（2026-11-23）
+> 以 ΔE / CIEDE2000 为统一度量，以**数值优化 + 光谱证据**为主线：
+> **目标 LAB → 工艺 ICC 反查最优分色值（设备值）→ 打印实测 → 闭环修正 → 校准收敛 → 工艺护照留痕**，
 > 且所有测量数据先过**方法学门禁**（测前登记 → 校准确认 → 测量 → 复测一致性 → 交叉校验 → 可信度分级 → 分级数据流向）。
+>
+> V0.10 完成加法式演进：不训练模型、不实现基础油墨 KM 调墨；当前对外定位为
+> **数值优化 + 光谱证据**，以可复核的数值结果与光谱风险证据取胜。
 
 ## 定位与核心工作流
 
 产品围绕两条业务主线：
 
 1. **配方预测（旗舰）**：客户给定目标 LAB（色样/色卡标准值），基于工艺 ICC
-   反查最优墨量配方。一次反查 = 大量正向预测迭代（粗查表 8.3 万点 + 局部精搜），
+   反查最优分色值（设备值）。一次反查 = 大量正向预测迭代（粗查表 8.3 万点 + 局部精搜），
    ΔE2000 收敛后输出 C/M/Y/K 百分比与预测色差。
 2. **实测验证闭环**：配方打印后用分光光度计实测 LAB 回填，系统做模型误差补偿
-   （p' = t - (m - p)）并再次反查，输出修正配方。
+   （p' = t - (m - p)）并再次反查，输出修正分色值（设备值）。
+3. **工艺证据与风险（V0.10）**：把 ICC、补偿、校准轮次、测量会话、配方统计与
+   光谱覆盖汇总为不可变的**工艺护照**；用现有 CGATS 光谱数据计算多光源同色异谱风险，
+   并以 `passport_hash` 把签样放行绑定到明确的证据版本。
 
 工艺（打印机 + 纸张 + 墨水组合）是一等实体，**不同工艺绑定不同的 ICC 特性文件**，
-预测与转换均以工艺为上下文。
+预测与转换均以工艺为上下文。V0.10 当前定位是**印前色彩数值优化 + 光谱证据平台**：
+以 ICC / CMM / ΔE00 / 补偿与校准数值计算为骨架，以光谱与测量方法学作为可追溯证据；
+不把模型能力作为当前卖点。
 
 ## 技术栈
 
@@ -28,6 +37,7 @@
 | QC 诊断与评价 | 自研（`diagnosis.py` / `qc_compare.py` / `evaluations.py` / `testform.py`） | 规则型诊断引擎（R1-R8 行业标准口径）、双会话指标 Δ 对比与工艺趋势、GB/T 34053 主观评价检查单、双点样张 + 目视诊断页 |
 | 印刷校准 | 自研（`calibration.py` + `testform.py` 校准版，V0.7） | ISO 12647-7 风格编号校准版、双基准报告（ICC 预期 + ISO 12647-2 固体参考）、逐通道墨量建议（写入补偿模型）、Lab 有效网点反演校正曲线、特性数据 CGATS 导出 |
 | 印前预检与输出 | 自研（`files.py` / `pdfx.py` / `signoffs.py` / `displays.py`，V0.9） | PDF 字体真嵌入 / TrimBox 出血 / 有效 DPI（内容流 CTM）/ 标准开本；PDF/X-4 结构封装（OutputIntent + XMP + 盒子）；签样状态机与放行门禁（ICC 变更自动失效）；显示器校准档案与软打样门禁、屏幕测量 CGATS 导入/导出 |
+| 工艺护照与光谱证据 | 自研（`passport.py` / `spectral.py`，V0.10） | 版本化护照（证据覆盖 + 警告 + 不可变快照 + sha256）、M0/M1/M2 记录、四光源光谱积分与工程同色异谱风险 |
 | 后端 | FastAPI + JSON 落盘（`data/`） | API 服务，工艺库/配方记录/补偿模型/测量会话重启不丢（损坏自动隔离备份） |
 | 前端 | 原生 ES Module + Canvas + three.js（vendored，无构建） | iOS 扁平风 SPA，hash 路由，亮/暗主题，2D/真 3D（WebGL）色域组件 |
 
@@ -53,6 +63,8 @@ color-mgmt/
 │   │   ├── signoffs.py         # 签样状态机 / 放行门禁 / 交接清单（V0.9 P0）
 │   │   ├── pdfx.py             # PDF/X-4 结构封装（OutputIntent / XMP / 盒子，V0.9 P0）
 │   │   ├── displays.py         # 显示器档案 / 校准有效期 / 软打样门禁 / 屏幕测量导入导出（V0.9 P0）
+│   │   ├── passport.py         # 工艺护照：证据汇总 / 状态 / sha256 / 版本（V0.10）
+│   │   ├── spectral.py         # 多光源光谱积分 / 同色异谱风险 / 会话比较（V0.10）
 │   │   ├── diagnosis.py         # 规则型印刷诊断引擎 R1-R8（行业标准口径，V0.6）
 │   │   ├── qc_compare.py        # 双会话指标 Δ 对比 + 工艺趋势时间序列（V0.6）
 │   │   ├── evaluations.py       # 主观评价检查单（GB/T 34053 方法论，V0.6）
@@ -66,6 +78,8 @@ color-mgmt/
 │   │   ├── files.py             # /api/files（preflight / pdfx / convert）
 │   │   ├── signoffs.py          # /api/signoffs（签样状态机 / 门禁 / 交接清单）
 │   │   ├── displays.py          # /api/displays（显示器档案 / 校准状态 / 软打样门禁 / 测量导入导出）
+│   │   ├── passport.py         # /api/processes/{pid}/passport*（V0.10）
+│   │   ├── spectral.py         # /api/spectral*（V0.10）
 │   │   └── main.py              # V0.1 端点（设备/测量/闭环/可视化…）
 │   └── main.py                  # 应用入口（/ 重定向前端）
 ├── static/
@@ -74,8 +88,8 @@ color-mgmt/
 │   ├── vendor/three/            # three.js r187 vendored（ESM，含 sha512 溯源 README）
 │   └── js/                      # api / router / icons / components / gamut-view / gamut-three / views/*
 ├── scripts/                     # 探针、冒烟、e2e、清理脚本
-├── data/                        # 运行时数据（工艺 ICC、配方记录、补偿模型）
-└── tests/                       # pytest 214 项（API 层 + 精度基线门禁 + 测量可靠性 + 诊断 + 评价 + 校准 + 轮次收敛 + 预检/PDF-X/签样/显示器 + fixtures）
+├── data/                        # 运行时数据（工艺 ICC、配方记录、补偿模型、passports.json）
+└── tests/                       # pytest 233 项（214 基线 + 19 新增：护照/光谱/迁移/签样门禁）
 ```
 
 ## 快速开始
@@ -114,14 +128,22 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 | `/api/processes/{id}/gamut/compare` | GET | 双工艺色域对比：凸包归属 + xy 交集多边形与面积占比 |
 | `/api/processes/{id}/compensation` | DELETE | 重置工艺级误差补偿模型 |
 
+**V0.10**：创建/编辑工艺增加可选 `measurement_condition`（空 / M0 / M1 / M2）；
+工艺响应增加 `passport_summary`。旧工艺默认空值与 `null` 摘要，不强制回填。
+
 ### 配方预测
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/api/recipes/predict` | POST | 批量 LAB→CMYK 反查（配方/ΔE/迭代轨迹/插值精搜评估数/补偿应用状态） |
-| `/api/recipes/verify` | POST | 实测验证闭环（模型误差补偿 + 修正配方 + 补偿模型沉淀） |
+| `/api/recipes/verify` | POST | 实测验证闭环（模型误差补偿 + 修正分色值 + 补偿模型沉淀） |
 | `/api/recipes/forward` | POST | CMYK→LAB 正查（与反查共用同一变换） |
 | `/api/recipes/stats` | GET | ΔE 监控聚合：总量/达标率/mean/P95/时间序列/分工艺漂移告警 |
 | `/api/recipes` | GET | 配方历史（可按工艺过滤） |
+| `/api/recipes/{rid}/export` | GET | V0.10：导出配方单 JSON/Markdown（`format=json\|md`） |
+
+**V0.10 配方语义**：`RecipeResult.recipe` 保持原字段与顺序，新增
+`recipe_kind="device_values"` 与 `recipe_meta`（unit/basis/note）。界面称“分色值（设备值）”，
+不再把设备通道百分比误导为油墨调配配方；旧记录读取时默认 `recipe_kind=device_values`。
 
 ### 印前文件
 | 端点 | 方法 | 说明 |
@@ -156,6 +178,22 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 | `/api/displays/{id}/measurements` | POST | 导入屏幕测量（raw CGATS.17 / TSV，需含 XYZ 白/黑色块）→ 白点 xy / 对比度 / 绝对亮度 |
 | `/api/displays/{id}/measurements/latest` | GET | 原样导出最近测量文件（附 `X-Content-SHA256` 短摘要） |
 
+### 工艺护照（V0.10）
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/processes/{pid}/passport` | POST | 生成/刷新护照；内容未变时返回现有版本，不新增版本 |
+| `/api/processes/{pid}/passport` | GET | 当前最新护照 |
+| `/api/processes/{pid}/passport/versions` | GET | 版本列表（每工艺最多保留 50 版） |
+| `/api/processes/{pid}/passport/{version}` | GET | 指定版本护照详情（不可变快照） |
+| `/api/processes/{pid}/passport/{version}/export` | GET | 导出 JSON/Markdown（`format=json\|md`） |
+
+### 光谱 / 同色异谱（V0.10）
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/spectral/metamerism` | POST | 按 patch label 匹配两组光谱，输出四光源 Lab / ΔE00 / 最大风险 / 最差光源 |
+| `/api/spectral/compare` | POST | 比较两个测量会话的光谱覆盖与 patch 差异，返回 top 差异 |
+| `/api/spectral/sessions/{sid}/summary` | GET | 单会话光谱摘要：patch 数、波长范围、可用/警告状态 |
+
 ### QC 测量可靠性闭环（V0.5 / V0.6）
 | 端点 | 方法 | 说明 |
 |---|---|---|
@@ -188,6 +226,37 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
 缺数据给 info 指引（生成 V0.6 样张即可补齐 75% 梯级/叠印块/灰平衡块）。
 **主观评价（GB/T 34053 方法论）**：多评价人独立 5 级打分 → 每指标算术平均 +
 标准差（σ>0.8 提示打分分歧）。
+
+### V0.10 兼容与机制
+
+- **护照版本与哈希**：护照快照汇总 ICC、补偿、校准轮次、测量会话、配方统计、
+  光谱覆盖与警告；快照不可变。`passport_hash` 为规范化 JSON 的 sha256，
+  排除 `generated_at`、`version`、`passport_hash`、`status`、`status_reasons`、`id`，
+  数值固定 4 位小数；
+  内容不变时 `POST` 返回现有版本，不新增版本；版本写入使用进程内锁串行化。
+- **状态判定**：ICC 缺失/不可读 → `invalid`；ICC 或补偿/校准指纹与快照不一致 →
+  `stale`；无 verified 测量，或 CMYK 工艺无校准轮次 → `incomplete`；否则 `valid`。
+  状态动态计算，不写入快照。
+- **单边依赖**：护照不嵌入签样状态；签样以可选 `passport_id` / `passport_hash`
+  引用护照，且仅允许关联 `valid` 护照；`release_manifest` 增加护照摘要。签样含
+  `passport_hash` 时，`SignoffStore.gate()` 校验当前最新护照 hash 与动态状态：
+  hash 不匹配返回 `passport_changed`，状态为 `incomplete/stale/invalid` 时分别返回
+  `passport_incomplete/passport_stale/passport_invalid`；
+  旧签样没有这两个字段时仍按 ICC 指纹放行。
+- **M0 / M1 / M2**：工艺记录可选测量条件；未指定时护照不比较条件，只记录缺失警告，
+  不强制回填旧数据。
+- **配方语义**：原 `recipe` 保留；新增 `recipe_kind`、`recipe_meta`。CSV 仅在末尾
+  增加 `recipe_kind` 列，旧列顺序不变；`ink_formula` 只保留类型位，不实现基础油墨 KM 调墨。
+- **光谱口径**：支持 `D50/2°`、`D65/2°`、`A/2°`、`FL11/2°`（界面显示 CIE F11）；
+  复用 `cgats.integrate_lab` / `white_xyz`。输出各光源 Lab、ΔE00、最大 ΔE、最差光源与
+  风险等级（`≤1.0 low`、`≤2.0 medium`、`>2.0 high`，常量集中定义，本版不做 UI 配置）。
+  明确标注这是**工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI**。
+- **光谱边界**：输入限定 CGATS 积分网格 `380–730nm`；允许荧光增白纸反射率 >1（OBA），
+  <0 或 >1.5 给警告；积分/Lab/ΔE 非有限时拒绝（422），不同波长网格各自独立积分，
+  不强行重采样；无光谱时 `available=false` 并给 warning，不伪造曲线或 ΔE。
+- **加法式兼容**：新增字段与路由全部为可选/新增，旧 API 响应字段不删不改；
+  `data/passports.json` 由 `PassportStore` 管理，幂等迁移补默认字段与初始化护照库，
+  不删除旧数据。破坏性变更留到 V1.x。
 
 ### V0.1 端点（保留，供工具箱使用）
 `/api/devices`、`/api/measurements`、`/api/color-checker/detect`、`/api/convert`、
@@ -238,37 +307,40 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
   （须含 XYZ 白/黑色块；发光屏不接受光谱反射率积分），自动推导白点 xy、对比度与
   可选绝对亮度（查询参数或 `LUMINANCE_CD_M2` 元数据），原始文件留档并可原样导出复核。
   系统不生成显示器 ICC（外部工具生成后登记名称/指纹）。
+- **工艺护照（V0.10）**：护照状态动态判定、快照不可变；hash 对规范化 JSON
+  做 sha256（排除时间/版本/hash/派生展示字段），按 4 位小数消除浮点尾差；版本幂等，
+  不用护照状态反向嵌入签样，避免循环依赖。
+- **光谱 / 同色异谱（V0.10）**：四个标准光源分别积分，风险阈值固定为
+  1.0/2.0 ΔE00；光谱覆盖不足或 patch 无法按标签配对时如实返回不可用/警告，
+  不插值造数。该指标是工程风险筛查，不是 CIE 15 特殊同色异谱指数。
 - PCS 为 D50 Lab；前端色块与点云经 Bradford 色适应（D50→D65）转 sRGB / display-p3 显示。
 
 ## 版本
 
-- **V0.1**：显示校准闭环（闭环校正 / 色卡识别 / 色域可视化 / ΔE）
-- **V0.2**：印前配方工作流 —— 工艺库、LAB→CMYK 反查引擎、实测验证闭环、
-  印前预检与转换、iOS 扁平 UI 全面重构（亮/暗主题、渐进式披露）
-- **V0.3**：ICC 模块视觉升级与功能补全 —— 色域凸包 + L\* 真彩点云 +
-  伪 3D 体积视图（拖拽旋转 / L\* 切片 / hover 读数）、工艺指标卡（体积/覆盖率/达标率）、
-  工艺编辑与 ICC 替换、批量上传、搜索筛选排序、「工艺→预测」带参联动、
-  交互基建（模态焦点圈闭 / 骨架屏 / 危险确认弹层 / 375px 适配）、
-  测试体系去平台化（50 项，含 API 层与精度基线门禁）。
-  路线图见 `docs/V0.3-下一阶段规划.md`
-- **V0.4**：真 3D + 精度 + 监控闭环 —— three.js 真 3D 色域体积
-  （Qhull 包络网格 + Lambert 光照 + L\* 切片 + WebGL 回退链）、插值精搜层
-  （打破 8-bit 平台期）+ 精度基线刷新、工艺级补偿模型（累积学习）、
-  ΔE 监控面板（趋势 + 漂移告警）、多工艺色域对比（凸包归属 + 交集运算）、
-  PDF 印前预检（pypdf + 首页缩略图）、修复凸包索引错位遗留 bug。
-  实施记录见 `docs/V0.4-实施规划.md`
-- **V0.5**：可信测量闭环 —— 实验方法七要素审计（三份课程报告：
-  复测缺失/校准未记录/转录链断裂/口径漂移均转化为产品对策）、CGATS.17 +
-  Status-T 双解析器（编码容错 + CIE 积分自实现）、五条可靠性规则分级
-  （verified/warning/rejected + density_ok 通道标记）、测量会话登记与导入向导、
-  GATF 油墨四指标 + TVI 曲线 + GATF 色轮（只消费 verified）、A4 CMYK 双点
-  重复样张生成器、ΔE 分量分解（dL/da/db/dC/dh/dE76）+ 解读文案、
-  补偿模型 verified 门禁。实施记录见 `docs/V0.5-实施规划.md`
-- **V0.8**：校准收敛与复测验证 —— apply 落库校准轮次（幂等/同秒确定性排序）、
-  新会话报告自动对比上一轮（改善/持平/恶化 + 逐通道 Δ）、工艺收敛判定（converged/improving/
-  worsening/flat）、工艺详情页校准历史卡（轮次列表 + max ΔE sparkline + 收敛 chip）、
-  监控页校准状态行带轮次与收敛。实施记录见 `docs/V0.8-实施规划.md`
-- **V0.9（当前）**：预检深水区 + PDF/X 封装 + 签样放行 + 显示器门禁 —— PDF 字体真嵌入
+> **V0.10 已于 2026-11-23 实现并验收**：`pytest` **233 passed**；
+> 隔离数据目录 + 8768 端口运行扩展 `scripts/e2e_http.py` 得到 **E2E ALL OK**。
+> 实现记录见 `docs/V0.10-实施记录.md`。
+>
+> 已知限制：存储仍为 JSON；护照只导出 JSON/Markdown，不生成 PDF 文件；风险阈值固定、
+> 无 UI 配置；E2E 创建工艺依赖 Windows 系统 ICC（`RSWOP.icm`），跨平台需自备 ICC。
+> 护照写锁为进程内锁，多 worker 部署需外置文件锁或数据库事务。
+> 非阻断后续项（护照版本历史 UI、完整 200% 缩放/屏幕阅读器审计、光谱曲线非颜色编码）
+> 见 `docs/V0.10-实施记录.md`。
+>
+> 当前路线图：V0.10 已交付；P1（拼版/专色/图像调整）与 P2（交付包/认证目标）
+> 尚未排入 V0.10，后续排期以待办清单为准。
+
+- **V0.10（当前，已实现）**：工艺护照 + 配方语义 + 光谱风险 —— 新增版本化**工艺护照**
+  （ICC/补偿/校准轮次/测量会话/配方统计/光谱覆盖汇总，`valid/incomplete/stale/invalid`
+  动态状态，不可变快照 + 规范化 sha256，幂等版本，每工艺最多 50 版）；工艺可选
+  M0/M1/M2 测量条件；配方显式标注**分色值（设备值）**，新增配方单 JSON/MD 导出与
+  CSV 尾部 `recipe_kind`；签样可选引用 `passport_id/passport_hash`（仅 valid），
+  护照变更或状态失效后门禁返回 `passport_changed` / `passport_stale` 等，
+  旧签样保留 ICC 指纹门禁；新增四光源（D50/D65/A/FL11，2°）
+  光谱同色异谱风险与双会话比较，输出各光源 Lab/ΔE00、最大风险与警告，明确不等同
+  CIE 15 MI。按 4 个两周 Sprint + 1 周 hardening 规划推进并完成验收，详见
+  `docs/V0.10-实施规划.md` 与 `docs/V0.10-实施记录.md`。
+- **V0.9（上一版）**：预检深水区 + PDF/X 封装 + 签样放行 + 显示器门禁 —— PDF 字体真嵌入
   （含 Type0/CIDFont）、TrimBox/BleedBox 出血量与标准开本、图像有效 DPI（内容流 CTM +
   Form 递归）；**PDF/X-4 结构封装**（OutputIntent + XMP + 盒子，严格模式拦截未嵌入字体 /
   RGB 图像）；签样状态机（draft/pending/approved/rejected/locked）、证据关联、驳回理由、
@@ -277,6 +349,10 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
   真实屏幕测量 CGATS/TSV 导入 → 白点/对比度推导、原样留档导出）。
   P1（拼版/专色/图像调整）与 P2（交付包）待做，路线见 `docs/印前标准-7步进度评判.md`，
   本轮记录见 `docs/V0.9-P0-实施记录.md`
+- **V0.8**：校准收敛与复测验证 —— apply 落库校准轮次（幂等/同秒确定性排序）、
+  新会话报告自动对比上一轮（改善/持平/恶化 + 逐通道 Δ）、工艺收敛判定（converged/improving/
+  worsening/flat）、工艺详情页校准历史卡（轮次列表 + max ΔE sparkline + 收敛 chip）、
+  监控页校准状态行带轮次与收敛。实施记录见 `docs/V0.8-实施规划.md`
 - **V0.7**：印刷校准闭环 —— ISO 12647-7 风格编号校准版（28 色块 × 双点，A4 单页）、
   双基准报告（实测 vs 工艺 ICC 预期 vs ISO 12647-2 固体参考，逐 patch ΔE00 + dL/da/db/dC/dh 分量）、
   逐通道墨量建议一键写入补偿模型（预测联动）、Lab 有效网点反演校正曲线（ISO 10128 方法）、
@@ -289,13 +365,31 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
   主观评价检查单（GB/T 34053：多评价人 5 级打分 → 均值±标准差 + 一致性预警）、
   样张目视诊断页（星标 / 0.01-0.6pt 细线 / 套准标记）、纯密度复测配对
   （密度计工作流进 verified）。实施记录见 `docs/V0.6-实施规划.md`
+- **V0.5**：可信测量闭环 —— 实验方法七要素审计（三份课程报告：
+  复测缺失/校准未记录/转录链断裂/口径漂移均转化为产品对策）、CGATS.17 +
+  Status-T 双解析器（编码容错 + CIE 积分自实现）、五条可靠性规则分级
+  （verified/warning/rejected + density_ok 通道标记）、测量会话登记与导入向导、
+  GATF 油墨四指标 + TVI 曲线 + GATF 色轮（只消费 verified）、A4 CMYK 双点
+  重复样张生成器、ΔE 分量分解（dL/da/db/dC/dh/dE76）+ 解读文案、
+  补偿模型 verified 门禁。实施记录见 `docs/V0.5-实施规划.md`
+- **V0.4**：真 3D + 精度 + 监控闭环 —— three.js 真 3D 色域体积
+  （Qhull 包络网格 + Lambert 光照 + L\* 切片 + WebGL 回退链）、插值精搜层
+  （打破 8-bit 平台期）+ 精度基线刷新、工艺级补偿模型（累积学习）、
+  ΔE 监控面板（趋势 + 漂移告警）、多工艺色域对比（凸包归属 + 交集运算）、
+  PDF 印前预检（pypdf + 首页缩略图）、修复凸包索引错位遗留 bug。
+  实施记录见 `docs/V0.4-实施规划.md`
+- **V0.3**：ICC 模块视觉升级与功能补全 —— 色域凸包 + L\* 真彩点云 +
+  伪 3D 体积视图（拖拽旋转 / L\* 切片 / hover 读数）、工艺指标卡（体积/覆盖率/达标率）、
+  工艺编辑与 ICC 替换、批量上传、搜索筛选排序、「工艺→预测」带参联动、
+  交互基建（模态焦点圈闭 / 骨架屏 / 危险确认弹层 / 375px 适配）、
+  测试体系去平台化（50 项，含 API 层与精度基线门禁）。
+  路线图见 `docs/V0.3-下一阶段规划.md`
+- **V0.2**：印前配方工作流 —— 工艺库、LAB→CMYK 反查引擎、实测验证闭环、
+  印前预检与转换、iOS 扁平 UI 全面重构（亮/暗主题、渐进式披露）
+- **V0.1**：显示校准闭环（闭环校正 / 色卡识别 / 色域可视化 / ΔE）
 
 ## 许可
 
 [MIT](LICENSE)（第三方资产许可单独注明：测试 ICC 见
 `tests/fixtures/icc/THIRD-PARTY-LICENSES.md`；内嵌 three.js r187 见
 `static/vendor/three/`（MIT，含 sha512 溯源记录））
-
-## 许可
-
-[MIT](LICENSE)（第三方测试 ICC 资产的许可单独见 `tests/fixtures/icc/THIRD-PARTY-LICENSES.md`）

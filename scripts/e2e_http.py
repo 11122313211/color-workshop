@@ -3,6 +3,8 @@
 import base64
 import hashlib
 import io
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -12,8 +14,9 @@ from PIL import Image
 # 控制台可能为 GBK：check 标签含 −/× 等 Unicode 字符，固定 UTF-8 输出避免编码崩溃
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# 本地固定后端地址（安全：目标硬编码为本机回环地址，不读取任何外部输入）
-client = httpx.Client(base_url="http://127.0.0.1:8765")
+# 默认连接本机固定端口；可用环境变量改到隔离测试实例。
+_base_url = os.environ.get("COLORFORGE_E2E_BASE_URL", "http://127.0.0.1:8765")
+client = httpx.Client(base_url=_base_url.rstrip("/"))
 WIN = Path(r"C:/Windows/System32/spool/drivers/color")
 
 
@@ -28,7 +31,7 @@ ok = True
 # 0. 静态页与 API 健康
 r = client.get("/api/health")
 ok &= check("健康检查", r.status_code == 200 and r.json()["status"] == "ok", r.text[:80])
-ok &= check("版本号 v0.9.0", r.json().get("version") == "0.9.0")
+ok &= check("版本号 v0.10.0", r.json().get("version") == "0.10.0")
 r = client.get("/", follow_redirects=False)
 ok &= check("根路径重定向", r.status_code == 307 and r.headers["location"] == "/static/index.html")
 r = client.get("/static/index.html")
@@ -690,6 +693,191 @@ ok &= check("V0.8 两轮历史 + 收敛判定（趋势/收敛）",
 for sid in (v8_sid,):
     r = client.delete("/api/qc/measurements", params={"session_id": sid})
     ok &= check("V0.8 测量会话清理", r.status_code == 200 and r.json()["status"] == "deleted")
+
+# 7.9 V0.10：光谱比较 → 工艺护照 → 签样引用 → 护照变更门禁
+r = client.patch(f"/api/processes/{pid}", json={"measurement_condition": "M1"})
+ok &= check("V0.10 工艺测量条件 M1", r.status_code == 200 and r.json()["measurement_condition"] == "M1")
+
+_pair = json.loads(
+    (Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "spectral" / "metameric_pair.json")
+    .read_text(encoding="utf-8")
+)
+_spec_a = {int(k): float(v) for k, v in _pair["a"].items()}
+_spec_b = {int(k): float(v) for k, v in _pair["b"].items()}
+_v10_wl = list(range(380, 731, 10))
+
+
+def _v10_cgats(patches):
+    fields = "\t".join(["SampleID", "SAMPLE_NAME"] + [f"nm{w}" for w in _v10_wl])
+    head = (
+        'INSTRUMENTATION\t"V0.10 E2E Probe"\n'
+        'ILLUMINATION_NAME\t"D50"\n'
+        'OBSERVER_ANGLE\t"2"\n'
+        f"NUMBER_OF_FIELDS\t{len(_v10_wl) + 2}\n"
+        "BEGIN_DATA_FORMAT\n" + fields + "\nEND_DATA_FORMAT\n"
+        f"NUMBER_OF_SETS\t{len(patches)}\nBEGIN_DATA\n"
+    )
+    rows = []
+    for label, spec in patches:
+        rows.append(f"1\t{label}\t" + "\t".join(f"{spec.get(w, 0.0):.4f}" for w in _v10_wl))
+    return (head + "\n".join(rows) + "\nEND_DATA\n").encode("utf-8")
+
+
+def _v10_session(instrument, patches):
+    payload = _v10_cgats(patches)
+    r0 = client.post(
+        "/api/qc/measurements/import",
+        params={
+            "filename": f"{instrument}.txt",
+            "instrument": instrument,
+            "condition": "M1",
+            "calibrated_at": "2026-01-01T11:00:00",
+            "repeat_mode": "single",
+            "process_id": pid,
+        },
+        content=payload,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    sid = r0.json()["session"]["id"]
+    r1 = client.post(
+        "/api/qc/measurements/import",
+        params={"filename": f"{instrument}-r2.txt", "session_id": sid,
+                "repeat_mode": "repeat", "process_id": pid},
+        content=payload,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    return sid, r1.json()["session"]["stats"]
+
+
+v10_a, st10_a = _v10_session("V0.10 Spectra A", [("L1", _spec_a), ("L2", _spec_b)])
+v10_b, st10_b = _v10_session("V0.10 Spectra B", [("L1", _spec_b), ("L2", _spec_a)])
+ok &= check(
+    "V0.10 含光谱复测会话 verified",
+    st10_a["verified"] == 2 and st10_b["verified"] == 2,
+    f"{st10_a} / {st10_b}",
+)
+r = client.post("/api/spectral/compare",
+                json={"session_a": v10_a, "session_b": v10_b, "top_n": 5})
+cmp10 = r.json()
+ok &= check(
+    "V0.10 双会话光谱匹配与最高风险",
+    r.status_code == 200 and cmp10["matched"] == 2 and cmp10["max_delta_e"] >= 2.0
+    and cmp10["worst_condition"] in ("D65", "A", "FL11")
+    and "CIE 15" in cmp10["disclaimer"],
+    f"max={cmp10.get('max_delta_e')} worst={cmp10.get('worst_condition')}",
+)
+r = client.get(f"/api/spectral/sessions/{v10_a}/summary")
+ok &= check(
+    "V0.10 会话光谱摘要",
+    r.status_code == 200 and r.json()["spectral_patches"] == 2
+    and r.json()["wavelength_min"] == 380 and r.json()["wavelength_max"] == 730,
+)
+
+r = client.post(f"/api/processes/{pid}/passport")
+pp10 = r.json()
+ok &= check(
+    "V0.10 生成工艺护照（valid）",
+    r.status_code == 200 and pp10["created"] is True and pp10["status"] == "valid"
+    and len(pp10["passport_hash"]) == 64,
+    f"v{pp10.get('version')} #{pp10.get('passport_hash', '')[:10]}",
+)
+r = client.post(f"/api/processes/{pid}/passport")
+ok &= check(
+    "V0.10 护照内容幂等",
+    r.status_code == 200 and r.json()["created"] is False
+    and r.json()["version"] == pp10["version"]
+    and r.json()["passport_hash"] == pp10["passport_hash"],
+)
+for fmt in ("json", "md"):
+    r = client.get(f"/api/processes/{pid}/passport/{pp10['version']}/export?format={fmt}")
+    ok &= check(f"V0.10 护照导出 {fmt}", r.status_code == 200 and len(r.content) > 100)
+
+r = client.post("/api/recipes/predict", json={
+    "process_id": pid, "targets": [{"label": "V10配方单", "lab": [50.0, 20.0, 5.0]}],
+})
+recipe10 = r.json()["results"][0]
+ok &= check(
+    "V0.10 配方设备值语义",
+    r.status_code == 200 and recipe10["recipe_kind"] == "device_values"
+    and recipe10["recipe_id"],
+)
+r = client.get(f"/api/recipes/{recipe10['recipe_id']}/export?format=md")
+ok &= check(
+    "V0.10 配方单导出",
+    r.status_code == 200 and "分色值（设备值）" in r.text
+    and "不是基础油墨调墨配方" in r.text,
+)
+
+r = client.post("/api/signoffs", json={
+    "process_id": pid,
+    "title": "V0.10 护照签样",
+    "evidence": {"file_name": "v10-proof.pdf"},
+    "passport_id": pp10["id"],
+    "passport_hash": pp10["passport_hash"],
+})
+sg10 = r.json()
+ok &= check(
+    "V0.10 签样引用护照",
+    r.status_code == 200 and sg10["snapshot"]["passport_hash"] == pp10["passport_hash"],
+)
+client.post(f"/api/signoffs/{sg10['id']}/submit", json={"actor": "设计"})
+client.post(f"/api/signoffs/{sg10['id']}/approve", json={"actor": "客户"})
+r = client.get("/api/signoffs/gate", params={"process_id": pid})
+ok &= check(
+    "V0.10 护照签样 gate allowed",
+    r.status_code == 200 and r.json()["allowed"] is True
+    and r.json().get("passport_hash") == pp10["passport_hash"],
+)
+r = client.get("/api/signoffs/release-manifest", params={"process_id": pid})
+ok &= check(
+    "V0.10 交接清单含护照摘要",
+    r.status_code == 200 and r.json()["passport"]["version"] == pp10["version"],
+)
+
+r = client.patch(f"/api/processes/{pid}", json={"measurement_condition": "M2"})
+r = client.post(f"/api/processes/{pid}/passport")
+pp10_v2 = r.json()
+ok &= check(
+    "V0.10 证据变化生成新护照版本",
+    r.status_code == 200 and pp10_v2["created"] is True
+    and pp10_v2["version"] == pp10["version"] + 1
+    and pp10_v2["passport_hash"] != pp10["passport_hash"],
+)
+r = client.get("/api/signoffs/gate", params={"process_id": pid})
+ok &= check(
+    "V0.10 护照变化 → passport_changed",
+    r.status_code == 200 and r.json()["allowed"] is False
+    and r.json()["reason"] == "passport_changed",
+    str(r.json())[:120],
+)
+r = client.get("/api/signoffs/release-manifest", params={"process_id": pid})
+ok &= check("V0.10 护照变化后交接清单 409", r.status_code == 409)
+
+alt_icc = (WIN / "JapanColor2001Coated.icc").read_bytes()
+r = client.put(
+    f"/api/processes/{pid}/icc",
+    params={"filename": "JapanColor2001Coated.icc"},
+    content=alt_icc,
+    headers={"Content-Type": "application/octet-stream"},
+)
+ok &= check(
+    "V0.10 替换工艺 ICC",
+    r.status_code == 200 and r.json()["status"] == "replaced"
+    and r.json()["process"]["icc_sha256"] != pp10["process"]["icc_sha256"],
+)
+r = client.get("/api/signoffs/gate", params={"process_id": pid})
+ok &= check(
+    "V0.10 替换 ICC → icc_changed",
+    r.status_code == 200 and r.json()["allowed"] is False
+    and r.json()["reason"] == "icc_changed",
+    str(r.json())[:120],
+)
+r = client.get("/api/signoffs/release-manifest", params={"process_id": pid})
+ok &= check("V0.10 替换 ICC 后交接清单 409", r.status_code == 409)
+
+for sid in (v10_a, v10_b):
+    r = client.delete("/api/qc/measurements", params={"session_id": sid})
+    ok &= check("V0.10 光谱会话清理", r.status_code == 200)
 
 # 8. 清理
 for p in (pid, pid_b):

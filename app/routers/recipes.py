@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from ..models.schemas import (
@@ -63,9 +64,14 @@ def predict(req: RecipePredictRequest):
         r["label"] = t.label
         r["compensation"] = {"n": comp_n, "applied": bias is not None}
         total_predictions += r["predictions"]
-        results.append(RecipeResult(**r))
         # 每个目标存一条配方历史
-        recipe_store.create(proc, {**r, "method": req.method.value, "tolerance": req.tolerance}, t.label)
+        doc = recipe_store.create(
+            proc,
+            {**r, "method": req.method.value, "tolerance": req.tolerance},
+            t.label,
+        )
+        r["recipe_id"] = doc["id"]
+        results.append(RecipeResult(**r))
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return RecipePredictResponse(
@@ -202,6 +208,70 @@ def get_recipe(rid: str):
     if not doc:
         raise HTTPException(404, "配方记录不存在")
     return doc
+
+
+def _recipe_markdown(doc: dict) -> str:
+    meta = doc.get("recipe_meta") or {}
+    rows = [
+        f"| {channel} | {value}% |"
+        for channel, value in (doc.get("recipe") or {}).items()
+    ]
+    lines = [
+        f"# 配方单 · {doc.get('label') or '未命名颜色'}",
+        "",
+        f"- 工艺：{doc.get('process_name', '')}（{doc.get('device_space', '')}）",
+        f"- 配方语义：{doc.get('recipe_kind', 'device_values')}",
+        f"- 单位/基准：{meta.get('unit', 'percent')} / {meta.get('basis', 'device_channels')}",
+        f"- 说明：{meta.get('note', '分色值（设备值），不是基础油墨调墨配方')}",
+        f"- 目标 Lab：{doc.get('target_lab', [])}",
+        f"- 预测 Lab：{doc.get('predicted_lab', [])}",
+        f"- ΔE2000：{doc.get('delta_e', '')}（容差 {doc.get('tolerance', '')}）",
+        f"- 创建时间：{doc.get('created_at', '')}",
+        "",
+        "## 分色值（设备值）",
+        "",
+        "| 通道 | 数值 |",
+        "| --- | ---: |",
+        *rows,
+        "",
+        "> 此单为设备通道分色值，不是基础油墨调墨配方；实际印刷请以工艺 ICC/RIP 与现场墨量为准。",
+        "",
+    ]
+    if doc.get("verifications"):
+        lines.extend(["## 实测验证", ""])
+        for verification in doc["verifications"]:
+            lines.append(
+                f"- {verification.get('created_at', '')}：实测 ΔE "
+                f"{verification.get('delta_e_measured', '')} → 修正预测 "
+                f"{verification.get('delta_e_corrected', '')}"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+@router.get("/{rid}/export")
+def export_recipe(rid: str, format: str = "json"):
+    """导出配方单（JSON / Markdown）；列义明确为设备分色值。"""
+    doc = recipe_store.get(rid)
+    if not doc:
+        raise HTTPException(404, "配方记录不存在")
+    if format not in ("json", "md"):
+        raise HTTPException(422, "format 仅支持 json / md")
+    if format == "md":
+        content = _recipe_markdown(doc)
+        media = "text/markdown; charset=utf-8"
+        filename = f"recipe-{rid}.md"
+    else:
+        import json
+
+        content = json.dumps(doc, ensure_ascii=False, indent=2)
+        media = "application/json; charset=utf-8"
+        filename = f"recipe-{rid}.json"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.delete("/{rid}")

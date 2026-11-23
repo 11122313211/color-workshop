@@ -60,6 +60,7 @@ export function apiUploadICC(iccBytes, meta, { onProgress } = {}) {
     ink: meta.ink || "",
     notes: meta.notes || "",
     filename: meta.filename || "",
+    measurement_condition: meta.measurement_condition || "",
   });
   if (!onProgress) {
     return request(`/api/processes?${qs.toString()}`, {

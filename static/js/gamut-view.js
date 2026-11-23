@@ -47,9 +47,10 @@ const canvas2d = {
   name: "canvas2d",
   /** 绘制并返回屏幕坐标集（供 hitTest / tooltip） */
   draw(canvas, data, state, spectrum) {
-    return state.mode === "3d"
-      ? draw3d(canvas, data, state)
-      : draw2d(canvas, data, state, spectrum);
+    if (state.mode === "3d") {
+      return { points: draw3d(canvas, data, state), spectrumPoints: [] };
+    }
+    return draw2d(canvas, data, state, spectrum);
   },
   hitTest(screenPts, px, py, radius = 10) {
     let best = null;
@@ -75,6 +76,7 @@ function draw2d(canvas, data, state, spectrum) {
     slice == null
       ? undefined
       : (i) => (Math.abs(labs[i][0] - slice) <= 6 ? 0.95 : 0.06);
+  const hiddenPoints = state.showPoints === false;
   const projector = drawCie(
     canvas,
     [
@@ -87,17 +89,20 @@ function draw2d(canvas, data, state, spectrum) {
         color: "var(--indigo)",
         alphaFn,
         pointSize: 1.7,
+        pointAlpha: 0.72,
+        hidePoints: hiddenPoints,
         hullAlpha: 0.14,
         hullWidth: 2,
       },
     ],
-    { spectrum }
+    { spectrum: state.showSpectrum === false ? null : spectrum }
   );
   // 屏幕坐标缓存（hover 命中测试用，顺序与绘制顺序一致）
-  return order.map((i) => {
+  const points = order.map((i) => {
     const [sx, sy] = projector.toScreen(data.xy_points[i][0], data.xy_points[i][1]);
     return { sx, sy, lab: labs[i], xy: data.xy_points[i] };
   });
+  return { points, spectrumPoints: projector.spectrumPoints || [] };
 }
 
 function draw3d(canvas, data, state) {
@@ -164,7 +169,7 @@ function draw3d(canvas, data, state) {
 
   // —— painter 算法：由远及近绘制，点尺寸随深度 1.1 → 2.4px ——
   const sorted = [...screenPts].sort((a, b) => a.depthN - b.depthN);
-  for (const p of sorted) {
+  if (state.showPoints !== false) for (const p of sorted) {
     const inSlice = slice == null || Math.abs(p.lab[0] - slice) <= 6;
     const alpha = slice == null ? 0.9 : inSlice ? 0.95 : 0.07;
     if (alpha <= 0.02) continue;
@@ -174,7 +179,7 @@ function draw3d(canvas, data, state) {
     ctx.fill();
   }
 
-  return screenPts;
+  return state.showPoints === false ? [] : screenPts;
 }
 
 registerRenderer("canvas2d", canvas2d);
@@ -195,6 +200,9 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
   let data = null;
   let spectrum = null;
   let screenPts = [];
+  let spectrumPts = [];
+  let showSpectrum = true;
+  let showPoints = true;
   let dragging = false;
   let lastPointer = null;
   let disposed = false;
@@ -206,7 +214,19 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
         <button data-mode="2d" class="active">2D 平面</button>
         <button data-mode="3d">3D 体积</button>
       </div>
-      <span class="gamut-hint">3D：拖拽旋转 · 双击复位</span>
+      <div class="gamut-legend" role="group" aria-label="色域图层">
+        <button class="gamut-layer-toggle" type="button" data-layer="spectrum" aria-pressed="true"
+          title="显示 / 隐藏 CIE 光谱轨迹（仅 2D）">
+          <i class="gamut-dot gamut-dot-spectrum" aria-hidden="true"></i><span>光谱轨迹</span>
+        </button>
+        <span class="gamut-key-item"><i class="gamut-dot gamut-dot-srgb" aria-hidden="true"></i>sRGB</span>
+        <span class="gamut-key-item"><i class="gamut-dot gamut-dot-hull" aria-hidden="true"></i>工艺凸包</span>
+        <button class="gamut-layer-toggle" type="button" data-layer="points" aria-pressed="true"
+          title="显示 / 隐藏采样点（按 L* 着色）">
+          <i class="gamut-dot gamut-dot-proc" aria-hidden="true"></i><span>采样点</span>
+        </button>
+      </div>
+      <span class="gamut-hint" data-role="hint">悬停读取：采样点 / 光谱波长</span>
     </div>
     <div class="gamut-stage">
       <div class="gamut-loading"><span class="spinner"></span>正在经 ICC 采样色域…</div>
@@ -265,6 +285,7 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
 
   function updateBadge() {
     stage.classList.toggle("mode-3d", mode === "3d");
+    updateLayerUI();
     const b = el.querySelector(".gamut-render-badge");
     if (!b) return;
     if (mode !== "3d") {
@@ -275,13 +296,46 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     b.textContent = threeState === "ready" ? "WebGL · three.js" : "Canvas 回退";
   }
 
+  function updateLayerUI() {
+    const spectrumToggle = el.querySelector('[data-layer="spectrum"]');
+    const pointsToggle = el.querySelector('[data-layer="points"]');
+    const hint = el.querySelector('[data-role="hint"]');
+    [spectrumToggle, pointsToggle].forEach((btn) => {
+      if (!btn) return;
+      const on = btn.dataset.layer === "spectrum" ? showSpectrum : showPoints;
+      btn.setAttribute("aria-pressed", String(on));
+      btn.classList.toggle("is-off", !on);
+    });
+    if (spectrumToggle) {
+      spectrumToggle.disabled = mode === "3d";
+      spectrumToggle.title =
+        mode === "3d" ? "光谱轨迹仅在 2D 平面显示" : "显示 / 隐藏 CIE 光谱轨迹";
+    }
+    if (hint) {
+      hint.textContent =
+        mode === "3d" ? "拖拽旋转 · 双击复位" : "悬停读取：采样点 / 光谱波长";
+    }
+  }
+  updateLayerUI();
+
   /* —— 绘制（rAF 节流；按模式选 canvas 与渲染器）—— */
   let rafId = 0;
+  function applyDrawResult(result) {
+    if (Array.isArray(result)) {
+      screenPts = result;
+      spectrumPts = [];
+    } else {
+      screenPts = result?.points || [];
+      spectrumPts = result?.spectrumPoints || [];
+    }
+  }
+
   function schedule() {
     if (rafId || disposed || !data) return;
     rafId = requestAnimationFrame(() => {
       rafId = 0;
       if (disposed || !data) return;
+      const renderState = { mode, theta, phi, slice, zoom, showSpectrum, showPoints };
       if (mode === "3d" && threeState === "ready") {
         if (!glCanvas) {
           glCanvas = document.createElement("canvas");
@@ -291,41 +345,70 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
         }
         canvas.hidden = true;
         glCanvas.hidden = false;
-        screenPts = renderers
+        let result = renderers
           .get("three")
-          .draw(glCanvas, data, { mode, theta, phi, slice, zoom }, spectrum);
-        if (screenPts === null) {
+          .draw(glCanvas, data, renderState, spectrum);
+        if (result === null) {
           // WebGL 上下文创建失败 → 回退伪 3D
           threeState = "failed";
           updateBadge();
           glCanvas.hidden = true;
           canvas.hidden = false;
-          screenPts = renderers
+          result = renderers
             .get("canvas2d")
-            .draw(canvas, data, { mode, theta, phi, slice }, spectrum);
+            .draw(canvas, data, renderState, spectrum);
         }
+        applyDrawResult(result);
       } else {
         if (glCanvas) glCanvas.hidden = true;
         canvas.hidden = false;
-        screenPts = renderers
+        const result = renderers
           .get("canvas2d")
-          .draw(canvas, data, { mode, theta, phi, slice }, spectrum);
+          .draw(canvas, data, renderState, spectrum);
+        applyDrawResult(result);
       }
     });
   }
 
   /* —— tooltip —— */
+  function hideTip() {
+    tip.hidden = true;
+    if (hoverCb) hoverCb(null);
+  }
+
   function showTip(p, clientX, clientY) {
-    if (!p || !p.lab) { tip.hidden = true; if (hoverCb) hoverCb(null); return; }
+    if (!p) {
+      hideTip();
+      return;
+    }
+    if (p.kind === "spectrum") {
+      tip.hidden = false;
+      tip.innerHTML =
+        `<b>CIE 1931 · ${esc(p.wavelength)} nm</b>` +
+        `<span class="gamut-tip-sub">x ${p.x.toFixed(4)} · y ${p.y.toFixed(4)}</span>`;
+      if (hoverCb) hoverCb(null);
+    } else if (p.lab) {
+      tip.hidden = false;
+      tip.innerHTML = `<b>L* ${p.lab[0].toFixed(1)}</b> · a ${p.lab[1].toFixed(1)} · b ${p.lab[2].toFixed(1)}`;
+      if (hoverCb) hoverCb(p.lab);
+    } else {
+      hideTip();
+      return;
+    }
+
     const rect = stage.getBoundingClientRect();
-    tip.hidden = false;
-    tip.innerHTML = `<b>L* ${p.lab[0].toFixed(1)}</b> · a ${p.lab[1].toFixed(1)} · b ${p.lab[2].toFixed(1)}`;
     const tw = tip.offsetWidth;
-    const x = Math.min(Math.max(clientX - rect.left + 14, 6), rect.width - tw - 6);
-    const y = Math.max(clientY - rect.top - 34, 6);
+    const th = tip.offsetHeight;
+    const pointerX = clientX - rect.left;
+    const pointerY = clientY - rect.top;
+    let x = pointerX + 14;
+    if (x + tw > rect.width - 6) x = pointerX - tw - 14;
+    let y = pointerY - th - 12;
+    if (y < 6) y = pointerY + 16;
+    x = Math.min(Math.max(x, 6), Math.max(6, rect.width - tw - 6));
+    y = Math.min(Math.max(y, 6), Math.max(6, rect.height - th - 6));
     tip.style.left = `${x}px`;
     tip.style.top = `${y}px`;
-    if (hoverCb) hoverCb(p.lab);
   }
 
   /* —— 数据加载 —— */
@@ -363,20 +446,25 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       return;
     }
     const rect = activeCanvas().getBoundingClientRect();
-    const hit = renderers.get("canvas2d").hitTest(
-      screenPts,
-      e.clientX - rect.left,
-      e.clientY - rect.top,
-      mode === "3d" ? 8 : 10
-    );
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const hitTest = renderers.get("canvas2d").hitTest;
+    let hit = showPoints ? hitTest(screenPts, px, py, mode === "3d" ? 8 : 10) : null;
+    if (mode === "2d" && showSpectrum) {
+      const spectralHit = hitTest(spectrumPts, px, py, 7);
+      if (spectralHit) {
+        const sampleDistance = hit ? Math.hypot(hit.sx - px, hit.sy - py) : Infinity;
+        const spectrumDistance = Math.hypot(spectralHit.sx - px, spectralHit.sy - py);
+        // 轨迹与点云重叠时稍微偏向轨迹，保证细线也能被选中。
+        if (!hit || spectrumDistance <= sampleDistance + 2.5) hit = spectralHit;
+      }
+    }
     showTip(hit, e.clientX, e.clientY);
   });
-  stage.addEventListener("pointerleave", () => {
-    tip.hidden = true;
-    if (hoverCb) hoverCb(null);
-  });
+  stage.addEventListener("pointerleave", hideTip);
   stage.addEventListener("pointerdown", (e) => {
     if (mode !== "3d") return;
+    hideTip();
     dragging = true;
     lastPointer = { x: e.clientX, y: e.clientY };
     stage.setPointerCapture(e.pointerId);
@@ -407,9 +495,22 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     el.querySelectorAll('[data-role="mode"] button').forEach((b) =>
       b.classList.toggle("active", b === btn)
     );
-    tip.hidden = true;
+    hideTip();
     if (mode === "3d") ensureThree();
     updateBadge();
+    schedule();
+  });
+
+  el.querySelector(".gamut-legend").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-layer]");
+    if (!btn || btn.disabled) return;
+    if (btn.dataset.layer === "spectrum") {
+      showSpectrum = !showSpectrum;
+    } else if (btn.dataset.layer === "points") {
+      showPoints = !showPoints;
+    }
+    hideTip();
+    updateLayerUI();
     schedule();
   });
 

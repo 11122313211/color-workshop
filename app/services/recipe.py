@@ -384,6 +384,12 @@ class RecipeStore:
             "device_space": process_doc["icc_meta"]["device_space"],
             "target_lab": result["target_lab"],
             "recipe": result["recipe"],
+            "recipe_kind": result.get("recipe_kind", "device_values"),
+            "recipe_meta": result.get("recipe_meta") or {
+                "unit": "percent",
+                "basis": "device_channels",
+                "note": "分色值（设备值），不是基础油墨调墨配方",
+            },
             "predicted_lab": result["predicted_lab"],
             "delta_e": result["delta_e"],
             "method": result.get("method", "cie2000"),
@@ -399,14 +405,30 @@ class RecipeStore:
         return doc
 
     def get(self, rid: str) -> dict | None:
-        return self._store.get(rid)
+        doc = self._store.get(rid)
+        return self._with_defaults(doc) if doc else None
 
     def list(self, process_id: str | None = None) -> list[dict]:
-        docs = list(self._store.all().values())
+        docs = [self._with_defaults(d) for d in self._store.all().values()]
         if process_id:
             docs = [d for d in docs if d.get("process_id") == process_id]
         docs.sort(key=lambda d: d.get("created_at", ""), reverse=True)
         return docs
+
+    @staticmethod
+    def _with_defaults(doc: dict) -> dict:
+        """旧配方读取兼容：V0.10 语义字段按设备分色值补齐。"""
+        out = {**doc}
+        out.setdefault("recipe_kind", "device_values")
+        out.setdefault(
+            "recipe_meta",
+            {
+                "unit": "percent",
+                "basis": "device_channels",
+                "note": "分色值（设备值），不是基础油墨调墨配方",
+            },
+        )
+        return out
 
     def delete(self, rid: str) -> bool:
         return self._store.delete(rid)
@@ -421,7 +443,7 @@ class RecipeStore:
         return removed
 
     def append_verification(self, rid: str, verification: dict) -> dict | None:
-        doc = self._store.get(rid)
+        doc = self.get(rid)
         if not doc:
             return None
         doc.setdefault("verifications", []).append(verification)

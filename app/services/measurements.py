@@ -19,7 +19,7 @@ from .filedb import JsonStore
 from .measurement_qa import grade_session
 from .processes import DATA_DIR
 
-#: 支持的测量条件（ISO 13660 观测条件类别）
+#: 支持的测量条件（ISO 13655 观测条件类别）
 MEASUREMENT_CONDITIONS = ("M0", "M1", "M2")
 
 

@@ -7,7 +7,12 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from ..services.compensation import CompensationStore
-from ..services.processes import ProcessStore, gamut_summary, sample_process_gamut
+from ..services.processes import (
+    PROCESS_MEASUREMENT_CONDITIONS,
+    ProcessStore,
+    gamut_summary,
+    sample_process_gamut,
+)
 
 router = APIRouter(prefix="/api/processes", tags=["processes"])
 
@@ -20,6 +25,23 @@ class ProcessUpdateRequest(BaseModel):
     paper: str | None = Field(None, max_length=80)
     ink: str | None = Field(None, max_length=80)
     notes: str | None = Field(None, max_length=300)
+    measurement_condition: str | None = Field(
+        None,
+        description="V0.10 测量条件：空串 / M0 / M1 / M2",
+    )
+
+
+def _passport_summary(pid: str) -> dict | None:
+    """最轻量的护照摘要；护照服务异常不得影响工艺主数据读取。"""
+    from ..services.passport import PassportStore
+
+    try:
+        doc = process_store.get(pid)
+        if not doc:
+            return None
+        return PassportStore().summary_for_process(doc)
+    except Exception:  # noqa: BLE001 —— 护照损坏/旧数据时工艺仍可用
+        return None
 
 
 @router.post("")
@@ -30,8 +52,11 @@ async def create_process(
     ink: str = Query("", description="墨水"),
     notes: str = Query("", description="备注"),
     filename: str = Query("", description="ICC 原始文件名"),
+    measurement_condition: str = Query("", description="测量条件：空串 / M0 / M1 / M2"),
 ):
     """创建工艺（body 为 ICC 文件原始字节，Content-Type: application/octet-stream）。"""
+    if measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS:
+        raise HTTPException(422, "measurement_condition 仅支持空串 / M0 / M1 / M2")
     data = await request.body()
     if not data or len(data) < 128:
         raise HTTPException(400, "缺少有效的 ICC 文件数据（raw bytes body）")
@@ -39,7 +64,16 @@ async def create_process(
         meta = ProcessStore.parse_meta(data)
     except Exception as e:  # noqa: BLE001 —— 无效 ICC 文件
         raise HTTPException(400, f"无法解析 ICC 文件: {e}") from e
-    return process_store.create(name, data, paper, ink, notes, filename)
+    doc = process_store.create(
+        name,
+        data,
+        paper,
+        ink,
+        notes,
+        filename,
+        measurement_condition,
+    )
+    return {**doc, "passport_summary": None}
 
 
 @router.get("")
@@ -54,6 +88,7 @@ def list_processes(summary: bool = Query(False, description="附带色域摘要�
     out = []
     for doc in docs:
         item = {**doc}
+        item["passport_summary"] = _passport_summary(doc["id"])
         try:
             item["gamut_summary"] = gamut_summary(doc)
         except Exception:  # noqa: BLE001 —— 色域采样失败的工艺照常返回，摘要置空
@@ -71,17 +106,26 @@ def get_process(pid: str):
     doc = process_store.get(pid)
     if not doc:
         raise HTTPException(404, "工艺不存在")
-    doc = {**doc, "compensation": _compensations.get(pid)}
+    doc = {
+        **doc,
+        "compensation": _compensations.get(pid),
+        "passport_summary": _passport_summary(pid),
+    }
     return doc
 
 
 @router.patch("/{pid}")
 def update_process(pid: str, req: ProcessUpdateRequest):
     """编辑工艺元数据（名称/纸张/墨水/备注，None 字段保持不变）。"""
+    if (
+        req.measurement_condition is not None
+        and req.measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS
+    ):
+        raise HTTPException(422, "measurement_condition 仅支持空串 / M0 / M1 / M2")
     doc = process_store.update(pid, **req.model_dump())
     if not doc:
         raise HTTPException(404, "工艺不存在")
-    return doc
+    return {**doc, "passport_summary": _passport_summary(pid)}
 
 
 @router.put("/{pid}/icc")
@@ -123,6 +167,9 @@ def delete_process(pid: str):
     RecipeStore().remove_process(pid)
     _compensations.reset(pid)
     CalibrationStore().remove_process(pid)
+    from ..services.passport import PassportStore
+
+    PassportStore().remove_process(pid)
     return {"status": "deleted"}
 
 

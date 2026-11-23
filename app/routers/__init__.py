@@ -17,6 +17,8 @@ from .files import router as router_files
 from .qc import router as router_qc
 from .signoffs import router as router_signoffs
 from .displays import router as router_displays
+from .passport import router as router_passports
+from .spectral import router as router_spectral
 
 __all__ = [
     "router_devices",
@@ -35,4 +37,6 @@ __all__ = [
     "router_qc",
     "router_signoffs",
     "router_displays",
+    "router_passports",
+    "router_spectral",
 ]

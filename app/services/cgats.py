@@ -146,9 +146,13 @@ def xyz_from_spectral(
     # CMF/SPD 重采样到测量网格（测量网格可能与 CMF 原生网格不同）
     cmf_g = np.stack([np.interp(wl, WL_GRID, cmf[:, ch]) for ch in range(3)], axis=1)
     spd_g = np.interp(wl, WL_GRID, spd)
-    k = 100.0 / float((spd_g * cmf_g[:, 1]).sum())
-    sums = (spd_g[:, None] * refl[:, None] * cmf_g).sum(axis=0)
-    return (k * sums).tolist()
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        k = 100.0 / float((spd_g * cmf_g[:, 1]).sum())
+        sums = (spd_g[:, None] * refl[:, None] * cmf_g).sum(axis=0)
+        xyz = k * sums
+    if not np.all(np.isfinite(xyz)):
+        raise ValueError("光谱积分结果非有限，请检查反射率量级与数据质量")
+    return xyz.tolist()
 
 
 def lab_from_xyz(xyz, white_xyz) -> list[float]:

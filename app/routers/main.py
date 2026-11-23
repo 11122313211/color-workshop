@@ -241,7 +241,7 @@ router_system = APIRouter(prefix="/api", tags=["system"])
 
 @router_system.get("/health")
 def health():
-    return {"status": "ok", "product": "色彩管理闭环AI平台", "version": "0.9.0"}
+    return {"status": "ok", "product": "色彩工坊 · 数值优化与光谱证据", "version": "0.10.0"}
 
 
 @router_system.get("/spaces")

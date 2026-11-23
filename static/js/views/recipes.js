@@ -290,7 +290,11 @@ function resultCard(r, idx) {
         </div>
       </div>
       <div class="divider-v"></div>
-      <div style="flex:1; min-width:240px">${recipeLine(r.recipe)}</div>
+      <div style="flex:1; min-width:240px">
+        <div class="swatch-meta" style="margin-bottom:6px">分色值（设备值）</div>
+        ${recipeLine(r.recipe)}
+        <div class="swatch-meta" style="margin-top:6px">${esc(r.recipe_meta?.note || "设备通道分色值，不是基础油墨调墨配方")}</div>
+      </div>
     </div>
 
     <div class="spark-wrap" style="margin-top:14px">
@@ -298,8 +302,10 @@ function resultCard(r, idx) {
       <span>ΔE 迭代轨迹：${r.iterations.map((v) => v.toFixed(2)).join(" → ")} · 共 ${r.predictions} 次正向预测（粗查表 ${r.lut_points}）</span>
     </div>
 
-    <div style="margin-top:14px; display:flex; gap:10px">
+    <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap">
       <button class="btn btn-secondary btn-sm btn-verify">${icon("target")}实测验证</button>
+      ${r.recipe_id ? `<a class="btn btn-secondary btn-sm" href="/api/recipes/${encodeURIComponent(r.recipe_id)}/export?format=md" download>${icon("download")}导出配方单</a>
+        <a class="btn btn-ghost btn-sm" href="/api/recipes/${encodeURIComponent(r.recipe_id)}/export?format=json" download>JSON</a>` : ""}
     </div>
     ${verify ? verificationBlock(verify) : ""}
   </div>`;
@@ -413,7 +419,11 @@ function exportCsv() {
   if (!state.results) return toast("暂无预测结果", "warn");
   const proc = state.results.device_space || "CMYK";
   const channels = Object.keys(state.results.results[0].recipe);
-  const header = ["名称", "目标L", "目标a", "目标b", "预测L", "预测a", "预测b", "ΔE2000", ...channels.map((c) => c + "%")].join(",");
+  const header = [
+    "名称", "目标L", "目标a", "目标b", "预测L", "预测a", "预测b", "ΔE2000",
+    ...channels.map((c) => c + "%"),
+    "recipe_kind",
+  ].join(",");
   const lines = state.results.results.map((r) =>
     [
       `"${(r.label || "").replace(/"/g, '""')}"`,
@@ -421,6 +431,7 @@ function exportCsv() {
       ...r.predicted_lab.map((v) => Math.round(v * 100) / 100),
       r.delta_e,
       ...channels.map((c) => r.recipe[c]),
+      r.recipe_kind || "device_values",
     ].join(",")
   );
   downloadCsv([header, ...lines].join("\n"), `配方_${state.results.process_name}.csv`);

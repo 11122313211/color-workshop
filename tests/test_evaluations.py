@@ -8,6 +8,10 @@
 
 from __future__ import annotations
 
+import os
+import uuid
+from pathlib import Path
+
 import pytest
 
 from app.services.evaluations import (
@@ -21,8 +25,10 @@ from app.services.evaluations import (
 
 
 @pytest.fixture()
-def store(tmp_path):
-    return EvaluationStore(tmp_path / "eval.json")
+def store():
+    # Windows 沙箱下 pytest tmp_path 会创建 ACL 受限目录；使用隔离数据目录内普通路径。
+    path = Path(os.environ["COLORFORGE_DATA_DIR"]) / f"eval-{uuid.uuid4().hex[:8]}.json"
+    return EvaluationStore(path)
 
 
 # --- 模板 -----------------------------------------------------------------------

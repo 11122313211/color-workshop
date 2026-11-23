@@ -7,7 +7,7 @@
  * 会话对比 Δ 表，工艺绑定会话 K 值趋势 sparkline；主观评价卡见 views/evaluation.js。
  */
 
-import { apiGet, apiPostRaw, apiDelete } from "../api.js";
+import { apiGet, apiPost, apiPostRaw, apiDelete } from "../api.js";
 import { icon } from "../icons.js";
 import {
   emptyState, errorState, skeletonCards, esc, openModal, toast, confirmDanger, observeRedraw,
@@ -599,6 +599,227 @@ function compareTable(cmp) {
     </table>`;
 }
 
+/* =========================================================
+ * V0.10 光谱 / 同色异谱卡
+ * 非同色异谱 MI；仅为工程风险指标，阈值 1.0/2.0。
+ * ========================================================= */
+
+const SPECTRAL_RISK = {
+  low: ["低风险", "badge-green"],
+  medium: ["中风险", "badge-orange"],
+  high: ["高风险", "badge-red"],
+  none: ["无可比", "badge-gray"],
+};
+
+function spectralRiskBadge(risk) {
+  const [label, cls] = SPECTRAL_RISK[risk] || SPECTRAL_RISK.none;
+  return `<span class="badge ${cls}">${esc(label)}</span>`;
+}
+
+function drawSpectralCurve(canvas, row) {
+  const W = 620, H = 280, PAD = { l: 48, r: 18, t: 34, b: 36 };
+  const ctx = setupCanvas(canvas, W, H);
+  const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue("--label-3").trim() || "#999";
+  const sep = css.getPropertyValue("--separator").trim() || "#ddd";
+  const accent = css.getPropertyValue("--accent").trim() || "#007aff";
+  const purple = css.getPropertyValue("--purple").trim() || "#af52de";
+  const a = row.spectral_a || {};
+  const b = row.spectral_b || {};
+  const allW = [...new Set([...Object.keys(a), ...Object.keys(b)].map(Number))].sort((x, y) => x - y);
+  const allV = [...Object.values(a), ...Object.values(b)].map(Number).filter((v) => Number.isFinite(v));
+  if (!allW.length) {
+    ctx.fillStyle = ink;
+    ctx.font = "12px system-ui";
+    ctx.fillText("没有可比光谱曲线", PAD.l, H / 2);
+    return;
+  }
+  const xMin = allW[0], xMax = allW[allW.length - 1];
+  const yMax = Math.max(1.0, Math.max(...allV) * 1.08, 1.1);
+  const X = (w) => PAD.l + ((w - xMin) / Math.max(1, xMax - xMin)) * (W - PAD.l - PAD.r);
+  const Y = (v) => PAD.t + (1 - Math.min(v, yMax) / yMax) * (H - PAD.t - PAD.b);
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = sep; ctx.lineWidth = 0.8; ctx.font = "10px system-ui";
+  for (const w of [400, 450, 500, 550, 600, 650, 700].filter((w) => w >= xMin && w <= xMax)) {
+    ctx.beginPath(); ctx.moveTo(X(w), PAD.t); ctx.lineTo(X(w), H - PAD.b); ctx.stroke();
+    ctx.fillStyle = ink; ctx.fillText(`${w}`, X(w) - 10, H - PAD.b + 15);
+  }
+  for (const v of [0, 0.25, 0.5, 0.75, 1.0, 1.25].filter((v) => v <= yMax + 0.001)) {
+    ctx.beginPath(); ctx.moveTo(PAD.l, Y(v)); ctx.lineTo(W - PAD.r, Y(v)); ctx.stroke();
+    ctx.fillStyle = ink; ctx.fillText(v.toFixed(2), 8, Y(v) + 3);
+  }
+  ctx.strokeStyle = "rgba(127,127,127,0.55)"; ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(PAD.l, Y(1)); ctx.lineTo(W - PAD.r, Y(1)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  const plot = (series, color) => {
+    const pts = Object.entries(series)
+      .map(([w, v]) => [Number(w), Number(v)])
+      .filter(([w, v]) => Number.isFinite(w) && Number.isFinite(v))
+      .sort(([w1], [w2]) => w1 - w2);
+    if (!pts.length) return;
+    ctx.strokeStyle = color; ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    pts.forEach(([w, v], i) => {
+      const px = X(w), py = Y(v);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.stroke();
+  };
+  plot(a, accent);
+  plot(b, purple);
+
+  ctx.fillStyle = ink; ctx.font = "11px system-ui";
+  ctx.fillText("反射率", 8, PAD.t - 12);
+  ctx.fillText("波长 nm", W - PAD.r - 52, H - 8);
+  ctx.fillStyle = accent;
+  ctx.fillRect(PAD.l, 14, 18, 2.5);
+  ctx.fillText("样本 A", PAD.l + 24, 18);
+  ctx.fillStyle = purple;
+  ctx.fillRect(PAD.l + 96, 14, 18, 2.5);
+  ctx.fillText("样本 B", PAD.l + 120, 18);
+}
+
+function openSpectralModal(row) {
+  const conditions = row.conditions || [];
+  const tableRows = conditions.map((c) => `
+    <tr>
+      <td><b>${esc(c.label || c.condition)}</b></td>
+      <td class="chip-mono">${c.lab_a.map((v) => v.toFixed(2)).join(", ")}</td>
+      <td class="chip-mono">${c.lab_b.map((v) => v.toFixed(2)).join(", ")}</td>
+      <td class="chip-mono"><b>${c.delta_e.toFixed(2)}</b></td>
+      <td>${spectralRiskBadge(c.risk)}</td>
+    </tr>`).join("");
+  const warnings = (row.warnings || []).map((w) => `
+    <div class="issue issue-warn">${icon("warn")}<span>${esc(w)}</span></div>`).join("");
+  const modal = openModal(`
+    <h3 class="card-title">${icon("eye")}光谱曲线 · 色块 ${esc(row.label)}</h3>
+    <p class="swatch-meta" style="margin-top:4px">${esc(row.disclaimer || "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI")}</p>
+    <canvas id="spectral-modal-canvas" class="spectral-canvas"></canvas>
+    <div class="section-title" style="margin:18px 0 6px">各光源 Lab / ΔE00</div>
+    <table class="spectral-table">
+      <thead><tr><th>光源</th><th>样本 A Lab</th><th>样本 B Lab</th><th>ΔE00</th><th>风险</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+    ${warnings ? `<div class="issue-list" style="margin-top:12px">${warnings}</div>` : ""}
+    <div style="display:flex;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-secondary" data-close>关闭</button>
+    </div>
+  `);
+  modal.modal.style.width = "min(760px, 100%)";
+  const canvas = modal.modal.querySelector("#spectral-modal-canvas");
+  const redraw = () => drawSpectralCurve(canvas, row);
+  redraw();
+  observeRedraw(canvas, redraw);
+  modal.modal.querySelector("[data-close]").addEventListener("click", modal.close);
+}
+
+async function renderSpectralCard(view) {
+  const holder = view.querySelector("#qc-spectral-card");
+  let sessions;
+  try {
+    sessions = await apiGet("/api/qc/measurements");
+  } catch (e) {
+    holder.innerHTML = `<div class="card-title">${icon("eye")}光谱 / 同色异谱</div>
+      <div class="gamut-error" style="margin-top:10px">${esc(e.message)}</div>`;
+    return;
+  }
+
+  const summaries = (await Promise.all(
+    sessions.map((s) => apiGet(`/api/spectral/sessions/${encodeURIComponent(s.id)}/summary`).catch(() => null))
+  )).filter((s) => s && s.available);
+
+  if (!summaries.length) {
+    holder.innerHTML = `
+      <div class="card-title">${icon("eye")}光谱 / 同色异谱</div>
+      <div class="empty" style="margin-top:8px">
+        <p class="swatch-meta">还没有含光谱反射率的测量会话。导入 CGATS 光谱数据后，可按 patch label 比较两个会话在
+        D50 / D65 / A / CIE F11 下的 Lab 与 ΔE00，识别同色异谱风险。</p>
+      </div>`;
+    return;
+  }
+
+  const options = summaries.map((s) =>
+    `<option value="${esc(s.id)}">${esc(s.instrument)} · ${s.spectral_patches} 块 · ${esc(s.condition)}</option>`
+  ).join("");
+  holder.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <div class="card-title" style="margin:0">${icon("eye")}光谱 / 同色异谱</div>
+      <span class="chip">4 光源 · 2°</span>
+      <span style="flex:1"></span>
+      <select id="spectral-a" class="input" style="max-width:240px">${options}</select>
+      <span class="swatch-meta">vs</span>
+      <select id="spectral-b" class="input" style="max-width:240px">${options}</select>
+      <button class="btn btn-sm" id="spectral-compare">${icon("compare")}比对</button>
+    </div>
+    <p class="swatch-meta" style="margin-top:8px">按 patch label 匹配光谱；D50/D65/A/CIE F11 各自独立积分，不重采样。
+      风险阈值：≤1.0 low / ≤2.0 medium / &gt;2.0 high。工程指标，不等同 CIE 15 特殊同色异谱指数 MI。</p>
+    <div id="spectral-result" style="margin-top:12px">${skeletonCards(1)}</div>
+  `;
+  const aSel = holder.querySelector("#spectral-a");
+  const bSel = holder.querySelector("#spectral-b");
+  if (summaries.length > 1) bSel.selectedIndex = 1;
+  const resultBox = holder.querySelector("#spectral-result");
+  const compareBtn = holder.querySelector("#spectral-compare");
+
+  const runCompare = async () => {
+    if (aSel.value === bSel.value) {
+      resultBox.innerHTML = `<div class="issue issue-warn">${icon("warn")}<span>请选择两个不同的测量会话</span></div>`;
+      return;
+    }
+    compareBtn.disabled = true;
+    resultBox.innerHTML = `<div style="display:flex;align-items:center;gap:8px"><span class="spinner"></span><span class="swatch-meta">正在匹配光谱并计算多光源 ΔE00…</span></div>`;
+    try {
+      const data = await apiPost("/api/spectral/compare", {
+        session_a: aSel.value,
+        session_b: bSel.value,
+        top_n: 12,
+      });
+      if (!view.isConnected) return;
+      if (!data.matched) {
+        resultBox.innerHTML = `<div class="issue issue-warn">${icon("warn")}<span>${esc((data.warnings || []).join("；") || "两个会话没有共同光谱色块")}</span></div>`;
+        return;
+      }
+      const rows = data.top.slice(0, 10).map((row, i) => `
+        <tr>
+          <td><b>${esc(row.label)}</b></td>
+          <td class="chip-mono">${row.max_delta_e.toFixed(2)}</td>
+          <td>${esc(row.worst_condition)}</td>
+          <td>${spectralRiskBadge(row.risk)}</td>
+          <td><button class="btn btn-ghost btn-sm" data-spectral-row="${i}">曲线</button></td>
+        </tr>`).join("");
+      resultBox.innerHTML = `
+        <div class="spectral-grid">
+          <div class="spectral-metric"><b>${data.max_delta_e.toFixed(2)}</b><span>最大 ΔE00</span></div>
+          <div class="spectral-metric"><b>${esc(data.worst_condition)}</b><span>最差光源</span></div>
+          <div class="spectral-metric"><b>${data.matched}</b><span>匹配色块</span></div>
+          <div class="spectral-metric"><b style="display:flex;align-items:center;gap:8px">${spectralRiskBadge(data.risk)}</b><span>综合风险</span></div>
+        </div>
+        <table class="spectral-table" style="margin-top:10px">
+          <thead><tr><th>色块</th><th>最大 ΔE00</th><th>最差光源</th><th>风险</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        ${(data.warnings || []).length ? `<div class="issue-list" style="margin-top:10px">${data.warnings.slice(0, 3).map((w) =>
+          `<div class="issue issue-warn">${icon("warn")}<span>${esc(w)}</span></div>`).join("")}</div>` : ""}
+        <p class="swatch-meta" style="margin-top:8px">${esc(data.disclaimer)}</p>
+      `;
+      resultBox.querySelectorAll("[data-spectral-row]").forEach((btn) => {
+        btn.addEventListener("click", () => openSpectralModal(data.top[+btn.dataset.spectralRow]));
+      });
+    } catch (e) {
+      if (view.isConnected) {
+        resultBox.innerHTML = `<div class="issue issue-error">${icon("xmark")}<span>${esc(e.message)}</span></div>`;
+      }
+    } finally {
+      compareBtn.disabled = false;
+    }
+  };
+
+  compareBtn.addEventListener("click", runCompare);
+  if (summaries.length > 1) runCompare();
+}
+
 async function renderQcCard(view) {
   const holder = view.querySelector("#qc-ink-card");
   let sessions;
@@ -830,11 +1051,13 @@ export async function renderMonitorView(view) {
     </div>
     <div id="monitor-body">${skeletonCards(4)}</div>
     <div id="qc-measure-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
+    <div id="qc-spectral-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
     <div id="qc-ink-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
     <div id="qc-eval-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
   `;
   // 测量数据卡、QC 卡与主观评价卡独立加载（与配方统计互不阻塞）
   renderMeasurementCard(view);
+  renderSpectralCard(view);
   renderQcCard(view);
   renderEvalCard(view);
 

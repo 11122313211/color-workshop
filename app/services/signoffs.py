@@ -52,6 +52,8 @@ EVIDENCE_KEYS = (
     "evaluation_id",
     "testform",
     "file_name",
+    "passport_id",
+    "passport_hash",
 )
 
 
@@ -109,6 +111,11 @@ def summary(doc: dict) -> dict:
         "locked_at": doc.get("locked_at"),
         "release_token": doc.get("release_token"),
         "history": doc.get("history") or [],
+        "passport": {
+            "id": (doc.get("snapshot") or {}).get("passport_id", ""),
+            "version": (doc.get("snapshot") or {}).get("passport_version", None),
+            "hash": (doc.get("snapshot") or {}).get("passport_hash", ""),
+        },
     }
 
 
@@ -122,6 +129,16 @@ class SignoffStore:
     def create(self, process_doc: dict, title: str = "", job_no: str = "",
                created_by: str = "", evidence: dict | None = None) -> dict:
         now = _now()
+        evidence = _clean_evidence(evidence)
+        passport_id = str(evidence.get("passport_id") or "")
+        passport_hash = str(evidence.get("passport_hash") or "")
+        passport_version = None
+        if passport_id and passport_hash:
+            from .passport import PassportStore
+
+            snapshot = PassportStore().get_by_hash(process_doc.get("id", ""), passport_hash)
+            if snapshot is not None:
+                passport_version = int(snapshot.get("version", 0) or 0)
         doc = {
             "id": _new_id(),
             "process_id": process_doc.get("id", ""),
@@ -131,13 +148,16 @@ class SignoffStore:
             "created_by": (created_by or "").strip(),
             "created_at": now,
             "updated_at": now,
-            "evidence": _clean_evidence(evidence),
+            "evidence": evidence,
             "snapshot": {
                 "process_name": process_doc.get("name", ""),
                 "icc_sha256": process_doc.get("icc_sha256", ""),
                 "device_space": (process_doc.get("icc_meta") or {}).get("device_space", ""),
                 "paper": process_doc.get("paper", ""),
                 "ink": process_doc.get("ink", ""),
+                "passport_id": passport_id,
+                "passport_hash": passport_hash,
+                "passport_version": passport_version,
             },
             "decision": None,
             "history": [],
@@ -247,6 +267,42 @@ class SignoffStore:
                 "snapshot_icc": snapshot_sha,
                 "current_icc": current_sha,
             }
+        snapshot_passport_hash = (latest.get("snapshot") or {}).get("passport_hash", "")
+        passport_status = None
+        if snapshot_passport_hash:
+            from .passport import PassportStore
+
+            store = PassportStore()
+            current_passport = store.latest_snapshot(pid)
+            current_hash = (current_passport or {}).get("passport_hash", "")
+            if current_hash != snapshot_passport_hash:
+                return {
+                    "allowed": False,
+                    "reason": "passport_changed",
+                    "message": "工艺护照已更新或不可用，原签样失效，需重新签样",
+                    "signoff_id": latest["id"],
+                    "snapshot_passport": snapshot_passport_hash,
+                    "current_passport": current_hash,
+                }
+            exposed = store.expose(current_passport, process_doc)
+            passport_status = exposed["status"]
+            if passport_status != "valid":
+                messages = {
+                    "incomplete": "工艺护照证据不完整，需补齐可信测量/校准并重新签样",
+                    "stale": "工艺护照已失效，需刷新护照并重新签样",
+                    "invalid": "工艺护照无效（ICC 缺失或不可读），需修复后重新签样",
+                }
+                return {
+                    "allowed": False,
+                    "reason": f"passport_{passport_status}",
+                    "message": messages.get(passport_status, "工艺护照状态不可放行，需重新签样"),
+                    "signoff_id": latest["id"],
+                    "snapshot_passport": snapshot_passport_hash,
+                    "current_passport": current_hash,
+                    "passport_status": passport_status,
+                    "passport_status_label": exposed.get("status_label", ""),
+                    "passport_status_reasons": exposed.get("status_reasons") or [],
+                }
         return {
             "allowed": True,
             "reason": "approved",
@@ -255,6 +311,8 @@ class SignoffStore:
             "state": latest.get("state"),
             "approval": latest.get("decision"),
             "release_token": latest.get("release_token"),
+            "passport_hash": snapshot_passport_hash or None,
+            "passport_status": passport_status,
         }
 
     def release_manifest(self, process_doc: dict) -> dict:
@@ -263,6 +321,33 @@ class SignoffStore:
         if not gate["allowed"]:
             raise PermissionError(gate["message"])
         doc = self.get(gate["signoff_id"])
+        passport = None
+        snapshot = doc.get("snapshot") or {}
+        passport_hash = snapshot.get("passport_hash", "")
+        if passport_hash:
+            from .passport import PassportStore
+
+            store = PassportStore()
+            version = snapshot.get("passport_version")
+            passport_snapshot = (
+                store.get_version(process_doc.get("id", ""), int(version))
+                if version is not None
+                else None
+            ) or store.get_by_hash(process_doc.get("id", ""), passport_hash)
+            if passport_snapshot:
+                exposed = store.expose(passport_snapshot, process_doc)
+                passport = {
+                    "id": exposed["id"],
+                    "version": exposed["version"],
+                    "passport_hash": exposed["passport_hash"],
+                    "status": exposed["status"],
+                    "status_label": exposed["status_label"],
+                    "generated_at": exposed["generated_at"],
+                    "warnings": len(exposed.get("warnings") or []),
+                    "spectral_risk": (
+                        (exposed.get("evidence") or {}).get("spectral") or {}
+                    ).get("max_risk"),
+                }
         return {
             "generated_at": _now(),
             "gate": gate,
@@ -274,4 +359,5 @@ class SignoffStore:
                 "ink": process_doc.get("ink", ""),
             },
             "signoff": summary(doc),
+            "passport": passport,
         }

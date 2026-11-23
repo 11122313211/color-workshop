@@ -261,10 +261,14 @@ class ProcessOut(BaseModel):
     paper: str = ""
     ink: str = ""
     notes: str = ""
+    #: V0.10：ISO 13655 观测条件类别；空串表示未登记（旧工艺默认值）
+    measurement_condition: str = ""
     icc_size: int = 0
     icc_original_name: str = ""
     icc_meta: dict = {}
     created_at: str = ""
+    #: V0.10：最近护照的轻量摘要（由路由按需注入，旧数据可为空）
+    passport_summary: Optional[dict] = None
 
 
 class RecipeTarget(BaseModel):
@@ -285,6 +289,18 @@ class RecipeResult(BaseModel):
     target_lab: list[float]
     predicted_lab: list[float]
     recipe: dict[str, float] = Field(..., description="配方：通道名 -> 百分比")
+    #: V0.10：这里的 recipe 明确为设备分色值，不是基础油墨调墨配方
+    recipe_kind: str = "device_values"
+    recipe_meta: dict = Field(
+        default_factory=lambda: {
+            "unit": "percent",
+            "basis": "device_channels",
+            "note": "分色值（设备值），不是基础油墨调墨配方",
+        },
+        description="配方语义：单位/基准/说明",
+    )
+    #: V0.10：本次预测落库后的记录 id（用于导出配方单）
+    recipe_id: str = ""
     delta_e: float
     method: str
     tolerance: float
@@ -432,8 +448,108 @@ class SignoffCreateRequest(BaseModel):
     job_no: str = ""
     created_by: str = ""
     evidence: dict = {}
+    #: V0.10：可选关联工艺护照；缺省时保持 V0.9 的 ICC 指纹门禁语义
+    passport_id: str = ""
+    passport_hash: str = ""
 
 
 class SignoffActionRequest(BaseModel):
     actor: str = ""
     note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# V0.10 工艺护照 / 光谱同色异谱
+# ---------------------------------------------------------------------------
+
+class PassportWarning(BaseModel):
+    code: str
+    level: str = "warning"
+    message: str
+
+
+class PassportSummary(BaseModel):
+    passport_id: str
+    version: int
+    passport_hash: str
+    generated_at: str = ""
+    status: str = "incomplete"
+    status_label: str = ""
+    warnings: int = 0
+    spectral_risk: Optional[str] = None
+
+
+class PassportOut(BaseModel):
+    id: str
+    process_id: str
+    version: int
+    passport_hash: str
+    generated_at: str
+    created: bool = False
+    process: dict = {}
+    evidence: dict = {}
+    warnings: list[PassportWarning] = []
+    status: str = "incomplete"
+    status_label: str = ""
+    status_reasons: list[PassportWarning] = []
+
+
+class PassportExport(BaseModel):
+    passport_id: str
+    version: int
+    format: str
+    filename: str
+    content: str
+
+
+class SpectralMetamerismRequest(BaseModel):
+    spectral_a: dict[str, float] = Field(..., description="样本 A：波长(nm) -> 反射率")
+    spectral_b: dict[str, float] = Field(..., description="样本 B：波长(nm) -> 反射率")
+    label_a: str = ""
+    label_b: str = ""
+    conditions: list[str] = Field(
+        default_factory=lambda: ["D50", "D65", "A", "FL11"],
+        description="D50/D65/A/FL11（CIE F11），均为 2° 观察者",
+    )
+
+
+class SpectralConditionOut(BaseModel):
+    condition: str
+    label: str
+    illuminant: str
+    observer: str = "2"
+    lab_a: list[float]
+    lab_b: list[float]
+    delta_e: float
+    risk: str
+
+
+class SpectralMetamerismResponse(BaseModel):
+    label_a: str = ""
+    label_b: str = ""
+    conditions: list[SpectralConditionOut]
+    max_delta_e: float
+    worst_condition: str
+    risk: str
+    risk_label: str
+    warnings: list[str] = []
+    disclaimer: str = "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI"
+
+
+class SpectralCompareRequest(BaseModel):
+    session_a: str
+    session_b: str
+    top_n: int = Field(12, ge=1, le=50)
+
+
+class SpectralCompareResponse(BaseModel):
+    session_a: dict
+    session_b: dict
+    matched: int
+    top: list[dict]
+    max_delta_e: Optional[float] = None
+    worst_condition: str = ""
+    risk: str = "none"
+    risk_label: str = "无可比光谱"
+    warnings: list[str] = []
+    disclaimer: str = "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI"

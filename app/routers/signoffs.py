@@ -65,6 +65,49 @@ def _validate_evidence(process_id: str, raw: dict) -> dict:
     return evidence
 
 
+def _attach_passport(
+    process_doc: dict,
+    passport_id: str,
+    passport_hash: str,
+    evidence: dict,
+) -> dict:
+    """关联护照：必须属于当前工艺、状态 valid，并以快照实际 hash 为准。"""
+    process_id = process_doc["id"]
+    passport_id = (passport_id or "").strip()
+    passport_hash = (passport_hash or "").strip()
+    if not passport_id and not passport_hash:
+        return evidence
+    from ..services.passport import PassportStore
+
+    store = PassportStore()
+    snapshot = None
+    if passport_id:
+        snapshot = store.get_by_id(process_id, passport_id)
+        if snapshot is None:
+            raise HTTPException(422, "passport_id 对应的工艺护照不存在")
+    if passport_hash:
+        by_hash = store.get_by_hash(process_id, passport_hash)
+        if by_hash is None:
+            raise HTTPException(422, "passport_hash 对应的工艺护照不存在")
+        if snapshot is not None and by_hash.get("passport_hash") != snapshot.get("passport_hash"):
+            raise HTTPException(422, "passport_id 与 passport_hash 不匹配")
+        snapshot = snapshot or by_hash
+    exposed = store.expose(snapshot, process_doc)
+    if exposed["status"] != "valid":
+        reasons = "；".join(
+            row.get("message", "") for row in (exposed.get("status_reasons") or [])
+        )
+        detail = (
+            f"仅可关联状态为 valid 的工艺护照（当前 {exposed.get('status_label')}）"
+            + (f"：{reasons}" if reasons else "")
+        )
+        raise HTTPException(422, detail)
+    evidence = {**evidence}
+    evidence["passport_id"] = snapshot.get("id", "") if snapshot else passport_id
+    evidence["passport_hash"] = snapshot.get("passport_hash", "") if snapshot else passport_hash
+    return evidence
+
+
 def _act(signoff_id: str, action: str, req: SignoffActionRequest) -> dict:
     store = SignoffStore()
     try:
@@ -81,6 +124,12 @@ def create_signoff(req: SignoffCreateRequest):
     """创建签样草稿；证据可留空，提交时至少需一项。"""
     proc = _process_or_404(req.process_id)
     evidence = _validate_evidence(proc["id"], req.evidence)
+    evidence = _attach_passport(
+        proc,
+        req.passport_id or str(evidence.get("passport_id") or ""),
+        req.passport_hash or str(evidence.get("passport_hash") or ""),
+        evidence,
+    )
     doc = SignoffStore().create(
         proc,
         title=req.title,

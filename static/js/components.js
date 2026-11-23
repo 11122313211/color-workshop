@@ -279,6 +279,158 @@ export function fetchSpectrum() {
   return _spectrumPromise;
 }
 
+const LOCUS_LABEL_WAVELENGTHS = [460, 500, 540, 580, 620, 700];
+
+function rectsOverlap(a, b) {
+  return !(a.right < b.left || a.left > b.right || a.bottom < b.top || a.top > b.bottom);
+}
+
+/**
+ * 光谱轨迹置顶绘制：先铺背景描边，再叠加波长标注并做碰撞避让。
+ * 返回所有轨迹点的屏幕坐标，供 gamut-view 的悬停命中使用。
+ */
+function drawSpectrumOverlay(ctx, spectrum, px, py, size, pad) {
+  if (!spectrum || !spectrum.locus || spectrum.locus.length < 2) return [];
+  const locus = spectrum.locus;
+  const spectrumPoints = locus.map((point) => ({
+    kind: "spectrum",
+    wavelength: point.wavelength,
+    x: point.x,
+    y: point.y,
+    sx: px(point.x),
+    sy: py(point.y),
+    hex: point.hex,
+  }));
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  const trace = () => {
+    ctx.beginPath();
+    locus.forEach((p, i) => {
+      const x = px(p.x);
+      const y = py(p.y);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+  };
+
+  // 中性底描边把光谱轨迹从密集点云中“托”出来，再按波长着色。
+  trace();
+  ctx.strokeStyle = withAlpha(resolveToken("--bg-elevated"), 0.92);
+  ctx.lineWidth = 6;
+  ctx.stroke();
+  ctx.lineWidth = 2.4;
+  for (let i = 1; i < locus.length; i++) {
+    ctx.beginPath();
+    ctx.strokeStyle = locus[i].hex;
+    ctx.moveTo(px(locus[i - 1].x), py(locus[i - 1].y));
+    ctx.lineTo(px(locus[i].x), py(locus[i].y));
+    ctx.stroke();
+  }
+
+  if (spectrum.purple_line) {
+    const [a, b] = spectrum.purple_line;
+    ctx.beginPath();
+    ctx.strokeStyle = withAlpha(resolveToken("--bg-elevated"), 0.92);
+    ctx.lineWidth = 5;
+    ctx.setLineDash([5, 4]);
+    ctx.moveTo(px(a[0]), py(a[1]));
+    ctx.lineTo(px(b[0]), py(b[1]));
+    ctx.stroke();
+    ctx.strokeStyle = "#c95cd6";
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 波长标注：沿“白点 → 轨迹点”的外法线放置，并用屏幕矩形避让。
+  const centerX = px(0.3127);
+  const centerY = py(0.329);
+  const placed = [];
+  ctx.font = "600 9px ui-monospace, monospace";
+  ctx.textBaseline = "middle";
+  for (const wavelength of LOCUS_LABEL_WAVELENGTHS) {
+    const index = locus.findIndex((p) => p.wavelength === wavelength);
+    if (index < 0) continue;
+    const point = locus[index];
+    const x = px(point.x);
+    const y = py(point.y);
+    let nx = x - centerX;
+    let ny = y - centerY;
+    const norm = Math.hypot(nx, ny) || 1;
+    nx /= norm;
+    ny /= norm;
+    const text = String(wavelength);
+    const textWidth = ctx.measureText(text).width;
+    let selected = null;
+    for (const distance of [10, 15, 21]) {
+      const align = nx < -0.25 ? "right" : nx > 0.25 ? "left" : "center";
+      let anchorX = x + nx * distance;
+      const anchorY = y + ny * distance;
+      let left =
+        align === "right" ? anchorX - textWidth : align === "left" ? anchorX : anchorX - textWidth / 2;
+      let top = anchorY - 5;
+      if (left < pad + 2) {
+        anchorX += pad + 2 - left;
+        left = pad + 2;
+      } else if (left + textWidth > size - pad - 2) {
+        anchorX -= left + textWidth - (size - pad - 2);
+        left = size - pad - 2 - textWidth;
+      }
+      if (top < 2) {
+        top = 2;
+      } else if (top + 10 > size - 2) {
+        top = size - 12;
+      }
+      const rect = {
+        left: left - 2,
+        right: left + textWidth + 2,
+        top,
+        bottom: top + 10,
+      };
+      if (!placed.some((other) => rectsOverlap(rect, other))) {
+        selected = { align, anchorX, anchorY, rect };
+        break;
+      }
+    }
+    if (!selected) continue;
+    placed.push(selected.rect);
+    ctx.beginPath();
+    ctx.strokeStyle = withAlpha(resolveToken("--label-3"), 0.55);
+    ctx.lineWidth = 1;
+    ctx.moveTo(x + nx * 4, y + ny * 4);
+    ctx.lineTo(selected.anchorX, selected.anchorY);
+    ctx.stroke();
+    ctx.textAlign = selected.align;
+    ctx.strokeStyle = withAlpha(resolveToken("--bg-elevated"), 0.96);
+    ctx.lineWidth = 3.2;
+    ctx.strokeText(text, selected.anchorX, selected.anchorY);
+    ctx.fillStyle = withAlpha(resolveToken("--label-2"), 0.92);
+    ctx.fillText(text, selected.anchorX, selected.anchorY);
+  }
+
+  // 白点标注与各图层共用同一套描边，避免在点云上失去可读性。
+  const wx = px(0.3127);
+  const wy = py(0.329);
+  ctx.beginPath();
+  ctx.fillStyle = withAlpha(resolveToken("--bg-elevated"), 0.96);
+  ctx.arc(wx, wy, 5.2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.fillStyle = withAlpha(resolveToken("--label-2"), 0.95);
+  ctx.arc(wx, wy, 2.6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.textAlign = "left";
+  ctx.font = "600 9px ui-monospace, monospace";
+  ctx.strokeStyle = withAlpha(resolveToken("--bg-elevated"), 0.96);
+  ctx.lineWidth = 3.2;
+  ctx.strokeText("D65", wx + 7, wy - 8);
+  ctx.fillStyle = withAlpha(resolveToken("--label-2"), 0.9);
+  ctx.fillText("D65", wx + 7, wy - 8);
+  ctx.restore();
+  return spectrumPoints;
+}
+
 /**
  * 绘制 CIE 1931 xy 色度图。
  * series: [{points: [[x,y]...], color, fill, hull, labPoints, alphaFn, pointSize}]
@@ -334,52 +486,6 @@ export function drawCie(canvas, series, opts = {}) {
   ctx.arc(px(0.3127), py(0.329), 3, 0, Math.PI * 2);
   ctx.fill();
 
-  // 光谱轨迹（逐段光谱色）+ 紫线闭合 + 波长标注
-  const spectrum = opts.spectrum;
-  if (spectrum && spectrum.locus && spectrum.locus.length > 1) {
-    const locus = spectrum.locus;
-    ctx.lineWidth = 2.6;
-    ctx.lineCap = "round";
-    for (let i = 1; i < locus.length; i++) {
-      ctx.beginPath();
-      ctx.strokeStyle = locus[i].hex;
-      ctx.moveTo(px(locus[i - 1].x), py(locus[i - 1].y));
-      ctx.lineTo(px(locus[i].x), py(locus[i].y));
-      ctx.stroke();
-    }
-    // 紫线：380nm → 700nm 直线闭合
-    if (spectrum.purple_line) {
-      const [a, b] = spectrum.purple_line;
-      ctx.beginPath();
-      ctx.strokeStyle = "#c95cd6";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([5, 4]);
-      ctx.moveTo(px(a[0]), py(a[1]));
-      ctx.lineTo(px(b[0]), py(b[1]));
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    // 关键波长标注（置于轨迹外侧）
-    ctx.fillStyle = withAlpha(resolveToken("--label-2"), 0.8);
-    ctx.font = "9px ui-monospace, monospace";
-    for (const wl of [460, 500, 540, 580, 620, 660, 700]) {
-      const p = locus.find((q) => q.wavelength === wl);
-      if (!p) continue;
-      const x = px(p.x);
-      const y = py(p.y);
-      // 依位置决定标注偏移方向（大致朝远离轨迹的一侧）
-      let dx = 0, dy = 0, align = "center";
-      if (wl <= 470) { dx = -4; align = "right"; }
-      else if (wl <= 510) { dy = -6; }
-      else if (wl <= 560) { dx = -2; dy = -6; align = "right"; }
-      else if (wl <= 620) { dx = 2; dy = -6; }
-      else { dx = 6; dy = 3; align = "left"; }
-      ctx.textAlign = align;
-      ctx.fillText(String(wl), x + dx, y + dy);
-    }
-    ctx.textAlign = "left";
-  }
-
   // 系列（色域多边形 / 凸包 / 点集）
   for (const s of series) {
     if (!s.points || !s.points.length) continue;
@@ -407,11 +513,11 @@ export function drawCie(canvas, series, opts = {}) {
       ctx.strokeStyle = solid;
       ctx.lineWidth = 1.6;
       ctx.stroke();
-    } else if (s.labPoints && s.labPoints.length === s.points.length) {
+    } else if (!s.hidePoints && s.labPoints && s.labPoints.length === s.points.length) {
       // L* 真彩点云（数据即色）：支持逐点 alpha（L* 切片淡出）
       const r = s.pointSize ?? 1.8;
       for (let i = 0; i < s.points.length; i++) {
-        const alpha = s.alphaFn ? s.alphaFn(i) : 0.85;
+        const alpha = s.alphaFn ? s.alphaFn(i) : (s.pointAlpha ?? 0.85);
         if (alpha <= 0.01) continue;
         const [x, y] = s.points[i];
         ctx.fillStyle = withAlpha(labToCss(s.labPoints[i]), alpha);
@@ -419,7 +525,7 @@ export function drawCie(canvas, series, opts = {}) {
         ctx.arc(px(x), py(y), r, 0, Math.PI * 2);
         ctx.fill();
       }
-    } else {
+    } else if (!s.hidePoints) {
       ctx.fillStyle = withAlpha(s.color, s.dotAlpha ?? 0.4);
       for (const [x, y] of s.points) {
         ctx.beginPath();
@@ -429,7 +535,24 @@ export function drawCie(canvas, series, opts = {}) {
     }
   }
 
-  return { size, scale, toScreen: (x, y) => [px(x), py(y)] };
+  // 凸包轮廓最后再描一遍，避免被高密度采样点盖住边界。
+  for (const s of series) {
+    if (!s.hull || s.hull.length < 3) continue;
+    ctx.beginPath();
+    s.hull.forEach((idx, i) => {
+      const [x, y] = s.points[idx];
+      i ? ctx.lineTo(px(x), py(y)) : ctx.moveTo(px(x), py(y));
+    });
+    ctx.closePath();
+    ctx.strokeStyle = withAlpha(s.color, 1);
+    ctx.lineWidth = s.hullWidth ?? 2;
+    ctx.stroke();
+  }
+
+  // 光谱轨迹最后绘制，确保不会被填充色域或点云遮住；标注带背景描边与碰撞避让。
+  const spectrumPoints = drawSpectrumOverlay(ctx, opts.spectrum, px, py, size, PAD);
+
+  return { size, scale, spectrumPoints, toScreen: (x, y) => [px(x), py(y)] };
 }
 
 /* ---------- 模态（Esc / 焦点圈闭 / 焦点还原 / aria） ---------- */

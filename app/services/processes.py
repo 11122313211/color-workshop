@@ -39,6 +39,9 @@ DEVICE_CLASS_NAMES = {
 # 设备色彩空间 -> 通道数
 SPACE_CHANNELS = {"CMYK": 4, "RGB": 3, "GRAY": 1, "Lab": 3, "XYZ": 3}
 
+#: V0.10 工艺可登记的测量条件（ISO 13655）；空串表示未登记
+PROCESS_MEASUREMENT_CONDITIONS = ("", "M0", "M1", "M2")
+
 
 def detect_device_space(icc: bytes) -> str:
     """从 ICC 头部探测设备色彩空间。
@@ -86,7 +89,10 @@ class ProcessStore:
         ink: str = "",
         notes: str = "",
         filename: str = "",
+        measurement_condition: str = "",
     ) -> dict:
+        if measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS:
+            raise ValueError("measurement_condition 仅支持空串 / M0 / M1 / M2")
         pid = uuid.uuid4().hex[:12]
         icc_file = f"{pid}.icc"
         (PROFILE_DIR / icc_file).write_bytes(icc_bytes)
@@ -96,6 +102,7 @@ class ProcessStore:
             "paper": paper,
             "ink": ink,
             "notes": notes,
+            "measurement_condition": measurement_condition,
             "icc_file": icc_file,
             "icc_original_name": filename or icc_file,
             "icc_size": len(icc_bytes),
@@ -107,12 +114,20 @@ class ProcessStore:
         return doc
 
     def get(self, pid: str) -> dict | None:
-        return self._store.get(pid)
+        doc = self._store.get(pid)
+        return self._with_defaults(doc) if doc else None
 
     def list(self) -> list[dict]:
-        docs = list(self._store.all().values())
+        docs = [self._with_defaults(d) for d in self._store.all().values()]
         docs.sort(key=lambda d: d.get("created_at", ""), reverse=True)
         return docs
+
+    @staticmethod
+    def _with_defaults(doc: dict) -> dict:
+        """旧工艺读取兼容：不写盘，仅补 V0.10 缺省字段。"""
+        out = {**doc}
+        out.setdefault("measurement_condition", "")
+        return out
 
     def delete(self, pid: str) -> bool:
         doc = self._store.get(pid)
@@ -125,7 +140,15 @@ class ProcessStore:
             pass
         return True
 
-    def update(self, pid: str, name=None, paper=None, ink=None, notes=None) -> dict | None:
+    def update(
+        self,
+        pid: str,
+        name=None,
+        paper=None,
+        ink=None,
+        notes=None,
+        measurement_condition=None,
+    ) -> dict | None:
         """编辑工艺元数据（None 字段保持不变）。"""
         doc = self._store.get(pid)
         if not doc:
@@ -138,8 +161,12 @@ class ProcessStore:
             doc["ink"] = ink
         if notes is not None:
             doc["notes"] = notes
+        if measurement_condition is not None:
+            if measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS:
+                raise ValueError("measurement_condition 仅支持空串 / M0 / M1 / M2")
+            doc["measurement_condition"] = measurement_condition
         self._store.put(pid, doc)
-        return doc
+        return self._with_defaults(doc)
 
     def replace_icc(self, pid: str, icc_bytes: bytes, filename: str = "") -> dict:
         """替换 ICC 文件：覆盖落盘 + 重解析元数据 + 更新 sha 指纹。

@@ -383,6 +383,33 @@ html[data-theme="dark"] .swatch { box-shadow: inset 0 0 0 1px rgba(255, 255, 255
 .kv dt { color: var(--label-2); }
 .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; word-break: break-all; }
 
+/* V0.10 工艺护照 / 光谱证据 */
+.passport-summary-row {
+  display: flex; gap: 8px 18px; flex-wrap: wrap; align-items: center;
+  margin-top: 12px; font-size: 12px; color: var(--label-2);
+}
+.passport-summary-row b { color: var(--label); font-family: var(--mono); }
+.passport-card .card-title { white-space: nowrap; }
+.spectral-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px; margin-top: 12px;
+}
+.spectral-metric {
+  border-radius: 12px; background: var(--fill); padding: 12px 14px;
+}
+.spectral-metric b {
+  display: block; font-size: 20px; font-family: var(--mono);
+  letter-spacing: -0.4px; color: var(--label);
+}
+.spectral-metric span { font-size: 11px; color: var(--label-3); }
+.spectral-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.spectral-table th, .spectral-table td {
+  padding: 7px 6px; text-align: left; border-bottom: 1px solid var(--separator);
+}
+.spectral-table th { color: var(--label-3); font-weight: 600; }
+.spectral-table tr:last-child td { border-bottom: none; }
+.spectral-canvas { width: 100%; display: block; margin-top: 8px; }
+
 /* 拖放上传 */
 .dropzone {
   border: 1.5px dashed var(--separator); border-radius: var(--radius-card);
@@ -477,20 +504,44 @@ html[data-theme="dark"] .swatch { box-shadow: inset 0 0 0 1px rgba(255, 255, 255
 .head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .icon-btn.btn-back:hover { background: var(--fill-2); color: var(--label) !important; }
 .gamut-card-head {
-  display: flex; align-items: baseline; justify-content: space-between;
-  gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px 16px; flex-wrap: wrap; margin-bottom: 4px;
 }
 .gamut-card-head .card-title { margin: 0; }
-.gamut-card-head .cie-legend { margin: 0; }
+.gamut-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .legend-srgb { background: var(--accent); }
 .legend-proc { background: var(--indigo); }
 
 /* ---------- 色域视图组件（2D/3D） ---------- */
 .gamut-view { display: flex; flex-direction: column; gap: 8px; }
-.gamut-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.gamut-hint { font-size: 12px; color: var(--label-3); }
+.gamut-toolbar { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; min-height: 32px; }
+.gamut-legend { display: flex; align-items: center; gap: 2px 6px; flex-wrap: wrap; }
+.gamut-layer-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 8px; border: 1px solid transparent;
+  border-radius: 999px; background: transparent; color: var(--label-2);
+  font: inherit; font-size: 12px; cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+.gamut-layer-toggle:hover:not(:disabled) { background: var(--fill); color: var(--label); }
+.gamut-layer-toggle.is-off { color: var(--label-3); }
+.gamut-layer-toggle.is-off .gamut-dot { filter: grayscale(1); opacity: 0.35; }
+.gamut-layer-toggle:disabled { opacity: 0.42; cursor: not-allowed; }
+.gamut-key-item {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 4px; font-size: 12px; color: var(--label-2); white-space: nowrap;
+}
+.gamut-dot {
+  width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%;
+  display: inline-block; transition: filter 0.15s ease, opacity 0.15s ease;
+}
+.gamut-dot-spectrum { background: linear-gradient(90deg, #4400ff, #00ff00, #ff0000); }
+.gamut-dot-srgb { background: var(--accent); }
+.gamut-dot-proc { background: var(--indigo); }
+.gamut-dot-hull { background: transparent; box-shadow: inset 0 0 0 1.5px var(--indigo); }
+.gamut-hint { margin-left: auto; font-size: 12px; color: var(--label-3); }
 .gamut-stage {
-  position: relative; width: 100%;
+  position: relative; width: 100%; aspect-ratio: 1 / 1; max-height: 520px;
   background: var(--bg-elevated);
   border: 1px solid var(--separator);
   border-radius: var(--radius-card);
@@ -506,12 +557,17 @@ html[data-theme="dark"] .swatch { box-shadow: inset 0 0 0 1px rgba(255, 255, 255
 .gamut-stage.mode-3d .gamut-canvas { cursor: grab; }
 .gamut-render-badge { color: var(--label-2); }
 .gamut-loading {
-  display: flex; align-items: center; gap: 10px; padding: 40px 20px;
+  position: absolute; inset: 0; z-index: 2;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 20px; background: var(--bg-elevated); text-align: center;
   color: var(--label-2); font-size: 13px;
 }
 /* class 设了 display 会覆盖 hidden 属性，显式兜底 */
 .gamut-loading[hidden], .gamut-canvas[hidden], .gamut-tip[hidden] { display: none !important; }
-.gamut-error { padding: 28px 20px; color: var(--red); font-size: 13px; }
+.gamut-error {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  padding: 24px; color: var(--red); font-size: 13px; text-align: center;
+}
 .gamut-tip {
   position: absolute; z-index: 5; pointer-events: none;
   background: var(--card); border: 1px solid var(--separator);
@@ -519,6 +575,8 @@ html[data-theme="dark"] .swatch { box-shadow: inset 0 0 0 1px rgba(255, 255, 255
   padding: 6px 10px; font-size: 12px; font-family: var(--mono);
   white-space: nowrap; color: var(--label);
 }
+.gamut-tip b { display: block; margin-bottom: 1px; }
+.gamut-tip-sub { display: block; color: var(--label-2); font-size: 11px; }
 .gamut-controls {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   font-size: 13px; color: var(--label-2);
@@ -599,6 +657,12 @@ html[data-theme="dark"] .swatch { box-shadow: inset 0 0 0 1px rgba(255, 255, 255
   .process-stats { grid-template-columns: repeat(3, 1fr); }
   .head-actions { flex-wrap: wrap; }
   .lab-row { grid-template-columns: minmax(70px, 1fr) 1fr 1fr 1fr 32px; }
+  .gamut-card-head { align-items: flex-start; }
+  .gamut-actions { flex: 1 1 100%; }
+  .gamut-toolbar { gap: 8px; }
+  .gamut-hint { flex-basis: 100%; margin-left: 0; font-size: 11px; }
+  .gamut-layer-toggle { height: 28px; padding: 0 7px; }
+  .gamut-key-item { padding: 0 2px; }
   .gamut-controls { font-size: 12px; }
   .gamut-slice { flex-basis: 140px; }
   .modal { width: 100%; }

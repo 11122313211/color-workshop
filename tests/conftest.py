@@ -12,12 +12,16 @@ from __future__ import annotations
 import os
 import struct
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
 
 # 必须先于任何 app.* 导入设定数据目录（conftest 先于测试模块加载）
-_TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="colorforge-test-data-"))
+# 注：Windows 沙箱下 tempfile.mkdtemp 会创建 ACL 受限目录，后续无法 mkdir；
+# 使用普通目录创建，仍位于系统临时目录，并保留 session 隔离。
+_TEST_DATA_DIR = Path(tempfile.gettempdir()) / f"colorforge-test-data-{uuid.uuid4().hex[:8]}"
+_TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["COLORFORGE_DATA_DIR"] = str(_TEST_DATA_DIR)
 
 FIXTURE_ICC_DIR = Path(__file__).resolve().parent / "fixtures" / "icc"

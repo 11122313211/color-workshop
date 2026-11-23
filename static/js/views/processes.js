@@ -174,6 +174,7 @@ function cardHtml(p) {
     <div class="proc-chips">
       <span class="badge ${space === "CMYK" ? "badge-blue" : space === "GRAY" ? "badge-gray" : "badge-gray"}">${space} · ${p.icc_meta.channels}通道</span>
       ${p.paper ? `<span class="chip">${esc(p.paper)}</span>` : ""}
+      ${p.measurement_condition ? `<span class="chip chip-mono">${esc(p.measurement_condition)}</span>` : ""}
     </div>
     <div class="process-stats">
       <div><b>${s ? formatVolume(s.volume) : "—"}</b><span>色域体积</span></div>
@@ -244,6 +245,16 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
         <div class="field"><label>纸张</label><input class="input" id="pe-paper" maxlength="80" placeholder="铜版纸 157g" value="${isEdit ? esc(process.paper || "") : ""}"></div>
         <div class="field"><label>墨水</label><input class="input" id="pe-ink" maxlength="80" placeholder="标准四色 / 专色扩展" value="${isEdit ? esc(process.ink || "") : ""}"></div>
       </div>
+      <div class="field-row" style="margin-top:10px">
+        <div class="field"><label>测量条件（工艺护照）</label>
+          <select class="input" id="pe-condition">
+            <option value="">未登记</option>
+            <option value="M0">M0 · 未滤紫外</option>
+            <option value="M1">M1 · 含紫外（D50）</option>
+            <option value="M2">M2 · 排除紫外</option>
+          </select>
+        </div>
+      </div>
       <div class="field" style="margin-top:10px"><label>备注</label><input class="input" id="pe-notes" maxlength="300" placeholder="驱动设置、印刷条件等" value="${isEdit ? esc(process.notes || "") : ""}"></div>
     </div>
     <div data-role="icc-area" style="margin-top:14px">
@@ -276,6 +287,8 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
   const modal = m.modal;
   const okBtn = modal.querySelector("#pe-ok");
   const nameInput = modal.querySelector("#pe-name");
+  const condSelect = modal.querySelector("#pe-condition");
+  if (isEdit && process.measurement_condition) condSelect.value = process.measurement_condition;
   let upMode = "single";
 
   const readForm = () => ({
@@ -283,6 +296,7 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
     paper: modal.querySelector("#pe-paper").value.trim(),
     ink: modal.querySelector("#pe-ink").value.trim(),
     notes: modal.querySelector("#pe-notes").value.trim(),
+    measurement_condition: condSelect.value,
   });
 
   /* —— 文件选择（单个：一个 iccFile；批量：文件队列）—— */
@@ -386,7 +400,11 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
       renderQueue();
       try {
         const buf = await fileToArrayBuffer(q.file);
-        q.doc = await apiUploadICC(new Uint8Array(buf), { name: q.name || q.file.name, filename: q.file.name }, {
+        q.doc = await apiUploadICC(new Uint8Array(buf), {
+          name: q.name || q.file.name,
+          filename: q.file.name,
+          measurement_condition: readForm().measurement_condition,
+        }, {
           onProgress: (pct) => {
             q.pct = pct;
             const row = queueBox.querySelector(`.uq-row[data-i="${i}"] .uq-status`);
@@ -592,7 +610,158 @@ function calibrationHistoryCard(hist) {
     </div>`;
 }
 
+/* ---------- 工艺护照（V0.10）：版本化色彩证据 ---------- */
+
+const PASSPORT_STATUS = {
+  valid: ["有效", "badge-green"],
+  incomplete: ["证据不完整", "badge-orange"],
+  stale: ["已失效", "badge-red"],
+  invalid: ["无效", "badge-red"],
+};
+
+const SPECTRAL_RISK = {
+  low: ["低风险", "badge-green"],
+  medium: ["中风险", "badge-orange"],
+  high: ["高风险", "badge-red"],
+  none: ["未评估", "badge-gray"],
+};
+
+function passportBadge(status, label = "") {
+  const [defaultLabel, cls] = PASSPORT_STATUS[status] || ["未生成", "badge-gray"];
+  return `<span class="badge ${cls}">${icon(status === "valid" ? "check" : status === "incomplete" ? "warn" : "xmark")}${esc(label || defaultLabel)}</span>`;
+}
+
+function spectralRiskBadge(risk) {
+  const [label, cls] = SPECTRAL_RISK[risk] || SPECTRAL_RISK.none;
+  return `<span class="badge ${cls}">${esc(label)}</span>`;
+}
+
+function passportCard(p, latest) {
+  if (!latest) {
+    return `<div class="card" style="padding:14px 16px; margin-top:12px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="card-title" style="margin:0">${icon("doc")}工艺护照</span>
+        <span class="badge badge-gray">未生成</span>
+        <span style="flex:1"></span>
+        <button class="btn btn-sm" data-pp="refresh">${icon("plus")}生成护照</button>
+      </div>
+      <p class="swatch-meta" style="margin-top:8px">把 ICC、补偿、校准轮次、可信测量、配方统计与光谱风险固化为不可变版本；签样可通过 hash 引用护照。</p>
+    </div>`;
+  }
+  const evidence = latest.evidence || {};
+  const measurements = evidence.measurements || {};
+  const calibration = evidence.calibration || {};
+  const recipes = evidence.recipes || {};
+  const spectral = evidence.spectral || {};
+  const warnings = latest.warnings || [];
+  const reasons = latest.status_reasons || [];
+  const visibleWarnings = [...reasons, ...warnings].slice(0, 3);
+  const warningHtml = visibleWarnings.length
+    ? `<div class="issue-list" style="margin-top:10px">${visibleWarnings.map((w) => `
+        <div class="issue ${w.level === "error" ? "issue-error" : w.level === "info" ? "issue-info" : "issue-warn"}">
+          ${icon(w.level === "error" ? "xmark" : w.level === "info" ? "info" : "warn")}<span>${esc(w.message)}</span>
+        </div>`).join("")}</div>`
+    : "";
+  return `<div class="card passport-card" style="margin-top:12px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span class="card-title" style="margin:0">${icon("doc")}工艺护照</span>
+      ${passportBadge(latest.status, latest.status_label)}
+      <span class="chip chip-mono">v${latest.version}</span>
+      <span class="chip chip-mono" title="${esc(latest.passport_hash)}">#${esc((latest.passport_hash || "").slice(0, 12))}</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-sm" data-pp="refresh">${icon("refresh")}生成 / 刷新</button>
+      <a class="btn btn-secondary btn-sm" href="/api/processes/${encodeURIComponent(p.id)}/passport/${latest.version}/export?format=json" download>${icon("download")}JSON</a>
+      <a class="btn btn-secondary btn-sm" href="/api/processes/${encodeURIComponent(p.id)}/passport/${latest.version}/export?format=md" download>${icon("download")}MD</a>
+      <button class="btn btn-secondary btn-sm" data-pp="detail">查看详情</button>
+    </div>
+    <div class="passport-summary-row">
+      <span>可信测量 <b>${measurements.verified_records ?? 0}</b> 条</span>
+      <span>校准 <b>${calibration.rounds ?? 0}</b> 轮</span>
+      <span>配方 <b>${recipes.total ?? 0}</b> 条</span>
+      <span>光谱 <b>${spectral.spectral_patches ?? 0}</b> 块</span>
+      <span>光谱风险 ${spectralRiskBadge(spectral.max_risk)}</span>
+    </div>
+    <div class="swatch-meta" style="margin-top:8px">生成于 ${esc(latest.generated_at || "-")} · 快照内容不变时重复生成不会新增版本</div>
+    ${warningHtml}
+    <p class="swatch-meta" style="margin-top:8px">${esc(spectral.disclaimer || "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI")}</p>
+  </div>`;
+}
+
+function openPassportDetail(latest) {
+  if (!latest) return;
+  const evidence = latest.evidence || {};
+  const icc = evidence.icc || {};
+  const comp = evidence.compensation || {};
+  const cal = evidence.calibration || {};
+  const meas = evidence.measurements || {};
+  const recipes = evidence.recipes || {};
+  const spectral = evidence.spectral || {};
+  const warnings = latest.warnings || [];
+  const reasons = latest.status_reasons || [];
+  const m = openModal(`
+    <h3 class="card-title">${icon("doc")}工艺护照 · ${esc((latest.process || {}).name || "")}</h3>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 14px">
+      ${passportBadge(latest.status, latest.status_label)}
+      <span class="chip chip-mono">v${latest.version}</span>
+      <span class="swatch-meta">${esc(latest.generated_at || "")}</span>
+    </div>
+    <dl class="kv">
+      <dt>Passport hash</dt><dd>${esc(latest.passport_hash)}</dd>
+      <dt>测量条件</dt><dd>${esc((latest.process || {}).measurement_condition || "未登记")}</dd>
+      <dt>ICC</dt><dd>${esc(icc.sha256 || "")} · ${esc(icc.device_space || "")} ${icc.channels || ""}CH</dd>
+      <dt>补偿模型</dt><dd>n=${comp.n ?? 0} · 匹配当前 ICC：${comp.matches_current_icc ? "是" : "否"}</dd>
+      <dt>校准轮次</dt><dd>${cal.rounds ?? 0} 轮${cal.latest_round_id ? ` · ${esc(cal.latest_round_id)}` : ""}</dd>
+      <dt>可信测量</dt><dd>${meas.verified_records ?? 0} 条 / ${meas.sessions ?? 0} 会话</dd>
+      <dt>配方历史</dt><dd>${recipes.total ?? 0} 条 · 达标率 ${recipes.pass_rate == null ? "-" : Math.round(recipes.pass_rate * 100) + "%"}</dd>
+      <dt>光谱覆盖</dt><dd>${spectral.spectral_patches ?? 0} 块 · ${spectral.wavelength_min ?? "-"}–${spectral.wavelength_max ?? "-"} nm · 可比较会话 ${spectral.comparable_sessions ?? 0}</dd>
+      <dt>最高光谱风险</dt><dd>${esc(spectral.max_risk || "none")}${spectral.worst_condition ? ` · ${esc(spectral.worst_condition)}` : ""}${spectral.max_delta_e != null ? ` · ΔE ${spectral.max_delta_e}` : ""}</dd>
+    </dl>
+    ${reasons.length ? `<div class="section-title" style="margin:18px 2px 8px">状态原因</div>
+      <div class="issue-list">${reasons.map((w) => `<div class="issue issue-error">${icon("xmark")}<span>${esc(w.message)}</span></div>`).join("")}</div>` : ""}
+    ${warnings.length ? `<div class="section-title" style="margin:18px 2px 8px">警告</div>
+      <div class="issue-list">${warnings.map((w) => `<div class="issue ${w.level === "error" ? "issue-error" : w.level === "info" ? "issue-info" : "issue-warn"}">${icon(w.level === "error" ? "xmark" : w.level === "info" ? "info" : "warn")}<span>${esc(w.message)}</span></div>`).join("")}</div>` : ""}
+    <div class="issue issue-info" style="margin-top:14px">${icon("info")}<span>${esc(spectral.disclaimer || "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI")}</span></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button class="btn btn-secondary" data-close>关闭</button>
+    </div>
+  `);
+  m.modal.style.width = "min(700px, 100%)";
+  m.modal.querySelector("[data-close]").addEventListener("click", m.close);
+}
+
+async function renderPassportSlot(view, p) {
+  const slot = view.querySelector("#passport-slot");
+  if (!slot) return;
+  let latest = null;
+  try {
+    latest = await apiGet(`/api/processes/${encodeURIComponent(p.id)}/passport`);
+  } catch (e) {
+    if (!String(e.message).includes("尚未生成")) {
+      slot.innerHTML = `<div class="card passport-card" style="margin-top:12px"><div class="issue issue-warn">${icon("warn")}<span>${esc(e.message)}</span></div></div>`;
+      return;
+    }
+  }
+  if (!view.isConnected) return;
+  slot.innerHTML = passportCard(p, latest);
+  const card = slot.querySelector(".passport-card");
+  if (!card) return;
+  card.querySelector('[data-pp="refresh"]')?.addEventListener("click", async (event) => {
+    const btn = event.currentTarget;
+    btn.disabled = true;
+    try {
+      const next = await apiPost(`/api/processes/${encodeURIComponent(p.id)}/passport`, {});
+      toast(next.created ? `护照 v${next.version} 已生成` : `内容未变，沿用护照 v${next.version}`, "ok");
+      await renderPassportSlot(view, p);
+    } catch (e) {
+      toast(e.message, "err");
+      btn.disabled = false;
+    }
+  });
+  card.querySelector('[data-pp="detail"]')?.addEventListener("click", () => openPassportDetail(latest));
+}
+
 /* ---------- 签样与放行（V0.9 · P0-3）：draft→pending→approved→locked ---------- */
+
 
 const SIGNOFF_STATE = {
   draft: ["草稿", "badge badge-gray"],
@@ -612,6 +781,7 @@ const SIGNOFF_ACTION = {
 
 function evidenceText(ev = {}) {
   const bits = [];
+  if (ev.passport_hash) bits.push(`工艺护照 #${esc(ev.passport_hash.slice(0, 10))}`);
   if (ev.calibration_session_id) bits.push(`校准会话 ${esc(ev.calibration_session_id)}`);
   if (ev.measurement_session_id) bits.push(`测量会话 ${esc(ev.measurement_session_id)}`);
   if (ev.evaluation_id) bits.push(`主观评价 ${esc(ev.evaluation_id)}`);
@@ -632,12 +802,16 @@ function signoffActions(latest) {
       <button class="btn btn-secondary btn-sm" data-sg="reject">${icon("xmark")}驳回</button>
       <button class="btn btn-ghost btn-sm" data-sg="withdraw">撤回</button>`;
   }
-  if (state === "approved") return `<button class="btn btn-sm" data-sg="lock">${icon("check")}锁定签样</button>`;
+  if (state === "approved") {
+    return `<button class="btn btn-sm" data-sg="lock">${icon("check")}锁定签样</button>
+      <button class="btn btn-secondary btn-sm" data-sg="create">${icon("plus")}重新签样</button>`;
+  }
   if (state === "rejected") {
     return `<button class="btn btn-sm" data-sg="submit">${icon("refresh")}重新提交</button>`;
   }
   if (state === "locked") {
-    return `<button class="btn btn-secondary btn-sm" data-sg="manifest">${icon("download")}交接清单</button>`;
+    return `<button class="btn btn-secondary btn-sm" data-sg="manifest">${icon("download")}交接清单</button>
+      <button class="btn btn-secondary btn-sm" data-sg="create">${icon("plus")}重新签样</button>`;
   }
   return "";
 }
@@ -650,11 +824,18 @@ function signoffCard(rows, gate) {
   const gateLine = gate.allowed
     ? `<span style="color:var(--green);display:inline-flex;align-items:center;gap:6px">${icon("check")}${esc(gate.message)}</span>`
     : `<span style="color:var(--orange);display:inline-flex;align-items:center;gap:6px">${icon("warn")}${esc(gate.message)}</span>`;
+  const passportGate = String(gate.reason || "").startsWith("passport_");
+  const gateExtra = passportGate
+    ? `<div class="swatch-meta" style="margin-top:6px">签样护照 <span class="chip chip-mono">${esc((gate.snapshot_passport || "").slice(0, 10) || "—")}</span>
+        当前最新护照 <span class="chip chip-mono">${esc((gate.current_passport || "").slice(0, 10) || "—")}</span>
+        ${gate.passport_status ? passportBadge(gate.passport_status, gate.passport_status_label) : ""}</div>`
+    : "";
   const detail = latest ? `
     <dl class="kv" style="margin-top:10px">
       <dt>标题 / 工单</dt><dd>${esc(latest.title)}${latest.job_no ? ` · ${esc(latest.job_no)}` : ""}</dd>
       <dt>依据</dt><dd>${evidenceText(latest.evidence)}</dd>
       <dt>快照 ICC</dt><dd><span class="chip chip-mono">${(latest.snapshot.icc_sha256 || "").slice(0, 8)}</span></dd>
+      ${latest.snapshot.passport_hash ? `<dt>关联护照</dt><dd><span class="chip chip-mono">v${latest.snapshot.passport_version ?? "?"} · #${esc(latest.snapshot.passport_hash.slice(0, 10))}</span></dd>` : ""}
       ${latest.decision ? `<dt>${latest.decision.action === "approve" ? "批准" : "驳回"}</dt><dd>${esc(latest.decision.by)} · ${esc(latest.decision.at)}${latest.decision.note ? ` · ${esc(latest.decision.note)}` : ""}</dd>` : ""}
       <dt>最近更新</dt><dd>${esc(latest.updated_at)}</dd>
     </dl>`
@@ -669,6 +850,7 @@ function signoffCard(rows, gate) {
         <div style="display:flex;gap:8px;flex-wrap:wrap">${signoffActions(latest)}</div>
       </div>
       <div style="margin-top:8px;font-size:13px">${gateLine}</div>
+      ${gateExtra}
       ${detail}
     </div>`;
 }
@@ -682,6 +864,10 @@ function openSignoffCreate(p, onDone) {
       <div class="field"><label>创建人</label><input class="input" id="sg-by" maxlength="40" placeholder="姓名"></div>
     </div>
     <div class="field" style="margin-top:10px"><label>样张 / 文件标识</label><input class="input" id="sg-file" maxlength="120" placeholder="如 封面-v3.pdf、校准样张第 2 轮"></div>
+    <div class="field" style="margin-top:10px"><label>关联工艺护照（可选）</label>
+      <select class="input" id="sg-passport"><option value="">不关联（沿用 V0.9 ICC 指纹门禁）</option></select>
+      <p class="swatch-meta" style="margin-top:4px">关联后签样会固化护照 hash；最新护照变化时门禁返回 <b>passport_changed</b>，旧签样失效。</p>
+    </div>
     <div class="field" style="margin-top:10px"><label>关联测量会话（可选）</label><input class="input" id="sg-session" placeholder="sess_xxx"></div>
     <div class="field" style="margin-top:10px"><label>关联主观评价（可选）</label><input class="input" id="sg-eval" placeholder="ev_xxx"></div>
     <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
@@ -689,16 +875,32 @@ function openSignoffCreate(p, onDone) {
       <button class="btn" id="sg-create">${icon("plus")}创建草稿</button>
     </div>
   `);
+  apiGet(`/api/processes/${encodeURIComponent(p.id)}/passport`).then((pp) => {
+    const sel = m.modal.querySelector("#sg-passport");
+    if (!sel || !pp) return;
+    const opt = document.createElement("option");
+    const eligible = pp.status === "valid";
+    opt.value = pp.id;
+    opt.dataset.hash = pp.passport_hash;
+    opt.disabled = !eligible;
+    opt.textContent = `v${pp.version} · #${pp.passport_hash.slice(0, 10)} · ${pp.status_label}${eligible ? "" : " · 不可关联"}`;
+    sel.appendChild(opt);
+  }).catch(() => {});
   m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
   m.modal.querySelector("#sg-create").addEventListener("click", async () => {
     const evidence = {};
     const file = m.modal.querySelector("#sg-file").value.trim();
     const session = m.modal.querySelector("#sg-session").value.trim();
     const evalId = m.modal.querySelector("#sg-eval").value.trim();
+    const passportSel = m.modal.querySelector("#sg-passport");
+    const passportId = passportSel.value;
+    const passportHash = passportSel.selectedOptions[0]?.dataset.hash || "";
     if (file) evidence.file_name = file;
     if (session) evidence.measurement_session_id = session;
     if (evalId) evidence.evaluation_id = evalId;
-    if (!Object.keys(evidence).length) return toast("请至少填写一项依据（文件 / 会话 / 评价）", "warn");
+    if (!Object.keys(evidence).length && !passportId) {
+      return toast("请至少填写一项依据（文件 / 会话 / 评价 / 工艺护照）", "warn");
+    }
     try {
       await apiPost("/api/signoffs", {
         process_id: p.id,
@@ -706,6 +908,8 @@ function openSignoffCreate(p, onDone) {
         job_no: m.modal.querySelector("#sg-job").value.trim(),
         created_by: m.modal.querySelector("#sg-by").value.trim(),
         evidence,
+        passport_id: passportId,
+        passport_hash: passportHash,
       });
       toast("签样草稿已创建", "ok");
       m.close();
@@ -1144,18 +1348,14 @@ export async function renderProcessDetail(view, params) {
     </div>
 
     ${p.compensation && p.compensation.n > 0 ? compensationCard(p) : ""}
+    <div id="passport-slot">${skeletonCards(1)}</div>
     ${p.icc_meta.device_space === "CMYK" ? `<div id="cal-history-slot">${skeletonCards(1)}</div>` : ""}
     <div id="signoff-slot">${skeletonCards(1)}</div>
 
     <div class="card gamut-card">
       <div class="gamut-card-head">
         <div class="card-title">${icon("target")}工艺色域</div>
-        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
-          <div class="cie-legend">
-            <span><i class="dot" style="background:linear-gradient(90deg,#4400ff,#00ff00,#ff0000)"></i>光谱轨迹</span>
-            <span><i class="dot legend-srgb"></i>sRGB</span>
-            <span><i class="dot legend-proc"></i>工艺凸包 · 采样点按 L* 着色</span>
-          </div>
+        <div class="gamut-actions">
           ${p.icc_meta.device_space === "CMYK"
             ? `<button class="btn btn-secondary btn-sm" id="btn-calibration">${icon("printer")}打印校准</button>`
             : ""}
@@ -1171,6 +1371,7 @@ export async function renderProcessDetail(view, params) {
         <div class="card-title">${icon("stack")}ICC 特性文件</div>
         <dl class="kv" style="margin-top:10px">
           <dt>设备色彩空间</dt><dd>${p.icc_meta.device_space}（${p.icc_meta.channels} 通道）</dd>
+          <dt>测量条件</dt><dd>${p.measurement_condition || "未登记"}</dd>
           <dt>ICC 指纹</dt><dd><span class="chip chip-mono">${p.icc_sha256.slice(0, 8)}</span></dd>
           <dt>文件名</dt><dd>${esc(p.icc_original_name)}</dd>
           <dt>大小</dt><dd>${(p.icc_size / 1024).toFixed(1)} KB</dd>
@@ -1195,6 +1396,7 @@ export async function renderProcessDetail(view, params) {
   `;
 
   const reload = () => renderProcessDetail(view, params);
+  renderPassportSlot(view, p);
 
   const compResetBtn = view.querySelector("#btn-comp-reset");
   if (compResetBtn) {
