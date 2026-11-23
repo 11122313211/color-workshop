@@ -1,10 +1,11 @@
-"""HTTP 端到端验证：走通 工艺创建→配方预测→实测验证→预检→转换→清理。"""
+"""HTTP 端到端验证：工艺→闭环→护照→V0.11 归档/完整性；跨平台测试 ICC。"""
 
 import base64
 import hashlib
 import io
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -17,7 +18,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 # 默认连接本机固定端口；可用环境变量改到隔离测试实例。
 _base_url = os.environ.get("COLORFORGE_E2E_BASE_URL", "http://127.0.0.1:8765")
 client = httpx.Client(base_url=_base_url.rstrip("/"))
-WIN = Path(r"C:/Windows/System32/spool/drivers/color")
+ROOT = Path(__file__).resolve().parent.parent
+ICC_FIXTURE = ROOT / "tests" / "fixtures" / "icc" / "testbed_cmyk.icc"
 
 
 def check(label, cond, extra=""):
@@ -28,10 +30,32 @@ def check(label, cond, extra=""):
 
 ok = True
 
+
+def cleanup_process(pid: str, label: str) -> bool:
+    """V0.11 清理协议：先归档（DELETE），再按 id 确认永久清理。"""
+    archived = client.delete(f"/api/processes/{pid}")
+    ok_archive = check(f"{label} 归档", archived.status_code == 200, archived.text[:80])
+    permanent = client.delete(
+        f"/api/processes/{pid}/permanent", params={"confirm": pid}
+    )
+    ok_permanent = check(
+        f"{label} 永久清理", permanent.status_code == 200, permanent.text[:80]
+    )
+    gone = client.get(f"/api/processes/{pid}")
+    return bool(ok_archive and ok_permanent and gone.status_code == 404)
+
+
+def process_payload(response):
+    """归档/恢复响应统一为 {status, process}；兼容直接返回工艺对象的端点。"""
+    body = response.json()
+    if isinstance(body, dict) and isinstance(body.get("process"), dict):
+        return body["process"]
+    return body
+
 # 0. 静态页与 API 健康
 r = client.get("/api/health")
 ok &= check("健康检查", r.status_code == 200 and r.json()["status"] == "ok", r.text[:80])
-ok &= check("版本号 v0.10.0", r.json().get("version") == "0.10.0")
+ok &= check("版本号 v0.11.0", r.json().get("version") == "0.11.0")
 r = client.get("/", follow_redirects=False)
 ok &= check("根路径重定向", r.status_code == 307 and r.headers["location"] == "/static/index.html")
 r = client.get("/static/index.html")
@@ -40,15 +64,15 @@ for path in ("/static/css/app.css", "/static/js/main.js", "/static/js/views/reci
     r = client.get(path)
     ok &= check(f"静态资源 {path}", r.status_code == 200)
 
-# 1. 创建工艺（raw bytes 上传）
-icc = (WIN / "RSWOP.icm").read_bytes()
+# 1. 创建工艺（raw bytes 上传；跨平台内置测试 ICC）
+icc = ICC_FIXTURE.read_bytes()
 r = client.post(
     "/api/processes",
     params={
         "name": "E2E-SWOP",
         "paper": "铜版纸",
         "ink": "四色",
-        "filename": "RSWOP.icm",
+        "filename": "testbed_cmyk.icc",
     },
     content=icc,
     headers={"Content-Type": "application/octet-stream"},
@@ -159,8 +183,8 @@ created = [p["created_at"] for p in s["series"]]
 ok &= check("stats 时间序列升序", created == sorted(created))
 
 # 6.8 V0.4：色域对比（同 ICC 双工艺 → 交集重合）
-icc2 = (WIN / "RSWOP.icm").read_bytes()
-r = client.post("/api/processes", params={"name": "E2E-SWOP-B", "filename": "RSWOP.icm"}, content=icc2, headers={"Content-Type": "application/octet-stream"})
+icc2 = ICC_FIXTURE.read_bytes()
+r = client.post("/api/processes", params={"name": "E2E-SWOP-B", "filename": "testbed_cmyk.icc"}, content=icc2, headers={"Content-Type": "application/octet-stream"})
 pid_b = r.json()["id"]
 r = client.get(f"/api/processes/{pid}/gamut/compare", params={"other": pid_b, "levels": 5})
 cmp = r.json()
@@ -643,8 +667,7 @@ r = client.post("/api/processes", params={"name": "E2E-GRAY-校准守卫", "file
 gray_pid = r.json()["id"]
 r = client.post("/api/qc/calibration/form", params={"process_id": gray_pid})
 ok &= check("V0.7 非 CMYK 工艺校准版 → 422", r.status_code == 422, r.text[:60])
-r = client.delete(f"/api/processes/{gray_pid}")
-ok &= check("V0.7 灰度守卫工艺清理", r.status_code == 200)
+ok &= cleanup_process(gray_pid, "V0.7 灰度守卫工艺")
 
 # 7.7 V0.8：校准轮次落库 → 历史收敛 → 新会话对比上一轮
 r = client.get("/api/qc/calibration/history", params={"process_id": pid})
@@ -853,10 +876,12 @@ ok &= check(
 r = client.get("/api/signoffs/release-manifest", params={"process_id": pid})
 ok &= check("V0.10 护照变化后交接清单 409", r.status_code == 409)
 
-alt_icc = (WIN / "JapanColor2001Coated.icc").read_bytes()
+alt_icc = bytearray(icc)
+struct.pack_into(">6H", alt_icc, 24, 1999, 12, 31, 12, 0, 0)
+alt_icc = bytes(alt_icc)
 r = client.put(
     f"/api/processes/{pid}/icc",
-    params={"filename": "JapanColor2001Coated.icc"},
+    params={"filename": "testbed_cmyk_date_variant.icc"},
     content=alt_icc,
     headers={"Content-Type": "application/octet-stream"},
 )
@@ -879,12 +904,152 @@ for sid in (v10_a, v10_b):
     r = client.delete("/api/qc/measurements", params={"session_id": sid})
     ok &= check("V0.10 光谱会话清理", r.status_code == 200)
 
-# 8. 清理
-for p in (pid, pid_b):
-    r = client.delete(f"/api/processes/{p}")
-    ok &= check("清理工艺", r.status_code == 200)
+# 7.10 V0.11：护照版本历史的签样引用字段
+r = client.get(f"/api/processes/{pid}/passport/versions")
+versions11 = r.json() if r.status_code == 200 else []
+v2_row = next((row for row in versions11 if row.get("version") == pp10_v2["version"]), {})
+v1_row = next((row for row in versions11 if row.get("version") == pp10["version"]), {})
+refs = v1_row.get("referenced_by_signoffs") or []
+ok &= check(
+    "V0.11 护照 versions latest/引用字段",
+    r.status_code == 200
+    and v2_row.get("is_latest") is True
+    and v1_row.get("is_latest") is False
+    and v1_row.get("referenced_count") == 1
+    and refs
+    and refs[0].get("id") == sg10["id"]
+    and refs[0].get("state") == "approved"
+    and refs[0].get("title") == "V0.10 护照签样",
+    str(v1_row)[:160],
+)
+
+# 7.11 V0.11：依赖计数 → 归档只读 → 门禁 → 恢复
+def _dep_count(report, key):
+    node = report.get(key)
+    if node is None:
+        node = (report.get("counts") or {}).get(key)
+    if isinstance(node, int):
+        return node
+    if isinstance(node, list):
+        return len(node)
+    if isinstance(node, dict):
+        for field in ("count", "total", "n"):
+            if isinstance(node.get(field), int):
+                return node[field]
+        return sum(value for value in node.values() if isinstance(value, int))
+    return 0
+
+
+r = client.get(f"/api/processes/{pid}/dependencies")
+deps11 = r.json() if r.status_code == 200 else {}
+ok &= check(
+    "V0.11 工艺依赖计数",
+    r.status_code == 200
+    and _dep_count(deps11, "recipes") >= 1
+    and _dep_count(deps11, "passports") >= 2
+    and _dep_count(deps11, "signoffs") >= 1
+    and "blockers" in deps11,
+    str(deps11)[:160],
+)
+
+r = client.post(
+    f"/api/processes/{pid}/archive",
+    json={"reason": "E2E 归档验证", "actor": "E2E"},
+)
+archived_body = r.json() if r.status_code == 200 else {}
+archived_proc = process_payload(r) if r.status_code == 200 else {}
+ok &= check(
+    "V0.11 显式归档（reason/actor）",
+    r.status_code == 200
+    and archived_body.get("status") == "archived"
+    and archived_proc.get("archived_at")
+    and archived_proc.get("archive_reason") == "E2E 归档验证"
+    and archived_proc.get("archived_by") == "E2E",
+    r.text[:120],
+)
+r = client.get("/api/processes")
+ok &= check("V0.11 默认列表排除归档", all(p["id"] != pid for p in r.json()))
+r = client.get("/api/processes", params={"include_archived": 1})
+ok &= check("V0.11 include_archived 包含", any(p["id"] == pid for p in r.json()))
+r = client.post(
+    "/api/recipes/predict",
+    json={"process_id": pid, "targets": [{"label": "归档写", "lab": [50, 20, 5]}]},
+)
+ok &= check(
+    "V0.11 归档工艺写操作 409",
+    r.status_code == 409 and isinstance(r.json().get("detail"), dict)
+    and r.json()["detail"].get("code") == "PROCESS_ARCHIVED",
+    r.text[:120],
+)
+r = client.get(f"/api/processes/{pid}/passport/versions")
+ok &= check("V0.11 归档后护照历史可读", r.status_code == 200 and len(r.json()) >= 2)
+r = client.get("/api/signoffs/gate", params={"process_id": pid})
+ok &= check(
+    "V0.11 归档门禁 reason=process_archived",
+    r.status_code == 200 and r.json().get("reason") == "process_archived",
+    r.text[:120],
+)
+r = client.get("/api/signoffs/release-manifest", params={"process_id": pid})
+ok &= check("V0.11 归档交接清单 409", r.status_code == 409)
+r = client.post(f"/api/processes/{pid}/restore")
+ok &= check("V0.11 恢复工艺", r.status_code == 200 and not r.json().get("archived_at"))
+r = client.get("/api/processes")
+ok &= check("V0.11 恢复后回到默认列表", any(p["id"] == pid for p in r.json()))
+
+# 7.12 V0.11：DELETE 归档 + confirm 永久清理（独立工艺，不污染主链路）
+r = client.post(
+    "/api/recipes/predict",
+    json={"process_id": pid_b, "targets": [{"label": "永久清理", "lab": [50, 0, 0]}]},
+)
+ok &= check("V0.11 永久清理前造数", r.status_code == 200)
+r = client.delete(f"/api/processes/{pid_b}")
+archived_b = process_payload(r) if r.status_code == 200 else {}
+ok &= check(
+    "V0.11 DELETE 改为归档",
+    r.status_code == 200 and bool(archived_b.get("archived_at")),
+    r.text[:120],
+)
+r = client.delete(
+    f"/api/processes/{pid_b}/permanent", params={"confirm": pid_b}
+)
+ok &= check("V0.11 archived + confirm 永久清理", r.status_code == 200, r.text[:120])
+ok &= check(
+    "V0.11 永久清理后工艺/配方消失",
+    client.get(f"/api/processes/{pid_b}").status_code == 404
+    and client.get("/api/recipes", params={"process_id": pid_b}).json() == [],
+)
+
+# 7.13 V0.11：完整性报告与 dry-run（隔离数据目录不依赖真实 data/ 孤儿）
+r = client.get("/api/integrity/report")
+integrity11 = r.json() if r.status_code == 200 else {}
+ok &= check(
+    "V0.11 完整性报告可用",
+    r.status_code == 200
+    and isinstance(integrity11, dict)
+    and any(key in integrity11 for key in ("summary", "counts", "orphans")),
+    str(integrity11)[:160],
+)
+before_recipes = client.get("/api/recipes", params={"process_id": pid}).json()
+r = client.post("/api/integrity/repair", json={"dry_run": True})
+ok &= check(
+    "V0.11 完整性 dry-run",
+    r.status_code == 200
+    and r.json().get("dry_run") is True
+    and client.get("/api/recipes", params={"process_id": pid}).json() == before_recipes,
+    r.text[:160],
+)
+
+# 8. 清理：主工艺也必须先归档再永久清理
+ok &= cleanup_process(pid, "V0.11 主工艺")
+# 永久清理保留审计证据：已批准签样转孤儿，配方删除
 r = client.get("/api/recipes", params={"process_id": pid})
 ok &= check("配方记录清理", r.status_code == 200 and r.json() == [])
+r = client.get(f"/api/signoffs/{sg10['id']}")
+ok &= check(
+    "永久清理后签样保留并标记孤儿",
+    r.status_code == 200 and bool(r.json().get("orphaned_at") or r.json().get("orphan_reason")),
+    r.text[:160],
+)
 
 print()
 print("E2E ALL OK" if ok else "E2E HAS FAILURES")

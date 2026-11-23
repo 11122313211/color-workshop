@@ -556,6 +556,61 @@ export function drawCie(canvas, series, opts = {}) {
 }
 
 /* ---------- 模态（Esc / 焦点圈闭 / 焦点还原 / aria） ---------- */
+let modalSeq = 0;
+const modalStack = [];
+let modalA11ySnapshot = null;
+let modalBodyOverflow = null;
+
+function setInert(el, inert) {
+  if (inert) {
+    el.setAttribute("inert", "");
+    el.inert = true;
+  } else {
+    el.removeAttribute("inert");
+    el.inert = false;
+  }
+}
+
+function syncModalA11y() {
+  const top = modalStack[modalStack.length - 1];
+  if (!top || !modalA11ySnapshot) return;
+
+  const backgrounds = [document.querySelector(".app"), ...document.querySelectorAll(".modal-mask")];
+  backgrounds.forEach((el) => {
+    if (!el) return;
+    if (!modalA11ySnapshot.has(el)) {
+      modalA11ySnapshot.set(el, {
+        inert: el.hasAttribute("inert"),
+        ariaHidden: el.getAttribute("aria-hidden"),
+      });
+    }
+    const isTop = el === top.mask;
+    setInert(el, !isTop);
+    if (isTop) {
+      const original = modalA11ySnapshot.get(el).ariaHidden;
+      if (original == null) el.removeAttribute("aria-hidden");
+      else el.setAttribute("aria-hidden", original);
+    } else {
+      el.setAttribute("aria-hidden", "true");
+    }
+  });
+}
+
+function restoreModalA11y() {
+  if (modalA11ySnapshot) {
+    modalA11ySnapshot.forEach((state, el) => {
+      if (!el.isConnected) return;
+      setInert(el, state.inert);
+      if (state.ariaHidden == null) el.removeAttribute("aria-hidden");
+      else el.setAttribute("aria-hidden", state.ariaHidden);
+    });
+  }
+  modalA11ySnapshot = null;
+  if (modalBodyOverflow == null) document.body.style.removeProperty("overflow");
+  else document.body.style.overflow = modalBodyOverflow;
+  modalBodyOverflow = null;
+}
+
 export function openModal(html, { onClose } = {}) {
   const mask = document.createElement("div");
   mask.className = "modal-mask";
@@ -563,28 +618,68 @@ export function openModal(html, { onClose } = {}) {
   document.body.appendChild(mask);
 
   const modal = mask.querySelector(".modal");
+  modal.tabIndex = -1;
+  const title = modal.querySelector("h1, h2, h3, h4, .card-title, .cd-title");
+  if (title) {
+    let titleId;
+    do {
+      titleId = `modal-title-${++modalSeq}`;
+    } while (document.getElementById(titleId));
+    title.id = titleId;
+    modal.setAttribute("aria-labelledby", titleId);
+  } else {
+    modal.setAttribute("aria-label", "对话框");
+  }
+
   const prevFocus = document.activeElement;
   let closed = false;
+  const record = { mask, modal };
+
+  if (!modalStack.length) {
+    modalA11ySnapshot = new Map();
+    modalBodyOverflow = document.body.style.overflow || null;
+  }
+  modalStack.push(record);
+  syncModalA11y();
 
   const focusables = () =>
     modal.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
 
-  requestAnimationFrame(() => {
-    const f = focusables();
+  const focusObserver = new MutationObserver(() => {
+    if (closed || modalStack[modalStack.length - 1] !== record) return;
+    if (modal.contains(document.activeElement) && document.activeElement !== modal) return;
+    const f = [...focusables()].filter((el) => !el.disabled && el.offsetParent !== null);
     if (f.length) f[0].focus();
+  });
+  focusObserver.observe(modal, { childList: true, subtree: true });
+
+  requestAnimationFrame(() => {
+    if (closed || modalStack[modalStack.length - 1] !== record) return;
+    const f = [...focusables()].filter((el) => !el.disabled && el.offsetParent !== null);
+    if (f.length) f[0].focus();
+    else modal.focus();
   });
 
   function close() {
     if (closed) return;
     closed = true;
     document.removeEventListener("keydown", onKey, true);
+    focusObserver.disconnect();
     mask.remove();
-    document.body.style.removeProperty("overflow");
+    const stackIndex = modalStack.indexOf(record);
+    if (stackIndex >= 0) modalStack.splice(stackIndex, 1);
+    if (modalStack.length) {
+      document.body.style.setProperty("overflow", "hidden");
+      syncModalA11y();
+    } else {
+      restoreModalA11y();
+    }
     if (prevFocus && typeof prevFocus.focus === "function") prevFocus.focus();
     if (onClose) onClose();
   }
 
   function onKey(e) {
+    if (modalStack[modalStack.length - 1] !== record) return;
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -608,7 +703,7 @@ export function openModal(html, { onClose } = {}) {
   document.addEventListener("keydown", onKey, true);
   document.body.style.setProperty("overflow", "hidden");
   mask.addEventListener("click", (e) => {
-    if (e.target === mask) close();
+    if (e.target === mask && modalStack[modalStack.length - 1] === record) close();
   });
 
   return { mask, modal, close };

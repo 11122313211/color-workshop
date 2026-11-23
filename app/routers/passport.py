@@ -12,6 +12,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
+from ..services.lifecycle import archived_detail, is_archived
 from ..services.passport import PassportStore
 from ..services.processes import ProcessStore
 
@@ -27,9 +28,15 @@ def _process_or_404(pid: str) -> dict:
     return doc
 
 
+def _ensure_active(proc: dict) -> None:
+    if is_archived(proc):
+        raise HTTPException(409, detail=archived_detail())
+
+
 @router.post("/{pid}/passport")
 def create_passport(pid: str):
     proc = _process_or_404(pid)
+    _ensure_active(proc)
     exposed, created = PassportStore().create(proc)
     return {**exposed, "created": created}
 
@@ -48,9 +55,27 @@ def get_latest_passport(pid: str):
 def list_passport_versions(pid: str):
     proc = _process_or_404(pid)
     store = PassportStore()
+    latest = store.latest_snapshot(pid)
+    latest_version = int((latest or {}).get("version", 0) or 0)
+    from ..services.signoffs import SignoffStore
+
+    signoffs = SignoffStore()
     out = []
     for snapshot in store.list_versions(pid):
         exposed = store.expose(snapshot, proc)
+        references = signoffs.references_for_passport(
+            pid,
+            exposed.get("id", ""),
+            exposed.get("passport_hash", ""),
+        )
+        referenced_by = [
+            {
+                "id": doc.get("id", ""),
+                "state": doc.get("state", "draft"),
+                "title": doc.get("title", ""),
+            }
+            for doc in references
+        ]
         out.append({
             "id": exposed["id"],
             "version": exposed["version"],
@@ -59,6 +84,9 @@ def list_passport_versions(pid: str):
             "status": exposed["status"],
             "status_label": exposed["status_label"],
             "warnings": len(exposed.get("warnings") or []),
+            "is_latest": exposed["version"] == latest_version,
+            "referenced_by_signoffs": referenced_by,
+            "referenced_count": len(referenced_by),
         })
     return out
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from ..services.lifecycle import archived_detail, is_archived
 from ..services.measurements import MEASUREMENT_CONDITIONS, MeasurementStore
 from ..services.processes import ProcessStore
 
@@ -27,6 +28,11 @@ router = APIRouter(prefix="/api/qc", tags=["qc"])
 
 measurements = MeasurementStore()
 _processes = ProcessStore()
+
+
+def _ensure_active(proc: dict) -> None:
+    if is_archived(proc):
+        raise HTTPException(409, detail=archived_detail())
 
 
 def _process_or_none(process_id: str) -> dict | None:
@@ -63,10 +69,17 @@ async def import_measurement(
         raise HTTPException(413, "测量文件过大（>2MB）")
 
     proc_doc = _process_or_none(process_id)
+    if proc_doc is not None:
+        _ensure_active(proc_doc)
     if session_id:
         session = measurements.get_session(session_id)
         if session is None:
             raise HTTPException(404, "测量会话不存在")
+        bound_pid = session.get("process_id") or ""
+        if bound_pid and not (proc_doc and proc_doc.get("id") == bound_pid):
+            bound_proc = _processes.get(bound_pid)
+            if bound_proc is not None:
+                _ensure_active(bound_proc)
         # 追加导入时允许更新复测声明（会话级属性，改后整体重分级）
         if repeat_mode and repeat_mode != session.get("repeat_mode"):
             measurements.update_session(session_id, repeat_mode=repeat_mode)
@@ -202,6 +215,8 @@ def create_evaluation(
     from ..services.evaluations import EvaluationStore
 
     proc_doc = _process_or_none(process_id) if process_id else None
+    if proc_doc is not None:
+        _ensure_active(proc_doc)
     store = EvaluationStore()
     try:
         doc = store.create_evaluation(template, title, process_id)
@@ -227,6 +242,13 @@ async def add_evaluation_entry(
     if not isinstance(scores, dict):
         raise HTTPException(422, "打分 body 需为 JSON 对象 {指标: 1-5}")
     store = EvaluationStore()
+    existing = store.get(evaluation_id)
+    if existing is not None:
+        bound_pid = existing.get("process_id") or ""
+        if bound_pid:
+            bound_proc = _processes.get(bound_pid)
+            if bound_proc is not None:
+                _ensure_active(bound_proc)
     try:
         doc = store.add_entry(evaluation_id, evaluator, scores)
     except KeyError as e:
@@ -266,7 +288,16 @@ def delete_evaluation(
 ):
     from ..services.evaluations import EvaluationStore
 
-    if not EvaluationStore().delete_evaluation(evaluation_id):
+    store = EvaluationStore()
+    existing = store.get(evaluation_id)
+    if existing is None:
+        raise HTTPException(404, "评价不存在")
+    bound_pid = existing.get("process_id") or ""
+    if bound_pid:
+        bound_proc = _processes.get(bound_pid)
+        if bound_proc is not None:
+            _ensure_active(bound_proc)
+    if not store.delete_evaluation(evaluation_id):
         raise HTTPException(404, "评价不存在")
     return {"status": "deleted"}
 
@@ -351,6 +382,7 @@ def calibration_apply(
     if session is None:
         raise HTTPException(404, "测量会话不存在")
     proc = _bound_cmyk_process(session)
+    _ensure_active(proc)
     from ..services.calibration import apply_suggestions, calibration_report
     from ..services.calibration_history import (
         CalibrationStore,
@@ -429,6 +461,15 @@ def delete_measurement(
     process_id: str = Query("", description="绑定工艺（重分级用）"),
 ):
     proc_doc = _process_or_none(process_id)
+    if proc_doc is not None:
+        _ensure_active(proc_doc)
+    session = measurements.get_session(session_id)
+    if session is not None:
+        bound_pid = session.get("process_id") or ""
+        if bound_pid and not (proc_doc and proc_doc.get("id") == bound_pid):
+            bound_proc = _processes.get(bound_pid)
+            if bound_proc is not None:
+                _ensure_active(bound_proc)
     if record_id:
         if not measurements.delete_record(session_id, record_id, proc_doc):
             raise HTTPException(404, "测量记录不存在")

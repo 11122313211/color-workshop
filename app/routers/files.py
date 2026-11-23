@@ -12,6 +12,7 @@ from ..models.schemas import (
     PreflightRequest,
 )
 from ..services.files import convert_image, preflight
+from ..services.lifecycle import archived_detail, is_archived
 from ..services.pdfx import MAX_PDF_BYTES, PdfxError, package_pdfx
 from ..services.processes import ProcessStore
 from ..services.displays import DisplayStore
@@ -20,6 +21,11 @@ router = APIRouter(prefix="/api/files", tags=["files"])
 
 _processes = ProcessStore()
 _displays = DisplayStore()
+
+
+def _ensure_active(proc: dict) -> None:
+    if is_archived(proc):
+        raise HTTPException(409, detail=archived_detail())
 
 
 def _decode_b64(data_b64: str) -> bytes:
@@ -48,6 +54,7 @@ def run_convert(req: FileConvertRequest):
     proc = _processes.get(req.process_id)
     if not proc:
         raise HTTPException(404, "工艺不存在，请先在工艺库中创建")
+    _ensure_active(proc)
     image_bytes = _decode_b64(req.image_b64)
     try:
         icc_bytes = _processes.icc_bytes(req.process_id)
@@ -80,6 +87,7 @@ async def make_pdfx(
     proc = _processes.get(process_id)
     if not proc:
         raise HTTPException(404, "工艺不存在，请先在工艺库中创建")
+    _ensure_active(proc)
     data = await request.body()
     if not data:
         raise HTTPException(400, "缺少 PDF 文件内容（raw bytes body）")

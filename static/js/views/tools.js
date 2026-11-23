@@ -17,6 +17,7 @@ const TOOLS = [
   ["gamut", "色域对比", "CIE 1931 色度图"],
   ["convert", "色彩转换器", "常见色彩空间互转"],
   ["display", "显示器", "校准档案与软打样门禁"],
+  ["integrity", "数据维护", "完整性扫描、Dry Run 与修复"],
 ];
 
 export async function renderToolsView(view) {
@@ -36,10 +37,10 @@ export async function renderToolsView(view) {
     <div class="page-head">
       <div>
         <h1 class="large-title">工具箱</h1>
-        <p class="page-sub">专业色彩工具：正查、色差、色域与转换</p>
+        <p class="page-sub">专业色彩工具：正查、色差、色域、转换与数据维护</p>
       </div>
     </div>
-    <div class="seg" id="tool-seg" style="margin-bottom:18px">
+    <div class="seg tool-seg" id="tool-seg" style="margin-bottom:18px">
       ${TOOLS.map(([k, t]) => `<button data-tool="${k}" class="${k === "forward" ? "active" : ""}">${t}</button>`).join("")}
     </div>
     ${TOOLS.map(([k, t, d], i) => `
@@ -65,6 +66,7 @@ export async function renderToolsView(view) {
   buildGamut(view.querySelector("#tool-gamut"));
   buildConvert(view.querySelector("#tool-convert"));
   buildDisplay(view.querySelector("#tool-display"));
+  buildIntegrity(view.querySelector("#tool-integrity"));
 }
 
 /* ---------- CMYK→LAB 正查 ---------- */
@@ -264,6 +266,389 @@ function buildConvert(box) {
       toast(e.message, "err");
     }
   });
+}
+
+/* ---------- 数据维护：完整性扫描 / Dry Run / 应用修复 ---------- */
+function readPath(obj, path) {
+  return path.split(".").reduce((cur, key) => (cur == null ? null : cur[key]), obj);
+}
+
+function firstReportValue(report, paths) {
+  for (const path of paths) {
+    const value = readPath(report, path);
+    if (value !== undefined && value !== null) return value;
+  }
+  return null;
+}
+
+function integrityCount(value, preferred = []) {
+  if (value == null) return 0;
+  if (typeof value === "number") return value;
+  if (typeof value === "boolean") return value ? 1 : 0;
+  if (Array.isArray(value)) return value.length;
+  if (typeof value === "object") {
+    for (const key of preferred) {
+      if (typeof value[key] === "number") return value[key];
+    }
+    for (const key of ["count", "total", "rounds", "versions", "records", "n"]) {
+      if (typeof value[key] === "number") return value[key];
+    }
+    const nestedArrays = Object.values(value).filter(Array.isArray);
+    if (nestedArrays.length) return nestedArrays.reduce((sum, arr) => sum + arr.length, 0);
+    const numbers = Object.values(value).filter((v) => typeof v === "number");
+    if (numbers.length) return Math.max(...numbers);
+  }
+  return 0;
+}
+
+function integrityItems(value) {
+  if (value == null) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "object") {
+    for (const key of ["items", "records", "details", "ids", "versions", "rounds", "files"]) {
+      if (Array.isArray(value[key])) return value[key];
+    }
+    const nestedArrays = Object.values(value).filter(Array.isArray);
+    if (nestedArrays.length) return nestedArrays.flat();
+    return [value];
+  }
+  return typeof value === "string" ? [value] : [];
+}
+
+function describeIntegrityItem(item) {
+  if (item == null) return "";
+  if (typeof item !== "object") return String(item);
+  const fields = [
+    ["id", item.id],
+    ["process", item.process_id || item.process || item.process_name],
+    ["name", item.name || item.title],
+    ["file", item.filename || item.file || item.path],
+    ["action", item.action],
+    ["category", item.category],
+    ["status", item.status],
+    ["count", item.count],
+    ["ids", Array.isArray(item.ids) ? item.ids.slice(0, 3).join(",") + (item.ids.length > 3 ? "…" : "") : item.ids],
+    ["state", item.state],
+    ["reason", item.reason || item.message],
+    ["at", item.created_at || item.generated_at || item.detached_at || item.orphaned_at],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (fields.length) return fields.map(([key, value]) => `${key}=${value}`).join(" · ");
+  try {
+    const text = JSON.stringify(item);
+    return text.length > 240 ? `${text.slice(0, 237)}…` : text;
+  } catch (_) {
+    return "无法解析的记录";
+  }
+}
+
+function integrityGroup(label, raw, count = null) {
+  const total = count == null ? integrityCount(raw) : count;
+  const items = integrityItems(raw);
+  return `<div class="maintenance-group">
+    <div class="maintenance-group-head">
+      <strong>${esc(label)}</strong>
+      <span class="badge ${total ? "badge-orange" : "badge-gray"}">${total}</span>
+    </div>
+    ${items.length ? `<div class="maintenance-list">${items.slice(0, 12).map((item) =>
+      `<div class="maintenance-item">${esc(describeIntegrityItem(item))}</div>`).join("")}
+      ${items.length > 12 ? `<div class="maintenance-more">另有 ${items.length - 12} 条明细</div>` : ""}
+    </div>` : total ? `<p class="swatch-meta" style="margin:5px 0 0">报告仅提供计数，未附带逐条明细。</p>` : ""}
+  </div>`;
+}
+
+function normalizeIntegrityReport(report) {
+  const active = firstReportValue(report, [
+    "summary.processes_active", "processes.active", "counts.active_processes",
+    "summary.active_processes", "active_processes", "active_count", "counts.active",
+  ]);
+  const archived = firstReportValue(report, [
+    "summary.processes_archived", "processes.archived", "counts.archived_processes",
+    "summary.archived_processes", "archived_processes", "archived_count", "counts.archived",
+  ]);
+  const recipes = firstReportValue(report, [
+    "orphan_recipes", "orphan_derived.recipes", "details.orphan_recipes",
+    "details.orphan_derived.recipes", "orphans.recipes", "summary.orphan_recipes", "counts.orphan_recipes",
+  ]);
+  const compensations = firstReportValue(report, [
+    "orphan_compensations", "orphan_derived.compensations", "details.orphan_compensations",
+    "details.orphan_derived.compensations", "orphans.compensations",
+    "summary.orphan_compensations", "counts.orphan_compensations",
+  ]);
+  const calibrations = firstReportValue(report, [
+    "orphan_calibrations", "orphan_derived.calibrations", "details.orphan_calibrations",
+    "details.orphan_derived.calibrations", "orphans.calibrations",
+    "summary.orphan_calibrations", "counts.orphan_calibrations",
+  ]);
+  const passports = firstReportValue(report, [
+    "orphan_passports", "orphan_derived.passports", "details.orphan_passports",
+    "details.orphan_derived.passports", "orphans.passports",
+    "summary.orphan_passports", "counts.orphan_passports",
+  ]);
+  const measurements = firstReportValue(report, [
+    "orphan_measurement_sessions", "orphan_measurements", "details.orphan_measurement_sessions",
+    "details.orphan_measurements", "orphans.measurement_sessions", "orphans.measurements",
+    "summary.orphan_measurement_sessions", "counts.orphan_measurement_sessions",
+  ]);
+  const evaluations = firstReportValue(report, [
+    "orphan_evaluations", "details.orphan_evaluations", "orphans.evaluations",
+    "summary.orphan_evaluations", "counts.orphan_evaluations",
+  ]);
+  const signoffs = firstReportValue(report, [
+    "orphan_signoffs", "details.orphan_signoffs", "orphans.signoffs",
+    "summary.orphan_signoffs", "counts.orphan_signoffs",
+  ]);
+  const missingIcc = firstReportValue(report, [
+    "missing_icc", "missing_icc_files", "missing_icc_processes", "details.missing_icc",
+    "summary.missing_icc", "counts.missing_icc",
+  ]);
+  const unreferencedIcc = firstReportValue(report, [
+    "unreferenced_icc", "unreferenced_icc_files", "orphan_icc", "details.unreferenced_icc",
+    "details.unreferenced_icc_files", "summary.unreferenced_icc", "counts.unreferenced_icc",
+  ]);
+
+  const derivedCount = [recipes, compensations, calibrations, passports]
+    .reduce((sum, value) => sum + integrityCount(value), 0);
+  const derivedFallback = firstReportValue(report, [
+    "summary.orphan_derived", "counts.orphan_derived", "orphan_derived",
+    "orphan_derived_count",
+  ]);
+  return {
+    generatedAt: report?.generated_at || report?.scanned_at || report?.created_at || "",
+    active: integrityCount(active),
+    archived: integrityCount(archived),
+    recipes, compensations, calibrations, passports,
+    measurements, evaluations, signoffs, missingIcc, unreferencedIcc,
+    derivedCount: derivedCount || integrityCount(derivedFallback),
+    measurementCount: integrityCount(measurements),
+    evaluationCount: integrityCount(evaluations),
+    signoffCount: integrityCount(signoffs),
+    missingIccCount: integrityCount(missingIcc),
+    unreferencedIccCount: integrityCount(unreferencedIcc),
+  };
+}
+
+function renderIntegrityReport(box, report) {
+  const data = normalizeIntegrityReport(report);
+  const issueTotal = data.derivedCount + data.measurementCount + data.evaluationCount
+    + data.signoffCount + data.missingIccCount + data.unreferencedIccCount;
+  const stat = (label, value, tone = "") =>
+    `<div class="maintenance-stat ${tone}"><b>${value}</b><span>${esc(label)}</span></div>`;
+  const sections = [];
+  if (data.derivedCount) {
+    sections.push(`<section class="maintenance-section">
+      <div class="maintenance-section-head"><h4>孤儿派生记录</h4><span class="badge badge-orange">${data.derivedCount}</span></div>
+      <div class="maintenance-groups">
+        ${integrityGroup("孤儿配方", data.recipes)}
+        ${integrityGroup("孤儿补偿", data.compensations)}
+        ${integrityGroup("孤儿校准", data.calibrations)}
+        ${integrityGroup("孤儿护照", data.passports)}
+      </div>
+    </section>`);
+  }
+  if (data.measurementCount || data.evaluationCount) {
+    sections.push(`<section class="maintenance-section">
+      <div class="maintenance-section-head"><h4>孤儿测量 / 评价</h4><span class="badge badge-orange">${data.measurementCount + data.evaluationCount}</span></div>
+      <div class="maintenance-groups">
+        ${data.measurementCount ? integrityGroup("孤儿测量会话", data.measurements) : ""}
+        ${data.evaluationCount ? integrityGroup("孤儿主观评价", data.evaluations) : ""}
+      </div>
+      <p class="swatch-meta" style="margin-top:6px">修复策略：解绑但保留审计记录，不删除。</p>
+    </section>`);
+  }
+  if (data.signoffCount) {
+    sections.push(`<section class="maintenance-section">
+      <div class="maintenance-section-head"><h4>孤儿签样</h4><span class="badge badge-orange">${data.signoffCount}</span></div>
+      ${integrityGroup("签样记录", data.signoffs)}
+      <p class="swatch-meta" style="margin-top:6px">修复策略：标记 orphaned，不删除签样。</p>
+    </section>`);
+  }
+  if (data.missingIccCount) {
+    sections.push(`<section class="maintenance-section">
+      <div class="maintenance-section-head"><h4>缺失 ICC</h4><span class="badge badge-red">${data.missingIccCount}</span></div>
+      ${integrityGroup("工艺缺少 ICC 文件", data.missingIcc)}
+    </section>`);
+  }
+  if (data.unreferencedIccCount) {
+    sections.push(`<section class="maintenance-section">
+      <div class="maintenance-section-head"><h4>未引用 ICC</h4><span class="badge badge-orange">${data.unreferencedIccCount}</span></div>
+      ${integrityGroup("未被工艺引用的 ICC", data.unreferencedIcc)}
+      <p class="swatch-meta" style="margin-top:6px">修复策略：移至 data/orphaned_icc/ 隔离，不直接删除。</p>
+    </section>`);
+  }
+
+  box.innerHTML = `
+    <div class="maintenance-report-head">
+      <div>
+        <div class="card-title" style="margin:0">完整性摘要</div>
+        <p class="swatch-meta" style="margin:2px 0 0">扫描时间：${esc(data.generatedAt ? data.generatedAt.replace("T", " ") : "本次请求")}</p>
+      </div>
+      <span class="badge ${issueTotal ? "badge-orange" : "badge-green"}">${issueTotal ? `${issueTotal} 个问题` : "未发现问题"}</span>
+    </div>
+    <div class="maintenance-summary">
+      ${stat("Active 工艺", data.active)}
+      ${stat("已归档工艺", data.archived)}
+      ${stat("孤儿派生", data.derivedCount, data.derivedCount ? "is-warn" : "")}
+      ${stat("孤儿测量", data.measurementCount, data.measurementCount ? "is-warn" : "")}
+      ${stat("孤儿评价", data.evaluationCount, data.evaluationCount ? "is-warn" : "")}
+      ${stat("孤儿签样", data.signoffCount, data.signoffCount ? "is-warn" : "")}
+      ${stat("缺失 ICC", data.missingIccCount, data.missingIccCount ? "is-danger" : "")}
+      ${stat("未引用 ICC", data.unreferencedIccCount, data.unreferencedIccCount ? "is-warn" : "")}
+    </div>
+    ${sections.length ? `<div class="maintenance-sections">${sections.join("")}</div>`
+      : `<div class="maintenance-clean">${icon("check")}未发现孤儿记录、缺失 ICC 或未引用 ICC，数据完整。</div>`}
+    <details class="maintenance-raw">
+      <summary>查看原始报告 JSON</summary>
+      <pre class="result-code">${esc(JSON.stringify(report, null, 2))}</pre>
+    </details>`;
+}
+
+function sumCountLeaves(value) {
+  if (value == null) return 0;
+  if (typeof value === "number") return Math.max(0, value);
+  if (Array.isArray(value)) return value.length;
+  if (typeof value === "object") {
+    return Object.values(value).reduce((sum, item) => sum + sumCountLeaves(item), 0);
+  }
+  return 0;
+}
+
+function renderRepairResult(box, result, dryRun, rescanned = false) {
+  const actions = integrityItems(firstReportValue(result, ["actions", "changes", "planned", "results"]) || [])
+    .filter((item) => !item || typeof item !== "object" || Number(item.count || 0) > 0);
+  const source = dryRun
+    ? firstReportValue(result, ["planned"])
+    : firstReportValue(result, ["counts"]);
+  const groupCount = (key) => sumCountLeaves(readPath(source, key));
+  const counts = [
+    ["删除孤儿派生", groupCount("deleted")],
+    ["解绑测量 / 评价", groupCount("detached")],
+    ["标记孤儿签样", groupCount("orphaned")],
+    ["隔离未引用 ICC", groupCount("quarantined")],
+  ];
+  const message = result?.message || result?.summary_text || "";
+  box.innerHTML = `
+    <div class="maintenance-result ${dryRun ? "is-dry" : "is-applied"}" role="status">
+      <div class="maintenance-result-head">
+        <span class="badge ${dryRun ? "badge-orange" : "badge-green"}">${dryRun ? "Dry Run · 仅预览" : "已应用"}</span>
+        <strong>${dryRun ? "以下为预览结果，未写入磁盘。" : "修复结果已写入磁盘。"}</strong>
+      </div>
+      <p>${dryRun
+        ? "Dry Run 只计算将受影响的记录，不删除、不解绑、不移动任何文件。"
+        : `完整性扫描已刷新${rescanned ? "，下方报告为修复后的最新状态" : ""}。`}</p>
+      ${message ? `<p class="swatch-meta">${esc(message)}</p>` : ""}
+      <div class="maintenance-result-grid">
+        ${counts.map(([label, value]) => `<div><b>${value}</b><span>${esc(label)}</span></div>`).join("")}
+      </div>
+      ${actions.length ? `<details class="maintenance-actions-detail">
+        <summary>查看修复动作明细（${actions.length}）</summary>
+        <div class="maintenance-list">${actions.slice(0, 30).map((item) =>
+          `<div class="maintenance-item">${esc(describeIntegrityItem(item))}</div>`).join("")}</div>
+      </details>` : ""}
+    </div>`;
+}
+
+function buildIntegrity(box) {
+  if (!box) return;
+  box.innerHTML = `
+    <div class="maintenance-toolbar">
+      <div class="maintenance-toolbar-group">
+        <button class="btn btn-secondary btn-sm" id="integrity-rescan" type="button">${icon("refresh")}重新扫描</button>
+        <button class="btn btn-secondary btn-sm" id="integrity-download" type="button" disabled>${icon("download")}下载 JSON</button>
+      </div>
+      <div class="maintenance-toolbar-group">
+        <button class="btn btn-secondary btn-sm" id="integrity-preview" type="button" disabled>${icon("eye")}预览修复</button>
+        <button class="btn btn-danger btn-sm" id="integrity-apply" type="button" disabled>${icon("warn")}应用修复</button>
+      </div>
+    </div>
+    <p class="swatch-meta maintenance-hint">扫描只读；预览修复固定使用 Dry Run，不写盘。应用修复前会再次确认。</p>
+    <div id="integrity-repair-result"></div>
+    <div id="integrity-report"><div class="spinner"></div></div>
+  `;
+  const reportBox = box.querySelector("#integrity-report");
+  const resultBox = box.querySelector("#integrity-repair-result");
+  const rescanBtn = box.querySelector("#integrity-rescan");
+  const downloadBtn = box.querySelector("#integrity-download");
+  const previewBtn = box.querySelector("#integrity-preview");
+  const applyBtn = box.querySelector("#integrity-apply");
+  let report = null;
+
+  const setReady = (ready) => {
+    downloadBtn.disabled = !ready;
+    previewBtn.disabled = !ready;
+    applyBtn.disabled = !ready;
+  };
+
+  const refresh = async () => {
+    report = null;
+    setReady(false);
+    rescanBtn.disabled = true;
+    reportBox.innerHTML = `<div style="display:flex;align-items:center;gap:8px"><span class="spinner"></span><span class="swatch-meta">扫描工艺、派生记录、签样与 ICC 文件…</span></div>`;
+    try {
+      report = await apiGet("/api/integrity/report");
+      if (!box.isConnected) return;
+      renderIntegrityReport(reportBox, report);
+      setReady(true);
+    } catch (e) {
+      if (!box.isConnected) return;
+      reportBox.innerHTML = `<div class="issue issue-error">${icon("xmark")}<span>${esc(e.message)}</span></div>
+        <div style="margin-top:10px"><button class="btn btn-secondary btn-sm" id="integrity-retry">重试</button></div>`;
+      reportBox.querySelector("#integrity-retry").addEventListener("click", refresh);
+    } finally {
+      rescanBtn.disabled = false;
+    }
+  };
+
+  rescanBtn.addEventListener("click", refresh);
+  downloadBtn.addEventListener("click", () => {
+    if (!report) return;
+    downloadDataUri(
+      "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(report, null, 2)),
+      "integrity-report.json",
+    );
+    toast("完整性报告已下载", "ok");
+  });
+
+  previewBtn.addEventListener("click", async () => {
+    previewBtn.disabled = true;
+    previewBtn.innerHTML = `<span class="spinner"></span>预览中…`;
+    try {
+      const result = await apiPost("/api/integrity/repair", { dry_run: true });
+      if (!box.isConnected) return;
+      renderRepairResult(resultBox, result, true);
+      toast("Dry Run 预览完成，未写入磁盘", "ok");
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      previewBtn.disabled = !report;
+      previewBtn.innerHTML = `${icon("eye")}预览修复`;
+    }
+  });
+
+  applyBtn.addEventListener("click", async () => {
+    const ok = await confirmDanger({
+      title: "应用数据修复？",
+      message: "将删除孤儿派生记录、解绑并保留测量/评价、标记孤儿签样，并把未引用 ICC 移至隔离目录。建议先执行 Dry Run 预览。",
+      confirmText: "应用修复",
+    });
+    if (!ok) return;
+    applyBtn.disabled = true;
+    applyBtn.innerHTML = `<span class="spinner"></span>应用中…`;
+    try {
+      const result = await apiPost("/api/integrity/repair", { dry_run: false });
+      if (!box.isConnected) return;
+      toast("数据修复已应用", "ok");
+      await refresh();
+      renderRepairResult(resultBox, result, false, true);
+    } catch (e) {
+      toast(e.message, "err");
+      applyBtn.disabled = !report;
+    } finally {
+      applyBtn.innerHTML = `${icon("warn")}应用修复`;
+      applyBtn.disabled = !report;
+    }
+  });
+
+  refresh();
 }
 
 /* ---------- 显示器档案与软打样门禁（V0.9 P0-4） ---------- */

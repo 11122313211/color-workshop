@@ -616,6 +616,8 @@ function spectralRiskBadge(risk) {
   return `<span class="badge ${cls}">${esc(label)}</span>`;
 }
 
+let spectralTableSeq = 0;
+
 function drawSpectralCurve(canvas, row) {
   const W = 620, H = 280, PAD = { l: 48, r: 18, t: 34, b: 36 };
   const ctx = setupCanvas(canvas, W, H);
@@ -653,36 +655,61 @@ function drawSpectralCurve(canvas, row) {
   ctx.beginPath(); ctx.moveTo(PAD.l, Y(1)); ctx.lineTo(W - PAD.r, Y(1)); ctx.stroke();
   ctx.setLineDash([]);
 
-  const plot = (series, color) => {
+  const plot = (series, color, { dashed = false, marker = "circle" } = {}) => {
     const pts = Object.entries(series)
       .map(([w, v]) => [Number(w), Number(v)])
       .filter(([w, v]) => Number.isFinite(w) && Number.isFinite(v))
       .sort(([w1], [w2]) => w1 - w2);
     if (!pts.length) return;
     ctx.strokeStyle = color; ctx.lineWidth = 2.2;
+    ctx.setLineDash(dashed ? [7, 5] : []);
     ctx.beginPath();
     pts.forEach(([w, v], i) => {
       const px = X(w), py = Y(v);
       i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
     });
     ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = color;
+    pts.forEach(([w, v]) => {
+      const px = X(w), py = Y(v);
+      if (marker === "square") {
+        ctx.fillRect(px - 2.6, py - 2.6, 5.2, 5.2);
+      } else {
+        ctx.beginPath();
+        ctx.arc(px, py, 2.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
   };
-  plot(a, accent);
-  plot(b, purple);
+  plot(a, accent, { marker: "circle" });
+  plot(b, purple, { dashed: true, marker: "square" });
 
   ctx.fillStyle = ink; ctx.font = "11px system-ui";
   ctx.fillText("反射率", 8, PAD.t - 12);
   ctx.fillText("波长 nm", W - PAD.r - 52, H - 8);
+  ctx.strokeStyle = accent; ctx.lineWidth = 2.2; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(PAD.l, 15); ctx.lineTo(PAD.l + 18, 15); ctx.stroke();
   ctx.fillStyle = accent;
-  ctx.fillRect(PAD.l, 14, 18, 2.5);
+  ctx.beginPath(); ctx.arc(PAD.l + 9, 15, 2.7, 0, Math.PI * 2); ctx.fill();
   ctx.fillText("样本 A", PAD.l + 24, 18);
+  ctx.strokeStyle = purple;
+  ctx.setLineDash([7, 5]);
+  ctx.beginPath(); ctx.moveTo(PAD.l + 96, 15); ctx.lineTo(PAD.l + 114, 15); ctx.stroke();
+  ctx.setLineDash([]);
   ctx.fillStyle = purple;
-  ctx.fillRect(PAD.l + 96, 14, 18, 2.5);
+  ctx.fillRect(PAD.l + 104.5, 11.8, 5.2, 5.2);
   ctx.fillText("样本 B", PAD.l + 120, 18);
 }
 
 function openSpectralModal(row) {
   const conditions = row.conditions || [];
+  const maxDelta = row.max_delta_e != null
+    ? Number(row.max_delta_e).toFixed(2)
+    : (conditions.length ? Math.max(...conditions.map((c) => Number(c.delta_e) || 0)).toFixed(2) : "—");
+  const worst = row.worst_condition || conditions.find((c) => Number(c.delta_e) === Number(maxDelta))?.label || "—";
+  const canvasLabel = `光谱反射率曲线比较：样本 A 为实线圆点，样本 B 为虚线方点；${conditions.length} 个光源，最大 ΔE00 ${maxDelta}，最差光源 ${worst}`;
+  const tableId = `spectral-condition-table-${++spectralTableSeq}`;
   const tableRows = conditions.map((c) => `
     <tr>
       <td><b>${esc(c.label || c.condition)}</b></td>
@@ -696,9 +723,10 @@ function openSpectralModal(row) {
   const modal = openModal(`
     <h3 class="card-title">${icon("eye")}光谱曲线 · 色块 ${esc(row.label)}</h3>
     <p class="swatch-meta" style="margin-top:4px">${esc(row.disclaimer || "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI")}</p>
-    <canvas id="spectral-modal-canvas" class="spectral-canvas"></canvas>
+    <canvas id="spectral-modal-canvas" class="spectral-canvas" role="img"
+      aria-label="${esc(canvasLabel)}" aria-describedby="${tableId}"></canvas>
     <div class="section-title" style="margin:18px 0 6px">各光源 Lab / ΔE00</div>
-    <table class="spectral-table">
+    <table class="spectral-table" id="${tableId}">
       <thead><tr><th>光源</th><th>样本 A Lab</th><th>样本 B Lab</th><th>ΔE00</th><th>风险</th></tr></thead>
       <tbody>${tableRows}</tbody>
     </table>
@@ -783,11 +811,12 @@ async function renderSpectralCard(view) {
       }
       const rows = data.top.slice(0, 10).map((row, i) => `
         <tr>
-          <td><b>${esc(row.label)}</b></td>
-          <td class="chip-mono">${row.max_delta_e.toFixed(2)}</td>
-          <td>${esc(row.worst_condition)}</td>
-          <td>${spectralRiskBadge(row.risk)}</td>
-          <td><button class="btn btn-ghost btn-sm" data-spectral-row="${i}">曲线</button></td>
+          <td data-label="色块"><b>${esc(row.label)}</b></td>
+          <td data-label="最大 ΔE00" class="chip-mono">${row.max_delta_e.toFixed(2)}</td>
+          <td data-label="最差光源">${esc(row.worst_condition)}</td>
+          <td data-label="风险">${spectralRiskBadge(row.risk)}</td>
+          <td data-label="操作"><button class="btn btn-ghost btn-sm" data-spectral-row="${i}"
+            aria-label="查看色块 ${esc(row.label)} 的光谱曲线">曲线</button></td>
         </tr>`).join("");
       resultBox.innerHTML = `
         <div class="spectral-grid">
@@ -796,7 +825,7 @@ async function renderSpectralCard(view) {
           <div class="spectral-metric"><b>${data.matched}</b><span>匹配色块</span></div>
           <div class="spectral-metric"><b style="display:flex;align-items:center;gap:8px">${spectralRiskBadge(data.risk)}</b><span>综合风险</span></div>
         </div>
-        <table class="spectral-table" style="margin-top:10px">
+        <table class="spectral-table spectral-diff-table" style="margin-top:10px" aria-label="光谱色块差异表">
           <thead><tr><th>色块</th><th>最大 ΔE00</th><th>最差光源</th><th>风险</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
         </table>

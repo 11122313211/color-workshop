@@ -3,6 +3,9 @@
 工艺是一等实体——不同工艺的 ICC 文件不一样，配方预测、印前转换
 均以工艺为上下文。ICC 文件上传后落盘 data/processes/，注册表存
 data/processes.json（重启不丢）。
+
+V0.11：工艺删除改为归档优先。``archived_at`` 非空即只读；旧数据缺字段按
+active 处理。``delete()`` 仍保留为内部硬删除，仅供永久清理与测试清理使用。
 """
 
 from __future__ import annotations
@@ -109,6 +112,9 @@ class ProcessStore:
             "icc_sha256": hashlib.sha256(icc_bytes).hexdigest()[:16],
             "icc_meta": self.parse_meta(icc_bytes),
             "created_at": datetime.now().isoformat(timespec="seconds"),
+            "archived_at": "",
+            "archive_reason": "",
+            "archived_by": "",
         }
         self._store.put(pid, doc)
         return doc
@@ -117,19 +123,53 @@ class ProcessStore:
         doc = self._store.get(pid)
         return self._with_defaults(doc) if doc else None
 
-    def list(self) -> list[dict]:
+    def list(self, include_archived: bool = True) -> list[dict]:
+        """工艺列表；``include_archived=False`` 时仅返回 active 工艺。"""
         docs = [self._with_defaults(d) for d in self._store.all().values()]
+        if not include_archived:
+            docs = [d for d in docs if not d.get("archived_at")]
         docs.sort(key=lambda d: d.get("created_at", ""), reverse=True)
         return docs
 
     @staticmethod
     def _with_defaults(doc: dict) -> dict:
-        """旧工艺读取兼容：不写盘，仅补 V0.10 缺省字段。"""
+        """旧工艺读取兼容：不写盘，补齐测量条件与 V0.11 归档字段。"""
         out = {**doc}
         out.setdefault("measurement_condition", "")
+        out.setdefault("archived_at", "")
+        out.setdefault("archive_reason", "")
+        out.setdefault("archived_by", "")
+        out["is_archived"] = bool(out.get("archived_at"))
         return out
 
+    def archive(self, pid: str, reason: str = "manual_archive", actor: str = "") -> dict:
+        """归档工艺（可逆）。已归档时幂等返回，不刷新归档时间。"""
+        doc = self._store.get(pid)
+        if not doc:
+            raise KeyError(pid)
+        if doc.get("archived_at"):
+            return self._with_defaults(doc)
+        doc["archived_at"] = datetime.now().isoformat(timespec="seconds")
+        doc["archive_reason"] = (reason or "").strip() or "manual_archive"
+        doc["archived_by"] = (actor or "").strip()
+        self._store.put(pid, doc)
+        return self._with_defaults(doc)
+
+    def restore(self, pid: str) -> dict:
+        """恢复归档工艺为 active。未归档时幂等返回。"""
+        doc = self._store.get(pid)
+        if not doc:
+            raise KeyError(pid)
+        if not doc.get("archived_at"):
+            return self._with_defaults(doc)
+        doc["archived_at"] = ""
+        doc["archive_reason"] = ""
+        doc["archived_by"] = ""
+        self._store.put(pid, doc)
+        return self._with_defaults(doc)
+
     def delete(self, pid: str) -> bool:
+        """内部硬删除：删除工艺元数据与 ICC 文件（API 不直接暴露）。"""
         doc = self._store.get(pid)
         if not doc:
             return False

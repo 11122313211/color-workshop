@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from ..models.schemas import SignoffActionRequest, SignoffCreateRequest
 from ..services.evaluations import EvaluationStore
+from ..services.lifecycle import archived_detail, is_archived
 from ..services.measurements import MeasurementStore
 from ..services.processes import ProcessStore
 from ..services.signoffs import (
@@ -31,6 +32,11 @@ from ..services.signoffs import (
 router = APIRouter(prefix="/api/signoffs", tags=["signoffs"])
 
 _processes = ProcessStore()
+
+
+def _ensure_active(proc: dict) -> None:
+    if is_archived(proc):
+        raise HTTPException(409, detail=archived_detail())
 
 
 def _process_or_404(process_id: str) -> dict:
@@ -110,6 +116,13 @@ def _attach_passport(
 
 def _act(signoff_id: str, action: str, req: SignoffActionRequest) -> dict:
     store = SignoffStore()
+    existing = store.get(signoff_id)
+    if existing is None:
+        raise HTTPException(404, "签样记录不存在")
+    if existing.get("process_id"):
+        proc = _processes.get(existing.get("process_id", ""))
+        if proc is not None:
+            _ensure_active(proc)
     try:
         doc = store.transition(signoff_id, action, req.actor, req.note)
     except KeyError as e:
@@ -123,6 +136,7 @@ def _act(signoff_id: str, action: str, req: SignoffActionRequest) -> dict:
 def create_signoff(req: SignoffCreateRequest):
     """创建签样草稿；证据可留空，提交时至少需一项。"""
     proc = _process_or_404(req.process_id)
+    _ensure_active(proc)
     evidence = _validate_evidence(proc["id"], req.evidence)
     evidence = _attach_passport(
         proc,
@@ -161,6 +175,8 @@ def signoff_gate(process_id: str = Query(..., description="工艺 id")):
 def release_manifest(process_id: str = Query(..., description="工艺 id")):
     """交接清单：未签样或 ICC 已变更时返回 409（下游导出的门禁消费者）。"""
     proc = _process_or_404(process_id)
+    if is_archived(proc):
+        raise HTTPException(409, detail=archived_detail())
     try:
         return SignoffStore().release_manifest(proc)
     except PermissionError as e:
@@ -203,6 +219,13 @@ def lock_signoff(signoff_id: str, req: SignoffActionRequest):
 @router.delete("/{signoff_id}")
 def delete_signoff(signoff_id: str):
     store = SignoffStore()
+    existing = store.get(signoff_id)
+    if existing is None:
+        raise HTTPException(404, "签样记录不存在")
+    if existing.get("process_id"):
+        proc = _processes.get(existing.get("process_id", ""))
+        if proc is not None:
+            _ensure_active(proc)
     try:
         deleted = store.delete(signoff_id)
     except KeyError as e:

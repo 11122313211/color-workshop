@@ -182,10 +182,20 @@ def test_api_calibration_history_flow(api_client, process_factory):
     assert hist["round_no"] == 2 and hist["rounds"][0]["session_id"] == sid2
     assert hist["convergence"]["rounds"] == 2
 
-    # 工艺删除级联清理轮次
+    # V0.11：归档后历史仍可读；永久清理才删除轮次
     assert api_client.delete(f"/api/processes/{proc['id']}").status_code == 200
     hist = api_client.get("/api/qc/calibration/history", params={"process_id": proc["id"]})
-    assert hist.status_code == 404  # 工艺不存在
+    assert hist.status_code == 200
+    assert hist.json()["round_no"] == 2
+    assert len(CalibrationStore().list_for_process(proc["id"])) == 2
+
+    permanent = api_client.delete(
+        f"/api/processes/{proc['id']}/permanent",
+        params={"confirm": proc["id"]},
+    )
+    assert permanent.status_code == 200
+    hist = api_client.get("/api/qc/calibration/history", params={"process_id": proc["id"]})
+    assert hist.status_code == 404
     assert CalibrationStore().list_for_process(proc["id"]) == []
 
 

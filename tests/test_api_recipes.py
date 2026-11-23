@@ -184,16 +184,34 @@ def test_stats_drift_flag(api_client, cmyk_icc):
 
 
 def test_verify_after_process_deleted_404(api_client, cmyk_icc):
+    """V0.11：归档后写入 409；永久清理后才回到 404。"""
     proc = _make_process(api_client, cmyk_icc, name="删除工艺后verify")
     pr = api_client.post(
         "/api/recipes/predict",
         json={"process_id": proc["id"], "targets": [{"lab": [50.0, 20.0, 5.0]}]},
     ).json()
     rid = api_client.get(f"/api/recipes?process_id={proc['id']}").json()[0]["id"]
-    api_client.delete(f"/api/processes/{proc['id']}")
+    assert api_client.delete(f"/api/processes/{proc['id']}").status_code == 200
+
+    archived_predict = api_client.post(
+        "/api/recipes/predict",
+        json={"process_id": proc["id"], "targets": [{"lab": [50.0, 20.0, 5.0]}]},
+    )
+    assert archived_predict.status_code == 409
+    assert archived_predict.json()["detail"]["code"] == "PROCESS_ARCHIVED"
+    r = api_client.post("/api/recipes/verify", json={"recipe_id": rid, "measured_lab": [50, 20, 5]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "PROCESS_ARCHIVED"
+    assert api_client.get(f"/api/recipes?process_id={proc['id']}").json()
+
+    permanent = api_client.delete(
+        f"/api/processes/{proc['id']}/permanent",
+        params={"confirm": proc["id"]},
+    )
+    assert permanent.status_code == 200
     r = api_client.post("/api/recipes/verify", json={"recipe_id": rid, "measured_lab": [50, 20, 5]})
     assert r.status_code == 404
-    print("[PASS] 工艺删除后 verify 404")
+    print("[PASS] 归档写操作 409；永久清理后 verify 404")
 
 
 def test_compensation_accumulate_apply_reset(api_client, cmyk_icc):

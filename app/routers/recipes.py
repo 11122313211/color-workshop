@@ -16,6 +16,7 @@ from ..models.schemas import (
     RecipeVerifyResponse,
 )
 from ..services.compensation import CompensationStore
+from ..services.lifecycle import archived_detail, is_archived
 from ..services.processes import ProcessStore
 from ..services.recipe import (
     CHANNEL_NAMES,
@@ -32,11 +33,17 @@ _processes = ProcessStore()
 _compensations = CompensationStore()
 
 
+def _ensure_active(proc: dict) -> None:
+    if is_archived(proc):
+        raise HTTPException(409, detail=archived_detail())
+
+
 @router.post("/predict", response_model=RecipePredictResponse)
 def predict(req: RecipePredictRequest):
     proc = _processes.get(req.process_id)
     if not proc:
         raise HTTPException(404, "工艺不存在，请先在工艺库中创建")
+    _ensure_active(proc)
 
     icc_bytes = _processes.icc_bytes(req.process_id)
     device_space = proc["icc_meta"]["device_space"]
@@ -276,6 +283,12 @@ def export_recipe(rid: str, format: str = "json"):
 
 @router.delete("/{rid}")
 def delete_recipe(rid: str):
+    doc = recipe_store.get(rid)
+    if not doc:
+        raise HTTPException(404, "配方记录不存在")
+    proc = _processes.get(doc.get("process_id", ""))
+    if proc is not None:
+        _ensure_active(proc)
     if not recipe_store.delete(rid):
         raise HTTPException(404, "配方记录不存在")
     return {"status": "deleted"}
@@ -290,6 +303,7 @@ def verify(req: RecipeVerifyRequest):
     proc = _processes.get(doc["process_id"])
     if not proc:
         raise HTTPException(404, "配方所属工艺已被删除")
+    _ensure_active(proc)
 
     # V0.5 补偿门禁：关联测量会话时，仅当会话含 verified 记录才允许补偿沉淀
     comp_session = None

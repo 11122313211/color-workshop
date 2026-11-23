@@ -18,7 +18,7 @@ import { updateNavCount } from "./shell.js";
 
 /* ---------- 列表页 ---------- */
 
-const listState = { search: "", filter: "all", sort: "created", cache: [] };
+const listState = { search: "", filter: "all", sort: "created", cache: [], includeArchived: false };
 
 export async function renderProcessesView(view) {
   view.innerHTML = `
@@ -45,9 +45,29 @@ export async function renderProcessesView(view) {
         <button data-s="volume">体积</button>
         <button data-s="pass">达标</button>
       </div>
+      <button class="archive-toggle" id="proc-show-archived" type="button" aria-pressed="false"
+        title="显示已归档工艺（只读，可恢复或永久删除）">
+        <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+        <span>显示已归档</span>
+      </button>
     </div>
     <div id="process-list">${skeletonCards(4)}</div>
   `;
+
+  const archivedToggle = view.querySelector("#proc-show-archived");
+  const syncArchivedToggle = () => {
+    archivedToggle.setAttribute("aria-pressed", String(listState.includeArchived));
+    archivedToggle.classList.toggle("is-on", listState.includeArchived);
+    archivedToggle.title = listState.includeArchived
+      ? "隐藏已归档工艺"
+      : "显示已归档工艺（只读，可恢复或永久删除）";
+  };
+  syncArchivedToggle();
+  archivedToggle.addEventListener("click", () => {
+    listState.includeArchived = !listState.includeArchived;
+    syncArchivedToggle();
+    loadList(view);
+  });
 
   view.querySelector("#btn-new").addEventListener("click", () =>
     openProcessEditor(view, { mode: "create", onDone: loadList })
@@ -86,7 +106,9 @@ async function loadList(view) {
   box.innerHTML = `<div class="spinner"></div>`;
   try {
     // summary=1：一次请求带出色域摘要与达标率（消除逐卡 N+1）
-    listState.cache = await apiGet("/api/processes?summary=1");
+    const query = new URLSearchParams({ summary: "1" });
+    if (listState.includeArchived) query.set("include_archived", "1");
+    listState.cache = await apiGet(`/api/processes?${query.toString()}`);
     updateNavCount();
     renderCards(view);
   } catch (e) {
@@ -124,7 +146,7 @@ function renderCards(view) {
   if (!listState.cache.length) {
     box.innerHTML = emptyState({
       iconName: "stack", title: "还没有工艺",
-      desc: "上传一个 ICC 特性文件即可创建工艺。可以用打印机厂商提供的、RIP 导出的或系统自带的 ICC 文件。",
+      desc: "上传一个 ICC 特性文件即可创建工艺；若工艺已归档，可开启“显示已归档”查看只读记录。",
       action: `<button class="btn" id="empty-new">${icon("plus")}新建工艺</button>`,
     });
     box.querySelector("#empty-new").addEventListener("click", () =>
@@ -153,17 +175,40 @@ function renderCards(view) {
 
   box.innerHTML = `<div class="card-grid">${docs.map(cardHtml).join("")}</div>`;
   box.querySelectorAll(".process-card").forEach((el) => {
-    el.addEventListener("click", () => (location.hash = `#/processes/${el.dataset.id}`));
+    const open = () => (location.hash = `#/processes/${el.dataset.id}`);
+    el.addEventListener("click", open);
+    el.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
     // 迷你色域凸包缩略图（summary 数据本地绘制，零额外请求）
     drawMiniHull(el.querySelector(".process-mini-cie"), docs.find((d) => d.id === el.dataset.id));
   });
 }
 
+function isArchived(p) {
+  return Boolean(p && (p.archived_at || p.is_archived || p.archived === true));
+}
+
+function formatArchivedWhen(value) {
+  if (!value) return "未记录时间";
+  return String(value).replace("T", " ").replace(/(\.\d+)?Z$/, "");
+}
+
+function formatArchiveReason(value) {
+  if (!value) return "";
+  return value === "manual_archive" ? "手动归档" : String(value);
+}
+
 function cardHtml(p) {
   const space = p.icc_meta.device_space;
   const s = p.gamut_summary;
+  const archived = isArchived(p);
   return `
-  <div class="card process-card" data-id="${p.id}" tabindex="0" role="button" aria-label="打开工艺 ${esc(p.name)}">
+  <div class="card process-card ${archived ? "is-archived" : ""}" data-id="${p.id}" tabindex="0" role="button"
+    aria-label="打开${archived ? "已归档" : ""}工艺 ${esc(p.name)}">
     <div class="process-head">
       <div class="process-mini-cie"></div>
       <div class="grow-truncate">
@@ -172,10 +217,15 @@ function cardHtml(p) {
       </div>
     </div>
     <div class="proc-chips">
+      ${archived ? `<span class="badge badge-gray">${icon("stack")}已归档</span>` : ""}
       <span class="badge ${space === "CMYK" ? "badge-blue" : space === "GRAY" ? "badge-gray" : "badge-gray"}">${space} · ${p.icc_meta.channels}通道</span>
       ${p.paper ? `<span class="chip">${esc(p.paper)}</span>` : ""}
       ${p.measurement_condition ? `<span class="chip chip-mono">${esc(p.measurement_condition)}</span>` : ""}
     </div>
+    ${archived ? `<div class="proc-archive-meta">
+      <span>归档于 ${esc(formatArchivedWhen(p.archived_at))}</span>
+      ${p.archive_reason ? `<span class="proc-archive-reason">${esc(formatArchiveReason(p.archive_reason))}</span>` : ""}
+    </div>` : ""}
     <div class="process-stats">
       <div><b>${s ? formatVolume(s.volume) : "—"}</b><span>色域体积</span></div>
       <div><b>${s ? Math.round(s.coverage_srgb * 100) + "%" : "—"}</b><span>sRGB 覆盖</span></div>
@@ -227,6 +277,10 @@ function drawMiniHull(el, p) {
 
 function openProcessEditor(view, { mode = "create", process = null, onDone } = {}) {
   const isEdit = mode === "edit" && process;
+  if (isEdit && isArchived(process)) {
+    toast("工艺已归档，恢复后才能编辑或替换 ICC", "warn");
+    return;
+  }
   const m = openModal(`
     <h3 class="card-title">${icon(isEdit ? "pencil" : "upload")}${isEdit ? "编辑工艺" : "新建工艺"}</h3>
     ${
@@ -500,7 +554,7 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
 /* ---------- 工艺详情 ---------- */
 
 /* 补偿模型卡（V0.4）：实测闭环沉淀的工艺级墨量偏置 */
-function compensationCard(p) {
+function compensationCard(p, archived = false) {
   const c = p.compensation;
   const names = { CMYK: ["C", "M", "Y", "K"], RGB: ["R", "G", "B"], GRAY: ["K"] }[
     p.icc_meta.device_space
@@ -519,12 +573,17 @@ function compensationCard(p) {
       </span>
       <span class="page-sub" style="margin:0; flex:1; min-width:180px">实测闭环沉淀的墨量偏置，预测时自动应用</span>
       ${chips || `<span class="chip chip-mono">偏置≈0</span>`}
-      <button class="btn btn-secondary btn-sm" id="btn-comp-reset">重置</button>
+      <button class="btn btn-secondary btn-sm" id="btn-comp-reset"
+        ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能重置补偿模型"` : ""}>重置</button>
     </div>`;
 }
 
 /* 验证样张模态（V0.5 M3）：双点重复布局的 A4 CMYK 样张，PDF/TIFF 下载 */
 async function openTestformModal(view, p) {
+  if (isArchived(p)) {
+    toast("工艺已归档，恢复后才能生成验证样张", "warn");
+    return;
+  }
   const modal = openModal(`
     <h3 class="title">${icon("doc")}生成验证样张 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
     <p class="swatch-meta" style="margin-top:4px">A4 CMYK · 设备值直出（不做 ICC 转换，测的是设备自身表现）。
@@ -579,7 +638,7 @@ async function openTestformModal(view, p) {
 }
 
 /* 校准轮次历史卡（V0.8）：收敛判定 + max ΔE 趋势 + 最近轮次列表 */
-function calibrationHistoryCard(hist) {
+function calibrationHistoryCard(hist, archived = false) {
   const conv = hist.convergence || {};
   const convCls = { converged: "badge-green", improving: "badge-blue", worsening: "badge-red", flat: "badge-orange", "n/a": "" }[conv.status] || "";
   const convChip = conv.status && conv.status !== "n/a"
@@ -604,7 +663,8 @@ function calibrationHistoryCard(hist) {
         ${convChip}
         <span style="flex:1"></span>
         ${sparkline(hist.trend || [], { width: 130, height: 26, tolerance: 3.5 })}
-        <button class="btn btn-secondary btn-sm" data-cal-open type="button">${icon("printer")}打印校准</button>
+        <button class="btn btn-secondary btn-sm" data-cal-open type="button"
+          ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能打印校准"` : ""}>${icon("printer")}打印校准</button>
       </div>
       <div style="margin-top:6px">${rows}</div>
     </div>`;
@@ -637,13 +697,15 @@ function spectralRiskBadge(risk) {
 }
 
 function passportCard(p, latest) {
+  const archived = isArchived(p);
   if (!latest) {
     return `<div class="card" style="padding:14px 16px; margin-top:12px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span class="card-title" style="margin:0">${icon("doc")}工艺护照</span>
         <span class="badge badge-gray">未生成</span>
         <span style="flex:1"></span>
-        <button class="btn btn-sm" data-pp="refresh">${icon("plus")}生成护照</button>
+        <button class="btn btn-sm" data-pp="refresh"
+          ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能生成护照"` : ""}>${icon("plus")}生成护照</button>
       </div>
       <p class="swatch-meta" style="margin-top:8px">把 ICC、补偿、校准轮次、可信测量、配方统计与光谱风险固化为不可变版本；签样可通过 hash 引用护照。</p>
     </div>`;
@@ -669,7 +731,9 @@ function passportCard(p, latest) {
       <span class="chip chip-mono">v${latest.version}</span>
       <span class="chip chip-mono" title="${esc(latest.passport_hash)}">#${esc((latest.passport_hash || "").slice(0, 12))}</span>
       <span style="flex:1"></span>
-      <button class="btn btn-sm" data-pp="refresh">${icon("refresh")}生成 / 刷新</button>
+      <button class="btn btn-secondary btn-sm" data-pp="versions">${icon("stack")}版本历史</button>
+      <button class="btn btn-sm" data-pp="refresh"
+        ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能生成或刷新护照"` : ""}>${icon("refresh")}生成 / 刷新</button>
       <a class="btn btn-secondary btn-sm" href="/api/processes/${encodeURIComponent(p.id)}/passport/${latest.version}/export?format=json" download>${icon("download")}JSON</a>
       <a class="btn btn-secondary btn-sm" href="/api/processes/${encodeURIComponent(p.id)}/passport/${latest.version}/export?format=md" download>${icon("download")}MD</a>
       <button class="btn btn-secondary btn-sm" data-pp="detail">查看详情</button>
@@ -729,9 +793,99 @@ function openPassportDetail(latest) {
   m.modal.querySelector("[data-close]").addEventListener("click", m.close);
 }
 
+function openPassportVersions(p) {
+  const m = openModal(`
+    <h3 class="card-title">${icon("stack")}护照版本历史 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
+    <p class="swatch-meta" style="margin-top:4px">版本快照只读；签样引用可帮助判断旧版本仍在哪些放行记录中使用。</p>
+    <div id="passport-versions-body" style="margin-top:14px"><div class="spinner"></div></div>
+  `);
+  m.modal.style.width = "min(860px, 100%)";
+  const body = m.modal.querySelector("#passport-versions-body");
+
+  const openVersion = async (version, row) => {
+    if (row?.classList.contains("is-loading")) return;
+    row?.classList.add("is-loading");
+    try {
+      const passport = await apiGet(
+        `/api/processes/${encodeURIComponent(p.id)}/passport/${encodeURIComponent(version.version)}`
+      );
+      openPassportDetail(passport);
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      row?.classList.remove("is-loading");
+    }
+  };
+
+  const load = async () => {
+    body.innerHTML = `<div style="display:flex;align-items:center;gap:8px"><span class="spinner"></span><span class="swatch-meta">读取版本历史…</span></div>`;
+    try {
+      const versions = await apiGet(`/api/processes/${encodeURIComponent(p.id)}/passport/versions`);
+      if (!m.modal.isConnected) return;
+      if (!versions.length) {
+        body.innerHTML = emptyState({
+          iconName: "doc", title: "暂无护照版本",
+          desc: "生成工艺护照后，每次证据变化会沉淀为新的不可变版本。",
+        });
+        return;
+      }
+      const stateLabel = { draft: "草稿", pending: "待确认", approved: "已批准", rejected: "已驳回", locked: "已锁定" };
+      const rows = versions.map((v) => {
+        const refs = v.referenced_by_signoffs || [];
+        const refCount = v.referenced_count ?? refs.length;
+        const warningCount = Array.isArray(v.warnings) ? v.warnings.length : Number(v.warnings || 0);
+        const refHtml = refs.length
+          ? refs.map((ref) => `<span class="version-ref">${esc(ref.title || ref.id || "未命名签样")}
+              <span class="chip">${esc(stateLabel[ref.state] || ref.state || "未知")}</span></span>`).join("")
+          : (refCount > 0 ? `<span class="swatch-meta">${refCount} 条签样引用</span>` : "—");
+        return `<tr tabindex="0" role="button" class="passport-version-row"
+          data-version="${v.version}" aria-label="查看护照 v${v.version} 只读详情">
+          <td data-label="版本"><span class="chip chip-mono">v${v.version}</span>${v.is_latest ? `<span class="badge badge-blue">当前</span>` : ""}</td>
+          <td data-label="状态">${passportBadge(v.status, v.status_label)}</td>
+          <td data-label="Hash"><span class="version-hash chip chip-mono" title="${esc(v.passport_hash || "")}">${esc(v.passport_hash || "—")}</span></td>
+          <td data-label="生成时间" class="swatch-meta">${esc(formatArchivedWhen(v.generated_at))}</td>
+          <td data-label="警告">${warningCount ? `<span class="badge badge-orange">${warningCount} 条</span>` : `<span class="swatch-meta">0</span>`}</td>
+          <td data-label="签样引用">${refHtml}</td>
+        </tr>`;
+      }).join("");
+      body.innerHTML = `
+        <div class="passport-version-wrap">
+          <table class="version-table">
+            <thead><tr><th>版本</th><th>状态</th><th>Hash</th><th>生成时间</th><th>警告</th><th>签样引用</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <p class="swatch-meta" style="margin-top:10px">点击任意版本行打开只读详情；归档工艺的历史版本同样可查看。</p>
+        <div style="display:flex;justify-content:flex-end;margin-top:16px">
+          <button class="btn btn-secondary" data-close>关闭</button>
+        </div>`;
+      body.querySelectorAll("[data-version]").forEach((row) => {
+        const version = versions.find((v) => String(v.version) === row.dataset.version);
+        row.addEventListener("click", () => openVersion(version, row));
+        row.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            openVersion(version, row);
+          }
+        });
+      });
+      body.querySelector("[data-close]").addEventListener("click", m.close);
+    } catch (e) {
+      body.innerHTML = `<div class="issue issue-error">${icon("xmark")}<span>${esc(e.message)}</span></div>
+        <div style="display:flex;justify-content:flex-end;margin-top:14px">
+          <button class="btn btn-secondary" id="pp-versions-retry">重试</button>
+        </div>`;
+      body.querySelector("#pp-versions-retry").addEventListener("click", load);
+    }
+  };
+
+  load();
+}
+
 async function renderPassportSlot(view, p) {
   const slot = view.querySelector("#passport-slot");
   if (!slot) return;
+  const archived = isArchived(p);
   let latest = null;
   try {
     latest = await apiGet(`/api/processes/${encodeURIComponent(p.id)}/passport`);
@@ -745,7 +899,9 @@ async function renderPassportSlot(view, p) {
   slot.innerHTML = passportCard(p, latest);
   const card = slot.querySelector(".passport-card");
   if (!card) return;
-  card.querySelector('[data-pp="refresh"]')?.addEventListener("click", async (event) => {
+  const refreshBtn = card.querySelector('[data-pp="refresh"]');
+  if (refreshBtn && !archived) refreshBtn.addEventListener("click", async (event) => {
+    if (isArchived(p)) return;
     const btn = event.currentTarget;
     btn.disabled = true;
     try {
@@ -758,6 +914,7 @@ async function renderPassportSlot(view, p) {
     }
   });
   card.querySelector('[data-pp="detail"]')?.addEventListener("click", () => openPassportDetail(latest));
+  card.querySelector('[data-pp="versions"]')?.addEventListener("click", () => openPassportVersions(p));
 }
 
 /* ---------- 签样与放行（V0.9 · P0-3）：draft→pending→approved→locked ---------- */
@@ -790,7 +947,10 @@ function evidenceText(ev = {}) {
   return bits.length ? bits.join(" · ") : "未关联依据";
 }
 
-function signoffActions(latest) {
+function signoffActions(latest, archived = false) {
+  if (archived) {
+    return `<span class="readonly-pill">${icon("info")}只读 · 恢复后可继续签样</span>`;
+  }
   if (!latest) return `<button class="btn btn-sm" data-sg="create">${icon("plus")}新建签样</button>`;
   const state = latest.state;
   if (state === "draft") {
@@ -816,17 +976,23 @@ function signoffActions(latest) {
   return "";
 }
 
-function signoffCard(rows, gate) {
+function signoffCard(rows, gate, archived = false) {
   const latest = rows[0];
   const [label, cls] = latest
     ? (SIGNOFF_STATE[latest.state] || ["未知", "badge badge-gray"])
     : ["未签样", "badge badge-gray"];
-  const gateLine = gate.allowed
-    ? `<span style="color:var(--green);display:inline-flex;align-items:center;gap:6px">${icon("check")}${esc(gate.message)}</span>`
-    : `<span style="color:var(--orange);display:inline-flex;align-items:center;gap:6px">${icon("warn")}${esc(gate.message)}</span>`;
-  const passportGate = String(gate.reason || "").startsWith("passport_");
+  const gateReason = String(gate.reason || "");
+  const archivedGate = gateReason === "process_archived";
+  const passportChanged = gateReason === "passport_changed";
+  const gateLine = archivedGate
+    ? `<div class="issue issue-info archived-gate">${icon("info")}<span>工艺已归档，签样与放行门禁为只读；恢复工艺后可继续签样、提交或放行。</span></div>`
+    : gate.allowed
+      ? `<span style="color:var(--green);display:inline-flex;align-items:center;gap:6px">${icon("check")}${esc(gate.message)}</span>`
+      : `<span style="color:var(--orange);display:inline-flex;align-items:center;gap:6px">${icon("warn")}${esc(gate.message)}</span>`;
+  const passportGate = gateReason.startsWith("passport_");
   const gateExtra = passportGate
-    ? `<div class="swatch-meta" style="margin-top:6px">签样护照 <span class="chip chip-mono">${esc((gate.snapshot_passport || "").slice(0, 10) || "—")}</span>
+    ? `<div class="swatch-meta signoff-passport-gate" style="margin-top:6px"
+        ${passportChanged ? `role="alert" aria-live="assertive"` : ""}>签样护照 <span class="chip chip-mono">${esc((gate.snapshot_passport || "").slice(0, 10) || "—")}</span>
         当前最新护照 <span class="chip chip-mono">${esc((gate.current_passport || "").slice(0, 10) || "—")}</span>
         ${gate.passport_status ? passportBadge(gate.passport_status, gate.passport_status_label) : ""}</div>`
     : "";
@@ -847,7 +1013,7 @@ function signoffCard(rows, gate) {
           ${icon("check")}签样放行 <span class="${cls}">${label}</span>
         </span>
         <span style="flex:1"></span>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">${signoffActions(latest)}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">${signoffActions(latest, archived)}</div>
       </div>
       <div style="margin-top:8px;font-size:13px">${gateLine}</div>
       ${gateExtra}
@@ -856,6 +1022,10 @@ function signoffCard(rows, gate) {
 }
 
 function openSignoffCreate(p, onDone) {
+  if (isArchived(p)) {
+    toast("工艺已归档，恢复后才能新建签样", "warn");
+    return;
+  }
   const m = openModal(`
     <h3 class="card-title">${icon("check")}新建签样 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
     <div class="field"><label>签样标题</label><input class="input" id="sg-title" maxlength="80" value="${esc(p.name)} 签样"></div>
@@ -970,6 +1140,10 @@ async function downloadSignoffManifest(p) {
  * 校准建议一键写入补偿模型（预测联动）；校正曲线/特性数据导出供外部专业软件生成 ICC。
  * V0.8：轮次化——apply 落库轮次，报告自动对比上一轮（改善/持平/恶化），收敛判定。 */
 async function openCalibrationModal(view, p) {
+  if (isArchived(p)) {
+    toast("工艺已归档，恢复后才能打印校准", "warn");
+    return;
+  }
   const state = { step: 1, form: null, sessionId: "", report: null, applied: null };
   const OVERALL_BADGE = {
     ok: `<span class="badge badge-green">${icon("check")}达标</span>`,
@@ -1215,9 +1389,10 @@ async function openCalibrationModal(view, p) {
 }
 
 /* 色域对比模态（V0.4）：双工艺凸包叠加 + 交集多边形 + xy 面积指标 */
-async function openCompareModal(view, p) {  let others = [];
+async function openCompareModal(view, p) {
+  let others = [];
   try {
-    others = (await apiGet("/api/processes")).filter((x) => x.id !== p.id);
+    others = (await apiGet("/api/processes?include_archived=1")).filter((x) => x.id !== p.id);
   } catch (_) { /* 列表失败也可手动刷新重试 */ }
 
   const { modal, close } = openModal(`
@@ -1228,7 +1403,7 @@ async function openCompareModal(view, p) {  let others = [];
       ${others.length ? `
         <label class="page-sub" style="margin:0">对比工艺</label>
         <select id="cmp-other" style="width:100%; margin-top:8px; padding:9px 12px; border:1px solid var(--separator); border-radius:var(--radius-btn); background:var(--fill); color:var(--label); font-size:14px">
-          ${others.map((x) => `<option value="${x.id}">${esc(x.name)}（${x.icc_meta.device_space}）</option>`).join("")}
+          ${others.map((x) => `<option value="${x.id}">${esc(x.name)}（${x.icc_meta.device_space}${isArchived(x) ? " · 已归档" : ""}）</option>`).join("")}
         </select>
         <div style="display:flex; gap:10px; margin-top:14px; justify-content:flex-end">
           <button class="btn btn-secondary btn-sm" id="cmp-cancel">关闭</button>
@@ -1311,6 +1486,185 @@ function renderCompareResult(el, p, otherName, data) {
   });
 }
 
+function archiveBanner(p) {
+  return `
+    <section class="archive-banner" aria-label="归档工艺只读信息">
+      <div class="archive-banner-icon">${icon("stack")}</div>
+      <div class="archive-banner-body">
+        <div class="archive-banner-title">已归档 · 只读模式</div>
+        <div class="archive-banner-meta">
+          <span><b>归档时间</b>${esc(formatArchivedWhen(p.archived_at))}</span>
+          <span><b>原因</b>${esc(formatArchiveReason(p.archive_reason) || "未填写")}</span>
+          <span><b>操作人</b>${esc(p.archived_by || "未记录")}</span>
+        </div>
+        <p class="swatch-meta" style="margin:7px 0 0">读取、下载 ICC、护照详情/版本历史与色域对比保持可用；所有写入、校准、签样和护照刷新操作已停用。</p>
+      </div>
+      <div class="archive-banner-actions">
+        <button class="btn btn-secondary btn-sm" id="btn-restore-process">${icon("refresh")}恢复</button>
+        <button class="btn btn-danger btn-sm" id="btn-permanent-delete">${icon("trash")}永久删除</button>
+      </div>
+    </section>`;
+}
+
+function openArchiveModal(p, onArchived) {
+  const m = openModal(`
+    <h3 class="card-title">${icon("stack")}归档工艺 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
+    <div class="issue issue-info" style="margin-top:10px">${icon("info")}<span>归档优先保留证据。归档后工艺转为只读，可随时恢复；不会自动删除 ICC、配方、补偿、校准或护照。</span></div>
+    <div class="field" style="margin-top:14px">
+      <label>归档原因</label>
+      <textarea class="input" id="archive-reason" rows="3" maxlength="120" placeholder="如：设备退役、纸张停产、样张不再投产"></textarea>
+    </div>
+    <div class="field" style="margin-top:10px">
+      <label>操作人 *</label>
+      <input class="input" id="archive-actor" maxlength="40" placeholder="姓名">
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button class="btn btn-ghost" data-cancel>取消</button>
+      <button class="btn btn-danger" id="archive-confirm">${icon("stack")}确认归档</button>
+    </div>
+  `);
+  m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
+  m.modal.querySelector("#archive-confirm").addEventListener("click", async (event) => {
+    const actor = m.modal.querySelector("#archive-actor").value.trim();
+    const reason = m.modal.querySelector("#archive-reason").value.trim();
+    if (!actor) return toast("请填写归档操作人", "warn");
+    const btn = event.currentTarget;
+    btn.disabled = true;
+    try {
+      await apiPost(`/api/processes/${encodeURIComponent(p.id)}/archive`, { reason, actor });
+      toast("工艺已归档，可在列表中开启“显示已归档”查看", "ok");
+      m.close();
+      if (onArchived) onArchived();
+    } catch (e) {
+      btn.disabled = false;
+      toast(e.message, "err");
+    }
+  });
+}
+
+function dependencyValue(dep, keys) {
+  for (const key of keys) {
+    if (dep && dep[key] !== undefined && dep[key] !== null) return dep[key];
+  }
+  return null;
+}
+
+function dependencyCount(dep, keys, preferred = []) {
+  const value = dependencyValue(dep, keys);
+  if (value == null) return 0;
+  if (typeof value === "number") return value;
+  if (typeof value === "boolean") return value ? 1 : 0;
+  if (Array.isArray(value)) return value.length;
+  if (typeof value === "object") {
+    for (const key of preferred) {
+      if (typeof value[key] === "number") return value[key];
+    }
+    for (const key of ["count", "total", "rounds", "versions", "n"]) {
+      if (typeof value[key] === "number") return value[key];
+    }
+    const numbers = Object.values(value).filter((v) => typeof v === "number");
+    if (numbers.length) return Math.max(...numbers);
+  }
+  return 0;
+}
+
+function dependencySingleCount(dep, keys) {
+  const value = dependencyValue(dep, keys);
+  if (value == null) return 0;
+  if (typeof value === "boolean") return value ? 1 : 0;
+  if (typeof value === "number") return value > 0 ? 1 : 0;
+  if (Array.isArray(value)) return value.length;
+  if (typeof value === "object") {
+    if (typeof value.exists === "boolean") return value.exists ? 1 : 0;
+    if (typeof value.present === "boolean") return value.present ? 1 : 0;
+    if (typeof value.n === "number" && value.n <= 0) return 0;
+    return 1;
+  }
+  return 0;
+}
+
+function openPermanentDeleteModal(p) {
+  const m = openModal(`
+    <h3 class="card-title">${icon("warn")}永久删除 · <span style="color:var(--label-2)">${esc(p.name)}</span></h3>
+    <p class="swatch-meta" style="margin-top:4px">正在读取关联数据，确认前不会执行任何删除。</p>
+    <div id="dependency-body" style="margin-top:14px"><div class="spinner"></div></div>
+  `);
+  const body = m.modal.querySelector("#dependency-body");
+
+  (async () => {
+    let deps;
+    try {
+      deps = await apiGet(`/api/processes/${encodeURIComponent(p.id)}/dependencies`);
+    } catch (e) {
+      body.innerHTML = `<div class="issue issue-error">${icon("xmark")}<span>关联数据读取失败：${esc(e.message)}</span></div>
+        <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+          <button class="btn btn-secondary" data-close>关闭</button>
+        </div>`;
+      body.querySelector("[data-close]").addEventListener("click", m.close);
+      return;
+    }
+    if (!m.modal.isConnected) return;
+
+    const counts = [
+      ["ICC 文件", deps?.icc === false || deps?.has_icc === false ? 0 : 1],
+      ["配方", dependencyCount(deps, ["recipes"])],
+      ["补偿模型", dependencySingleCount(deps, ["compensation"])],
+      ["校准轮次", dependencyCount(deps, ["calibrations", "calibration"], ["rounds"])],
+      ["护照版本", dependencyCount(deps, ["passports"], ["versions"])],
+      ["测量会话", dependencyCount(deps, ["measurement_sessions", "measurements"], ["total"])],
+      ["主观评价", dependencyCount(deps, ["evaluations"], ["total"])],
+      ["签样", dependencyCount(deps, ["signoffs"], ["total"])],
+    ];
+    const blockersRaw = deps?.blockers;
+    const blockers = Array.isArray(blockersRaw)
+      ? blockersRaw.map((b) => typeof b === "string" ? b : b?.message || b?.reason || JSON.stringify(b)).filter(Boolean)
+      : blockersRaw ? [String(blockersRaw)] : [];
+    const canDelete = deps?.can_permanent_delete !== false && blockers.length === 0;
+    body.innerHTML = `
+      <div class="issue issue-error">${icon("warn")}<span>永久删除不可撤销，仅适用于已归档工艺。</span></div>
+      <div class="dependency-grid">
+        ${counts.map(([label, count]) => `<div class="dependency-item">
+          <b>${count}</b><span>${esc(label)}</span>
+        </div>`).join("")}
+      </div>
+      <div class="permanent-delete-notes">
+        <div><b>会永久删除</b><span>工艺、ICC 文件、配方、补偿模型、校准轮次与护照版本。</span></div>
+        <div><b>会解绑保留</b><span>测量会话与主观评价解除工艺归属，但仍保留作审计证据。</span></div>
+        <div><b>会标记孤儿</b><span>签样记录不删除，标记为孤儿并保留标题、状态与历史。</span></div>
+      </div>
+      ${blockers.length ? `<div class="issue-list" style="margin-top:12px">${blockers.map((b) =>
+        `<div class="issue issue-warn">${icon("warn")}<span>${esc(b)}</span></div>`).join("")}</div>` : ""}
+      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px">
+        <button class="btn btn-ghost" data-cancel>取消</button>
+        <button class="btn btn-danger" id="dependency-delete"
+          ${canDelete ? "" : `disabled aria-disabled="true" title="存在阻断项，当前不能永久删除"`}>${icon("trash")}永久删除</button>
+      </div>`;
+    body.querySelector("[data-cancel]").addEventListener("click", m.close);
+    body.querySelector("#dependency-delete").addEventListener("click", async (event) => {
+      const btn = event.currentTarget;
+      const ok = await confirmDanger({
+        title: "永久删除该工艺？",
+        message: "ICC、配方、补偿、校准与护照将删除；测量/评价解绑保留，签样标记孤儿。此操作不可撤销。",
+        confirmText: "永久删除",
+      });
+      if (!ok) return;
+      btn.disabled = true;
+      try {
+        await apiDelete(
+          `/api/processes/${encodeURIComponent(p.id)}/permanent?confirm=${encodeURIComponent(p.id)}`
+        );
+        toast("工艺已永久删除，测量/评价与签样审计证据已保留", "ok");
+        m.close();
+        updateNavCount();
+        location.hash = "#/processes";
+      } catch (e) {
+        btn.disabled = false;
+        toast(e.message, "err");
+      }
+    });
+  })();
+}
+
 export async function renderProcessDetail(view, params) {
   view.innerHTML = `<div class="spinner"></div>`;
   let p;
@@ -1321,6 +1675,7 @@ export async function renderProcessDetail(view, params) {
     return;
   }
 
+  const archived = isArchived(p);
   const gamutPromise = apiGet(`/api/processes/${p.id}/gamut?levels=7`);
   const recipesPromise = apiGet(`/api/recipes?process_id=${p.id}`);
 
@@ -1334,11 +1689,16 @@ export async function renderProcessDetail(view, params) {
         </div>
       </div>
       <div class="head-actions">
-        <button class="btn btn-sm" id="btn-use">${icon("wand")}用此工艺预测</button>
-        <button class="btn btn-secondary btn-sm" id="btn-edit">${icon("pencil")}编辑</button>
-        <button class="icon-btn" id="btn-delete" aria-label="删除工艺" style="color:var(--red)">${icon("trash")}</button>
+        <button class="btn btn-sm" id="btn-use"
+          ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能用此工艺预测"` : ""}>${icon("wand")}用此工艺预测</button>
+        <button class="btn btn-secondary btn-sm" id="btn-edit"
+          ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能编辑"` : ""}>${icon("pencil")}编辑</button>
+        ${archived ? "" : `<button class="btn btn-danger btn-sm" id="btn-archive"
+          title="归档后工艺只读，可随时恢复">${icon("stack")}归档</button>`}
       </div>
     </div>
+
+    ${archived ? archiveBanner(p) : ""}
 
     <div class="stat-grid">
       <div class="card stat"><div class="stat-val" id="st-volume"><span class="spinner"></span></div><div class="stat-label">色域体积（Lab 包围盒）</div></div>
@@ -1347,7 +1707,7 @@ export async function renderProcessDetail(view, params) {
       <div class="card stat"><div class="stat-val" id="st-pass"><span class="spinner"></span></div><div class="stat-label">配方达标率（近 20 条）</div></div>
     </div>
 
-    ${p.compensation && p.compensation.n > 0 ? compensationCard(p) : ""}
+    ${p.compensation && p.compensation.n > 0 ? compensationCard(p, archived) : ""}
     <div id="passport-slot">${skeletonCards(1)}</div>
     ${p.icc_meta.device_space === "CMYK" ? `<div id="cal-history-slot">${skeletonCards(1)}</div>` : ""}
     <div id="signoff-slot">${skeletonCards(1)}</div>
@@ -1357,9 +1717,11 @@ export async function renderProcessDetail(view, params) {
         <div class="card-title">${icon("target")}工艺色域</div>
         <div class="gamut-actions">
           ${p.icc_meta.device_space === "CMYK"
-            ? `<button class="btn btn-secondary btn-sm" id="btn-calibration">${icon("printer")}打印校准</button>`
+            ? `<button class="btn btn-secondary btn-sm" id="btn-calibration"
+                ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能打印校准"` : ""}>${icon("printer")}打印校准</button>`
             : ""}
-          <button class="btn btn-secondary btn-sm" id="btn-testform">${icon("doc")}生成验证样张</button>
+          <button class="btn btn-secondary btn-sm" id="btn-testform"
+            ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能生成验证样张"` : ""}>${icon("doc")}生成验证样张</button>
           <button class="btn btn-secondary btn-sm" id="btn-compare">${icon("compare")}色域对比</button>
         </div>
       </div>
@@ -1384,7 +1746,8 @@ export async function renderProcessDetail(view, params) {
         </dl>
         <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap">
           <a class="btn btn-secondary btn-sm" href="/api/processes/${p.id}/icc" download="${esc(p.icc_original_name)}">${icon("download")}下载 ICC</a>
-          <button class="btn btn-secondary btn-sm" id="btn-replace">${icon("swap")}替换 ICC</button>
+          <button class="btn btn-secondary btn-sm" id="btn-replace"
+            ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能替换 ICC"` : ""}>${icon("swap")}替换 ICC</button>
         </div>
       </div>
 
@@ -1399,7 +1762,7 @@ export async function renderProcessDetail(view, params) {
   renderPassportSlot(view, p);
 
   const compResetBtn = view.querySelector("#btn-comp-reset");
-  if (compResetBtn) {
+  if (compResetBtn && !archived) {
     compResetBtn.addEventListener("click", async () => {
       const ok = await confirmDanger({
         title: "重置补偿模型？",
@@ -1418,17 +1781,25 @@ export async function renderProcessDetail(view, params) {
   }
 
   view.querySelector(".btn-back").addEventListener("click", () => (location.hash = "#/processes"));
-  view.querySelector("#btn-use").addEventListener("click", () => (location.hash = `#/recipes?process=${p.id}`));
-  view.querySelector("#btn-edit").addEventListener("click", () =>
-    openProcessEditor(view, { mode: "edit", process: p, onDone: reload })
-  );
-  view.querySelector("#btn-replace").addEventListener("click", () =>
-    openProcessEditor(view, { mode: "edit", process: p, onDone: reload })
-  );
+  if (!archived) {
+    view.querySelector("#btn-use").addEventListener("click", () => (location.hash = `#/recipes?process=${p.id}`));
+    view.querySelector("#btn-edit").addEventListener("click", () =>
+      openProcessEditor(view, { mode: "edit", process: p, onDone: reload })
+    );
+    view.querySelector("#btn-replace").addEventListener("click", () =>
+      openProcessEditor(view, { mode: "edit", process: p, onDone: reload })
+    );
+    view.querySelector("#btn-archive").addEventListener("click", () =>
+      openArchiveModal(p, () => {
+        updateNavCount();
+        location.hash = "#/processes";
+      })
+    );
+  }
   view.querySelector("#btn-compare").addEventListener("click", () => openCompareModal(view, p));
-  view.querySelector("#btn-testform").addEventListener("click", () => openTestformModal(view, p));
+  if (!archived) view.querySelector("#btn-testform").addEventListener("click", () => openTestformModal(view, p));
   const calBtn = view.querySelector("#btn-calibration");
-  if (calBtn) calBtn.addEventListener("click", () => openCalibrationModal(view, p));
+  if (calBtn && !archived) calBtn.addEventListener("click", () => openCalibrationModal(view, p));
 
   // V0.8：校准轮次历史（异步填充；失败静默——无轮次不显示卡片）
   const calSlot = view.querySelector("#cal-history-slot");
@@ -1437,9 +1808,11 @@ export async function renderProcessDetail(view, params) {
       try {
         const hist = await apiGet(`/api/qc/calibration/history?process_id=${encodeURIComponent(p.id)}`);
         if (!hist.rounds.length) { calSlot.innerHTML = ""; return; }
-        calSlot.innerHTML = calibrationHistoryCard(hist);
-        calSlot.querySelector("[data-cal-open]")?.addEventListener("click", () =>
-          openCalibrationModal(view, { ...p, compensation: undefined }));
+        calSlot.innerHTML = calibrationHistoryCard(hist, archived);
+        if (!archived) {
+          calSlot.querySelector("[data-cal-open]")?.addEventListener("click", () =>
+            openCalibrationModal(view, { ...p, compensation: undefined }));
+        }
       } catch (_) { calSlot.innerHTML = ""; }
     })();
   }
@@ -1454,7 +1827,7 @@ export async function renderProcessDetail(view, params) {
           apiGet(`/api/signoffs/gate?process_id=${encodeURIComponent(p.id)}`),
         ]);
         if (!view.isConnected) return;
-        sgSlot.innerHTML = signoffCard(rows, gate);
+        sgSlot.innerHTML = signoffCard(rows, gate, archived);
         const card = sgSlot.querySelector(".card");
         const reload = () => renderProcessDetail(view, params);
         card.querySelectorAll("[data-sg]").forEach((btn) => {
@@ -1484,22 +1857,22 @@ export async function renderProcessDetail(view, params) {
       } catch (_) { sgSlot.innerHTML = ""; }
     })();
   }
-  view.querySelector("#btn-delete").addEventListener("click", async () => {
-    const ok = await confirmDanger({
-      title: `删除工艺「${p.name}」？`,
-      message: "其 ICC 文件与全部配方历史将一并移除，此操作不可撤销。",
-      confirmText: "仍要删除",
+  const restoreBtn = view.querySelector("#btn-restore-process");
+  if (restoreBtn) {
+    restoreBtn.addEventListener("click", async () => {
+      restoreBtn.disabled = true;
+      try {
+        await apiPost(`/api/processes/${encodeURIComponent(p.id)}/restore`, {});
+        toast("工艺已恢复为可编辑状态", "ok");
+        updateNavCount();
+        reload();
+      } catch (e) {
+        restoreBtn.disabled = false;
+        toast(e.message, "err");
+      }
     });
-    if (!ok) return;
-    try {
-      await apiDelete(`/api/processes/${p.id}`);
-      toast("工艺已删除");
-      updateNavCount();
-      location.hash = "#/processes";
-    } catch (e) {
-      toast(e.message, "err");
-    }
-  });
+  }
+  view.querySelector("#btn-permanent-delete")?.addEventListener("click", () => openPermanentDeleteModal(p));
 
   // 色域主区（2D/3D 组件）+ 概览指标
   try {

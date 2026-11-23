@@ -1,5 +1,48 @@
 /* API 封装：统一 fetch + 错误处理 */
 
+function detailMessage(detail, fallback) {
+  if (detail == null || detail === "") return fallback;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") return item.message || item.msg || "";
+        return "";
+      })
+      .filter(Boolean);
+    return parts.length ? parts.join("；") : fallback;
+  }
+  if (typeof detail === "object") {
+    const code = detail.code || detail.error_code;
+    const message = detail.message || detail.msg;
+    if (typeof message === "string" && message) {
+      return code && !message.includes(String(code)) ? `${message}（${code}）` : message;
+    }
+    if (detail.detail !== undefined && detail.detail !== null && detail.detail !== detail) {
+      const nested = detailMessage(detail.detail, fallback);
+      return code && !nested.includes(String(code)) ? `${nested}（${code}）` : nested;
+    }
+    if (code) return `${fallback}（${code}）`;
+    try {
+      const serialized = JSON.stringify(detail);
+      return serialized && serialized !== "{}" ? serialized : fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+  return String(detail);
+}
+
+function errorFromDetail(detail, fallback) {
+  const err = new Error(detailMessage(detail, fallback));
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    err.code = detail.code || detail.error_code || "";
+    err.detail = detail;
+  }
+  return err;
+}
+
 async function request(path, options = {}) {
   let resp;
   try {
@@ -11,9 +54,9 @@ async function request(path, options = {}) {
     let detail = `HTTP ${resp.status}`;
     try {
       const data = await resp.json();
-      detail = data.detail || detail;
+      detail = data.detail ?? detail;
     } catch (_) { /* 保留状态码信息 */ }
-    throw new Error(String(detail));
+    throw errorFromDetail(detail, `HTTP ${resp.status}`);
   }
   return resp.json();
 }
@@ -83,8 +126,8 @@ export function apiUploadICC(iccBytes, meta, { onProgress } = {}) {
         catch (_) { resolve(null); }
       } else {
         let detail = `HTTP ${xhr.status}`;
-        try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
-        reject(new Error(String(detail)));
+        try { detail = JSON.parse(xhr.responseText).detail ?? detail; } catch (_) {}
+        reject(errorFromDetail(detail, `HTTP ${xhr.status}`));
       }
     };
     xhr.onerror = () => reject(new Error("无法连接服务器，请确认后端已启动"));

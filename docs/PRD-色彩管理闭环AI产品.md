@@ -1,10 +1,10 @@
-# 色彩工坊 · 印前色彩管理闭环平台 —— 产品需求文档（PRD，V0.10）
+# 色彩工坊 · 印前色彩管理闭环平台 —— 产品需求文档（PRD，V0.11）
 
-> 版本：v1.0 历史基线 ｜ 日期：2026-11-12 ｜ 当前修订：V0.10 已实现（2026-11-23）
+> 版本：v1.0 历史基线 ｜ 日期：2026-11-12 ｜ 当前修订：V0.11 已实现（2026-11-23）
 > 当前定位：**印前色彩数值优化 + 光谱证据平台**；不以模型能力作为卖点。
 
 > **历史说明**：文件名保留历史命名；第 2.4–5.7 节中早于 V0.10 的 AI 设想仅作历史语境，
-> 当前定位、范围与验收以附录 B 为准。
+> 当前定位、范围与验收以附录 C 为准。
 
 ---
 
@@ -610,3 +610,86 @@ V0.10 将“配方”这一容易混淆的词拆成两个明确概念：
 - 护照版本历史已提供 API，但未实现独立 UI 历史列表。
 - 光谱双曲线当前以颜色 + 图例区分，并附 Lab/ΔE00 数据表；线型/标记等非颜色编码待补。
 - 完整 200% 缩放与屏幕阅读器审计未完成；模态焦点圈闭、ESC、焦点恢复已实现。
+
+---
+
+## 附录 C · V0.11 已实现：生命周期完整性、护照历史与可用性修复（2026-11）
+
+> **状态：已交付/验收完成（2026-11-23）。** 全量 `pytest` **260 passed**；
+> 隔离数据目录 + 8797 端口运行 `scripts/e2e_http.py` 得到 **E2E ALL OK**；
+> `scripts/shoot_v11.py` 产出 7 张截图，Playwright 键盘路径通过且无页面错误。
+> 规划见 [V0.11-实施规划](V0.11-实施规划.md)，实现记录见
+> [V0.11-实施记录](V0.11-实施记录.md)，验收清单见 [V0.11-验收](V0.11-验收.md)。
+
+### C1. 产品决策：归档优先
+
+V0.11 将工艺删除从“立即硬删”改为**归档优先**：
+
+- `DELETE /api/processes/{pid}` 归档而非删除；默认列表排除归档，
+  `include_archived=1` 可查看。
+- 归档可逆；`archived_at/archive_reason/archived_by` 留痕。旧数据缺字段按 active 处理，
+  不做强制迁移。
+- 归档工艺只读。任何会改变证据的写操作返回 `409`
+  且 `detail.code=PROCESS_ARCHIVED`；读取、gamut、ICC 下载与护照历史保持可用。
+- 放行门禁对归档工艺返回 `reason=process_archived`；交接清单 409。
+
+### C2. 永久清理与完整性审计
+
+永久清理规则：
+
+| 对象 | 规则 |
+|---|---|
+| 工艺 + ICC | 删除 |
+| 配方 / 补偿 / 校准 / 护照 | 删除（派生数据） |
+| 测量会话 / 主观评价 | **解绑保留**，写 `detached_from_process/detached_at` |
+| 签样 | **不删除**，写 `orphaned_at/orphan_reason` |
+
+永久清理只允许 archived 工艺，且 `confirm=<pid>` 必须匹配。响应返回
+`deleted/detached/orphaned` 计数，便于审计。
+
+完整性审计覆盖 active/archived 工艺、孤儿派生记录、未解绑的孤儿测量/评价、
+未标记的孤儿签样、缺失 ICC 与未引用 ICC。修复原则：
+
+- `GET /api/integrity/report` 只读；
+- `POST /api/integrity/repair` 默认 `dry_run=true`，显式 false 才写盘；
+- 孤儿派生删除、测量/评价解绑保留、签样标孤儿、未引用 ICC 移至
+  `data/orphaned_icc/`；
+- 修复幂等；不自动在启动时执行。
+
+CLI `scripts/audit_data.py --dry-run|--apply` 与 API 共用同一服务层。
+
+### C3. 护照版本历史
+
+`GET /api/processes/{pid}/passport/versions` 每行新增：
+
+- `is_latest`：当前最新版本；
+- `referenced_by_signoffs`：引用签样的 `id/state/title`；
+- `referenced_count`：引用数量。
+
+签样引用按 `passport_id` 或 `passport_hash` 任一命中（OR 语义），兼容只填写部分
+字段的历史签样。旧版本快照不可变，归档工艺仍可只读查看；生成/刷新护照被归档门禁
+阻断。
+
+### C4. 可用性与跨平台
+
+- 模态：自动从首个标题生成 `aria-labelledby`，无标题用 `aria-label`；背景
+  `.app` 与其他 modal mask 设 `inert` + `aria-hidden`；保留 Tab/Shift+Tab、Esc、
+  焦点还原。
+- 光谱：Canvas 增加 `role="img"`、摘要 `aria-label`、指向数据表的
+  `aria-describedby`；A 实线圆点、B 虚线方点，不只靠颜色；375px top 差异表卡片化。
+- 数据维护：工具箱新增“数据维护”页，展示扫描摘要与明细，预览固定 Dry Run，
+  应用修复前二次确认。
+- E2E 去除 Windows `RSWOP.icm` / `JapanColor2001Coated.icc` 依赖，统一使用
+  `tests/fixtures/icc/testbed_cmyk.icc`；ICC 替换使用同文件 header 日期字节变体
+  （合法 profile、sha 不同）。
+
+### C5. 验收结果与边界
+
+- pytest：**260 passed**（233 基线 + 27 新增）；
+- E2E：**E2E ALL OK**，覆盖归档/恢复/永久清理、依赖计数、完整性 report/dry-run、
+  护照 versions 引用字段、跨平台 ICC；
+- 视觉：7 张截图（护照历史、数据维护、光谱 200% zoom、375px、暗色），
+  Tab/Shift+Tab/Esc/焦点还原自动通过，无控制台/页面错误；
+- 未完成：完整 NVDA/VoiceOver 全页审计、真实浏览器 200% 非 CSS zoom 审计、
+  多 worker 文件锁、归档操作审计日志导出；
+- 200% 缩放仍以 CSS zoom 代理，不宣称等价于操作系统缩放全场景。

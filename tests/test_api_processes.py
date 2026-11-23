@@ -211,7 +211,7 @@ def test_gamut_compare_errors(api_client, cmyk_icc):
 
 
 def test_process_delete_cascade_removes_recipes(api_client, cmyk_icc):
-    """级联删除回归：删工艺后 /api/recipes?process_id= 必须为空。"""
+    """V0.11：DELETE 先归档保留证据；永久清理后才级联删除配方。"""
     proc = _create_process(api_client, cmyk_icc, name="级联删除")
     pr = api_client.post(
         "/api/recipes/predict",
@@ -226,7 +226,21 @@ def test_process_delete_cascade_removes_recipes(api_client, cmyk_icc):
 
     d = api_client.delete(f"/api/processes/{proc['id']}")
     assert d.status_code == 200
+    assert d.json()["status"] == "archived"
+    assert api_client.get(f"/api/processes/{proc['id']}").status_code == 200
+    active = api_client.get("/api/processes").json()
+    assert all(row["id"] != proc["id"] for row in active)
+    archived = api_client.get("/api/processes?include_archived=1").json()
+    assert any(row["id"] == proc["id"] for row in archived)
+    retained = api_client.get(f"/api/recipes?process_id={proc['id']}").json()
+    assert retained == before
+
+    permanent = api_client.delete(
+        f"/api/processes/{proc['id']}/permanent",
+        params={"confirm": proc["id"]},
+    )
+    assert permanent.status_code == 200
     after = api_client.get(f"/api/recipes?process_id={proc['id']}").json()
     assert after == []
     assert api_client.get(f"/api/processes/{proc['id']}").status_code == 404
-    print("[PASS] 工艺删除级联清理配方记录")
+    print("[PASS] V0.11 归档保留配方；永久清理后级联删除")

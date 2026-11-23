@@ -269,6 +269,18 @@ class ProcessOut(BaseModel):
     created_at: str = ""
     #: V0.10：最近护照的轻量摘要（由路由按需注入，旧数据可为空）
     passport_summary: Optional[dict] = None
+    #: V0.11：归档生命周期；空 archived_at 表示 active（旧数据默认 active）
+    archived_at: Optional[str] = None
+    archive_reason: Optional[str] = None
+    archived_by: Optional[str] = None
+    is_archived: bool = False
+
+
+class ProcessArchiveRequest(BaseModel):
+    """归档工艺请求体。"""
+
+    reason: str = Field("manual_archive", max_length=120)
+    actor: str = Field("", max_length=80)
 
 
 class RecipeTarget(BaseModel):
@@ -553,3 +565,46 @@ class SpectralCompareResponse(BaseModel):
     risk_label: str = "无可比光谱"
     warnings: list[str] = []
     disclaimer: str = "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI"
+
+
+# ---------------------------------------------------------------------------
+# V0.11 归档依赖 / 完整性审计与修复
+# ---------------------------------------------------------------------------
+
+class DependencyBlocker(BaseModel):
+    code: str
+    message: str
+
+
+class DependencyReport(BaseModel):
+    process_id: str
+    name: str = ""
+    archived: bool = False
+    archived_at: str = ""
+    archive_reason: str = ""
+    archived_by: str = ""
+    counts: dict = {}
+    blockers: list[DependencyBlocker] = []
+    can_permanent_delete: bool = False
+
+
+class IntegrityRepairRequest(BaseModel):
+    """默认 dry_run；actions 为空表示全部修复动作。"""
+
+    dry_run: bool = True
+    actions: list = Field(default_factory=list)
+
+
+class IntegrityReport(BaseModel):
+    generated_at: str = ""
+    summary: dict = {}
+    details: dict = {}
+    actions: list[dict] = []
+
+
+class IntegrityRepairResult(IntegrityReport):
+    dry_run: bool = True
+    applied: bool = False
+    planned: dict = {}
+    counts: dict = {}
+    after: Optional[dict] = None

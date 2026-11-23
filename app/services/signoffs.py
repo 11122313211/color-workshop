@@ -96,7 +96,7 @@ def _release_token(doc: dict) -> str:
 
 
 def summary(doc: dict) -> dict:
-    return {
+    out = {
         "id": doc.get("id"),
         "title": doc.get("title", ""),
         "job_no": doc.get("job_no", ""),
@@ -117,6 +117,10 @@ def summary(doc: dict) -> dict:
             "hash": (doc.get("snapshot") or {}).get("passport_hash", ""),
         },
     }
+    if doc.get("orphaned_at"):
+        out["orphaned_at"] = doc.get("orphaned_at")
+        out["orphan_reason"] = doc.get("orphan_reason", "")
+    return out
 
 
 class SignoffStore:
@@ -177,6 +181,37 @@ class SignoffStore:
         docs.sort(key=lambda d: (d.get("updated_at", ""), d.get("created_at", "")), reverse=True)
         return docs
 
+    def references_for_passport(
+        self,
+        process_id: str,
+        passport_id: str,
+        passport_hash: str,
+    ) -> list[dict]:
+        """签样对该护照版本的引用（同时匹配 snapshot 与 evidence 的 id/hash）。
+
+        版本历史用：同一工艺可能有多个版本，签样可能引用旧版本；只有 id 或 hash
+        任一命中即视为引用，避免历史签样因证据字段不全而被漏判。
+        """
+        passport_id = str(passport_id or "")
+        passport_hash = str(passport_hash or "")
+        if not process_id or not (passport_id or passport_hash):
+            return []
+        refs: list[dict] = []
+        for doc in self.list(process_id=process_id):
+            # id 或 hash 任一命中即视为引用；兼容只记录其中一项的旧签样。
+            matched = False
+            for source in (doc.get("snapshot") or {}, doc.get("evidence") or {}):
+                source_id = str(source.get("passport_id", "") or "")
+                source_hash = str(source.get("passport_hash", "") or "")
+                id_matches = bool(passport_id) and source_id == passport_id
+                hash_matches = bool(passport_hash) and source_hash == passport_hash
+                if id_matches or hash_matches:
+                    matched = True
+                    break
+            if matched:
+                refs.append(doc)
+        return refs
+
     # -- 状态迁移 ---------------------------------------------------------
     def transition(self, sid: str, action: str, actor: str = "", note: str = "") -> dict:
         doc = self.get(sid)
@@ -232,6 +267,13 @@ class SignoffStore:
     # -- 门禁 -----------------------------------------------------------
     def gate(self, process_doc: dict) -> dict:
         """工艺是否已具备放行条件（最新 approved/locked 签样 + ICC 指纹一致）。"""
+        if process_doc.get("archived_at"):
+            return {
+                "allowed": False,
+                "reason": "process_archived",
+                "message": "工艺已归档，只读",
+                "signoff_id": None,
+            }
         pid = process_doc.get("id", "")
         candidates = [
             d for d in self._store.all().values()

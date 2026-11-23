@@ -1,4 +1,7 @@
-"""工艺库路由：ICC 上传/替换、工艺 CRUD、色域采样、列表聚合摘要。"""
+"""工艺库路由：ICC 上传/替换、工艺 CRUD、归档生命周期、色域采样与列表摘要。
+
+V0.11：DELETE 默认归档；永久清理只允许已归档工艺，且保留测量/评价/签样证据。
+"""
 
 from __future__ import annotations
 
@@ -6,7 +9,15 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from ..models.schemas import ProcessArchiveRequest
 from ..services.compensation import CompensationStore
+from ..services.lifecycle import (
+    ProcessNotArchivedError,
+    archived_detail,
+    dependency_report,
+    is_archived,
+    permanently_delete_process,
+)
 from ..services.processes import (
     PROCESS_MEASUREMENT_CONDITIONS,
     ProcessStore,
@@ -18,6 +29,12 @@ router = APIRouter(prefix="/api/processes", tags=["processes"])
 
 process_store = ProcessStore()
 _compensations = CompensationStore()
+
+
+def _ensure_active(doc: dict) -> None:
+    """归档工艺只读：任何会改变其证据的写操作返回 409。"""
+    if is_archived(doc):
+        raise HTTPException(409, detail=archived_detail())
 
 
 class ProcessUpdateRequest(BaseModel):
@@ -77,9 +94,12 @@ async def create_process(
 
 
 @router.get("")
-def list_processes(summary: bool = Query(False, description="附带色域摘要与达标率")):
-    """工艺列表。summary=1 时逐工艺附带 gamut_summary（体积/覆盖率/凸包）与近 20 条配方达标率。"""
-    docs = process_store.list()
+def list_processes(
+    summary: bool = Query(False, description="附带色域摘要与达标率"),
+    include_archived: bool = Query(False, description="是否包含已归档工艺（默认 0）"),
+):
+    """工艺列表。默认仅 active；summary=1 时附带色域摘要与近 20 条配方达标率。"""
+    docs = process_store.list(include_archived=include_archived)
     if not summary:
         return docs
     from ..services.recipe import RecipeStore
@@ -117,6 +137,10 @@ def get_process(pid: str):
 @router.patch("/{pid}")
 def update_process(pid: str, req: ProcessUpdateRequest):
     """编辑工艺元数据（名称/纸张/墨水/备注，None 字段保持不变）。"""
+    current = process_store.get(pid)
+    if not current:
+        raise HTTPException(404, "工艺不存在")
+    _ensure_active(current)
     if (
         req.measurement_condition is not None
         and req.measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS
@@ -138,6 +162,7 @@ async def replace_icc(
     doc = process_store.get(pid)
     if not doc:
         raise HTTPException(404, "工艺不存在")
+    _ensure_active(doc)
     data = await request.body()
     if not data or len(data) < 128:
         raise HTTPException(400, "缺少有效的 ICC 文件数据（raw bytes body）")
@@ -157,27 +182,89 @@ async def replace_icc(
 
 
 @router.delete("/{pid}")
-def delete_process(pid: str):
-    if not process_store.delete(pid):
+def delete_process(
+    pid: str,
+    reason: str = Query("manual_archive", description="归档原因"),
+    actor: str = Query("", description="操作人"),
+):
+    """归档工艺（V0.11 起 DELETE 不再硬删除；证据保留、只读）。"""
+    doc = process_store.get(pid)
+    if not doc:
         raise HTTPException(404, "工艺不存在")
-    # 级联清理该工艺的配方记录、补偿模型与校准轮次（V0.8）
-    from ..services.calibration_history import CalibrationStore
-    from ..services.recipe import RecipeStore
+    updated = process_store.archive(pid, reason, actor)
+    return {"status": "archived", "process": updated}
 
-    RecipeStore().remove_process(pid)
-    _compensations.reset(pid)
-    CalibrationStore().remove_process(pid)
-    from ..services.passport import PassportStore
 
-    PassportStore().remove_process(pid)
-    return {"status": "deleted"}
+@router.post("/{pid}/archive")
+def archive_process(pid: str, req: ProcessArchiveRequest | None = None):
+    """归档工艺（可逆）。已归档时幂等返回。"""
+    if not process_store.get(pid):
+        raise HTTPException(404, "工艺不存在")
+    request = req or ProcessArchiveRequest()
+    updated = process_store.archive(pid, request.reason, request.actor)
+    return {"status": "archived", "process": updated}
+
+
+@router.post("/{pid}/restore")
+def restore_process(pid: str):
+    """恢复已归档工艺为 active。"""
+    try:
+        updated = process_store.restore(pid)
+    except KeyError as e:
+        raise HTTPException(404, "工艺不存在") from e
+    return {"status": "restored", "process": updated}
+
+
+@router.delete("/{pid}/permanent")
+def permanent_delete_process(
+    pid: str,
+    confirm: str = Query("", description="必须等于工艺 id 以确认永久清理"),
+):
+    """永久清理已归档工艺：删除派生记录，解绑测量/评价，签样标记 orphaned。"""
+    doc = process_store.get(pid)
+    if not doc:
+        raise HTTPException(404, "工艺不存在")
+    if confirm != pid:
+        raise HTTPException(422, f"确认参数不匹配：需 confirm={pid}")
+    if not is_archived(doc):
+        raise HTTPException(
+            409,
+            detail={
+                "code": ProcessNotArchivedError.code,
+                "message": ProcessNotArchivedError.message,
+            },
+        )
+    try:
+        result = permanently_delete_process(doc)
+    except ProcessNotArchivedError as e:
+        raise HTTPException(
+            409,
+            detail={
+                "code": ProcessNotArchivedError.code,
+                "message": ProcessNotArchivedError.message,
+            },
+        ) from e
+    except KeyError as e:
+        raise HTTPException(404, "工艺不存在") from e
+    return result
+
+
+@router.get("/{pid}/dependencies")
+def process_dependencies(pid: str):
+    """工艺证据依赖计数与永久清理 blockers。"""
+    doc = process_store.get(pid)
+    if not doc:
+        raise HTTPException(404, "工艺不存在")
+    return dependency_report(doc)
 
 
 @router.delete("/{pid}/compensation")
 def reset_compensation(pid: str):
     """重置工艺级误差补偿模型（换纸张/墨水等场景下人工干预）。"""
-    if not process_store.get(pid):
+    doc = process_store.get(pid)
+    if not doc:
         raise HTTPException(404, "工艺不存在")
+    _ensure_active(doc)
     _compensations.reset(pid)
     return {"status": "reset"}
 

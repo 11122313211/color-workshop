@@ -1,12 +1,12 @@
-# 色彩工坊 · 印前色彩管理闭环平台（V0.10 已实现）
+# 色彩工坊 · 印前色彩管理闭环平台（V0.11 已实现）
 
-> 面向印前的色彩管理小软件 · V0.10 已实现（2026-11-23）
+> 面向印前的色彩管理小软件 · V0.11 已实现（2026-11-23）
 > 以 ΔE / CIEDE2000 为统一度量，以**数值优化 + 光谱证据**为主线：
 > **目标 LAB → 工艺 ICC 反查最优分色值（设备值）→ 打印实测 → 闭环修正 → 校准收敛 → 工艺护照留痕**，
 > 且所有测量数据先过**方法学门禁**（测前登记 → 校准确认 → 测量 → 复测一致性 → 交叉校验 → 可信度分级 → 分级数据流向）。
 >
-> V0.10 完成加法式演进：不训练模型、不实现基础油墨 KM 调墨；当前对外定位为
-> **数值优化 + 光谱证据**，以可复核的数值结果与光谱风险证据取胜。
+> V0.11 在 V0.10 证据链上完成**归档优先、完整性修复、护照历史与可用性修复**；
+> 不训练模型、不实现基础油墨 KM 调墨，仍以**数值优化 + 光谱证据**为对外定位。
 
 ## 定位与核心工作流
 
@@ -20,9 +20,12 @@
 3. **工艺证据与风险（V0.10）**：把 ICC、补偿、校准轮次、测量会话、配方统计与
    光谱覆盖汇总为不可变的**工艺护照**；用现有 CGATS 光谱数据计算多光源同色异谱风险，
    并以 `passport_hash` 把签样放行绑定到明确的证据版本。
+4. **生命周期与完整性（V0.11）**：删除改为**归档优先**；归档工艺只读、可恢复，
+   只有显式永久清理才删除派生记录。测量/评价解绑保留、签样标记孤儿；完整性审计
+   默认 Dry Run，显式 apply 才移动未引用 ICC 和修复孤儿数据。
 
 工艺（打印机 + 纸张 + 墨水组合）是一等实体，**不同工艺绑定不同的 ICC 特性文件**，
-预测与转换均以工艺为上下文。V0.10 当前定位是**印前色彩数值优化 + 光谱证据平台**：
+预测与转换均以工艺为上下文。V0.11 当前定位是**印前色彩数值优化 + 光谱证据平台**：
 以 ICC / CMM / ΔE00 / 补偿与校准数值计算为骨架，以光谱与测量方法学作为可追溯证据；
 不把模型能力作为当前卖点。
 
@@ -38,6 +41,7 @@
 | 印刷校准 | 自研（`calibration.py` + `testform.py` 校准版，V0.7） | ISO 12647-7 风格编号校准版、双基准报告（ICC 预期 + ISO 12647-2 固体参考）、逐通道墨量建议（写入补偿模型）、Lab 有效网点反演校正曲线、特性数据 CGATS 导出 |
 | 印前预检与输出 | 自研（`files.py` / `pdfx.py` / `signoffs.py` / `displays.py`，V0.9） | PDF 字体真嵌入 / TrimBox 出血 / 有效 DPI（内容流 CTM）/ 标准开本；PDF/X-4 结构封装（OutputIntent + XMP + 盒子）；签样状态机与放行门禁（ICC 变更自动失效）；显示器校准档案与软打样门禁、屏幕测量 CGATS 导入/导出 |
 | 工艺护照与光谱证据 | 自研（`passport.py` / `spectral.py`，V0.10） | 版本化护照（证据覆盖 + 警告 + 不可变快照 + sha256）、M0/M1/M2 记录、四光源光谱积分与工程同色异谱风险 |
+| 生命周期与完整性 | 自研（`lifecycle.py` / `integrity.py`，V0.11） | 归档/恢复/永久清理、依赖计数、只读门禁、孤儿扫描与 Dry Run 修复、未引用 ICC 隔离 |
 | 后端 | FastAPI + JSON 落盘（`data/`） | API 服务，工艺库/配方记录/补偿模型/测量会话重启不丢（损坏自动隔离备份） |
 | 前端 | 原生 ES Module + Canvas + three.js（vendored，无构建） | iOS 扁平风 SPA，hash 路由，亮/暗主题，2D/真 3D（WebGL）色域组件 |
 
@@ -65,6 +69,8 @@ color-mgmt/
 │   │   ├── displays.py         # 显示器档案 / 校准有效期 / 软打样门禁 / 屏幕测量导入导出（V0.9 P0）
 │   │   ├── passport.py         # 工艺护照：证据汇总 / 状态 / sha256 / 版本（V0.10）
 │   │   ├── spectral.py         # 多光源光谱积分 / 同色异谱风险 / 会话比较（V0.10）
+│   │   ├── lifecycle.py        # 归档 / 恢复 / 依赖计数 / 永久清理（V0.11）
+│   │   ├── integrity.py        # 孤儿扫描 / Dry Run / 修复 / ICC 隔离（V0.11）
 │   │   ├── diagnosis.py         # 规则型印刷诊断引擎 R1-R8（行业标准口径，V0.6）
 │   │   ├── qc_compare.py        # 双会话指标 Δ 对比 + 工艺趋势时间序列（V0.6）
 │   │   ├── evaluations.py       # 主观评价检查单（GB/T 34053 方法论，V0.6）
@@ -80,6 +86,7 @@ color-mgmt/
 │   │   ├── displays.py          # /api/displays（显示器档案 / 校准状态 / 软打样门禁 / 测量导入导出）
 │   │   ├── passport.py         # /api/processes/{pid}/passport*（V0.10）
 │   │   ├── spectral.py         # /api/spectral*（V0.10）
+│   │   ├── integrity.py        # /api/integrity/report|repair（V0.11）
 │   │   └── main.py              # V0.1 端点（设备/测量/闭环/可视化…）
 │   └── main.py                  # 应用入口（/ 重定向前端）
 ├── static/
@@ -87,9 +94,9 @@ color-mgmt/
 │   ├── css/app.css              # iOS 扁平设计令牌 + 组件
 │   ├── vendor/three/            # three.js r187 vendored（ESM，含 sha512 溯源 README）
 │   └── js/                      # api / router / icons / components / gamut-view / gamut-three / views/*
-├── scripts/                     # 探针、冒烟、e2e、清理脚本
+├── scripts/                     # 探针、冒烟、e2e、审计 CLI、V0.11 截图
 ├── data/                        # 运行时数据（工艺 ICC、配方记录、补偿模型、passports.json）
-└── tests/                       # pytest 233 项（214 基线 + 19 新增：护照/光谱/迁移/签样门禁）
+└── tests/                       # pytest 260 项（233 基线 + 27 新增：归档/完整性/护照历史/UI）
 ```
 
 ## 快速开始
@@ -109,10 +116,14 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 # 4. 测试（内置 MIT 许可测试 ICC，跨平台可跑，不再依赖 Windows 系统 profile）
 python -m pytest tests/ -q
 python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
+python scripts/audit_data.py --dry-run   # 完整性审计（默认不写盘）
+python scripts/shoot_v11.py              # V0.11 截图，需服务运行中
 ```
 
-> 提示：本机无 CMYK ICC 时，可从 `C:\Windows\System32\spool\drivers\color\`
-> 上传系统自带的 RSWOP.icm / JapanColor2001Coated.icc 创建演示工艺。
+> 跨平台提示：测试与 E2E 统一使用仓库内置
+> `tests/fixtures/icc/testbed_cmyk.icc`（MIT 许可），不读取 Windows 系统 profile。
+> E2E 可用 `COLORFORGE_E2E_BASE_URL` 指向隔离实例；截图可用
+> `COLORFORGE_V11_BASE_URL` 指向目标实例。
 
 ## API 一览
 
@@ -120,16 +131,22 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/api/processes` | POST | 创建工艺（raw bytes body = ICC 文件，query 传名称/纸张/墨水） |
-| `/api/processes` | GET | 工艺列表；`?summary=1` 附带色域摘要（体积/sRGB 覆盖率/凸包）与配方达标率 |
-| `/api/processes/{id}` | GET/DELETE | 详情（含补偿模型）/ 删除（级联清理配方记录与补偿模型） |
+| `/api/processes` | GET | 工艺列表；`?include_archived=1` 包含归档；`summary=1` 附带色域摘要与配方达标率 |
+| `/api/processes/{id}` | GET/DELETE | 详情（含补偿模型）/ **归档**（V0.11 起不再硬删除） |
 | `/api/processes/{id}` | PATCH | 编辑工艺（名称/纸张/墨水/备注） |
 | `/api/processes/{id}/icc` | GET/PUT | 下载 ICC / 替换 ICC（sha 变更后色域与变换缓存自动失效、补偿模型重置） |
 | `/api/processes/{id}/gamut` | GET | 色域采样：xy/Lab 点集、凸包索引、Qhull 表面三角、sRGB 覆盖率、Lab 包围盒体积 |
 | `/api/processes/{id}/gamut/compare` | GET | 双工艺色域对比：凸包归属 + xy 交集多边形与面积占比 |
+| `/api/processes/{id}/archive` | POST | 归档（body `{reason, actor}`）；已归档时幂等 |
+| `/api/processes/{id}/restore` | POST | 恢复为 active |
+| `/api/processes/{id}/permanent?confirm={id}` | DELETE | 仅已归档工艺；永久清理派生记录，测量/评价解绑、签样标孤儿 |
+| `/api/processes/{id}/dependencies` | GET | 配方/补偿/校准/护照/测量/评价/签样计数与 blockers |
 | `/api/processes/{id}/compensation` | DELETE | 重置工艺级误差补偿模型 |
 
-**V0.10**：创建/编辑工艺增加可选 `measurement_condition`（空 / M0 / M1 / M2）；
-工艺响应增加 `passport_summary`。旧工艺默认空值与 `null` 摘要，不强制回填。
+**V0.11 生命周期**：`DELETE` 变为归档；归档工艺的 PATCH、ICC 替换、预测/验证、
+测量导入、评价创建/打分、签样创建/迁移、护照生成、文件转换/PDF-X 均返回
+409 且 `detail.code=PROCESS_ARCHIVED`。读取、gamut、ICC 下载与护照历史保持可用。
+永久清理必须先归档并传入匹配的 `confirm`。
 
 ### 配方预测
 | 端点 | 方法 | 说明 |
@@ -186,6 +203,21 @@ python scripts/e2e_http.py   # HTTP 端到端（需服务运行中）
 | `/api/processes/{pid}/passport/versions` | GET | 版本列表（每工艺最多保留 50 版） |
 | `/api/processes/{pid}/passport/{version}` | GET | 指定版本护照详情（不可变快照） |
 | `/api/processes/{pid}/passport/{version}/export` | GET | 导出 JSON/Markdown（`format=json\|md`） |
+
+**V0.11 版本历史**：`GET /passport/versions` 每行新增 `is_latest`、
+`referenced_by_signoffs`（id/state/title）与 `referenced_count`；签样引用旧版本时
+即使护照继续刷新，旧版仍保留并显示引用。归档工艺的历史版本可只读查看。
+
+### 数据完整性（V0.11）
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/integrity/report` | GET | 扫描 active/archived、孤儿派生/证据记录、缺失 ICC、未引用 ICC |
+| `/api/integrity/repair` | POST | body `{dry_run, actions}`；默认 `dry_run=true`，显式 false 才写盘 |
+| `scripts/audit_data.py --dry-run\|--apply` | CLI | 与 API 共用审计/修复服务；JSON 输出 |
+
+修复策略：孤儿配方/补偿/校准/护照删除；孤儿测量/评价解绑保留；孤儿签样标记
+`orphaned_at/orphan_reason`；未引用 ICC 移至 `data/orphaned_icc/`。审计默认不创建目录、
+不写文件；修复幂等。
 
 ### 光谱 / 同色异谱（V0.10）
 | 端点 | 方法 | 说明 |
@@ -258,6 +290,24 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
   `data/passports.json` 由 `PassportStore` 管理，幂等迁移补默认字段与初始化护照库，
   不删除旧数据。破坏性变更留到 V1.x。
 
+### V0.11 归档与完整性机制
+
+- **归档优先**：`archived_at` 非空即只读；旧数据缺字段默认 active。归档可逆，
+  且不自动删除 ICC、配方、补偿、校准或护照。
+- **只读门禁**：所有会改变证据的写操作在进入业务逻辑前检查归档，统一返回
+  `409 {"detail":{"code":"PROCESS_ARCHIVED"}}`；门禁 `gate` 返回
+  `reason=process_archived`，`release-manifest` 返回 409。
+- **永久清理**：仅 archived + `confirm=<pid>` 可执行。工艺、ICC、配方、补偿、
+  校准与护照删除；测量会话/评价写 `detached_from_process/detached_at` 并解绑；
+  签样不删，写 `orphaned_at/orphan_reason`。响应返回 deleted/detached/orphaned 计数。
+- **完整性审计**：报告按类给出 `summary/details/actions`，每项含可操作 id/文件名；
+  Dry Run 返回计划但零写盘；apply 幂等，未引用 ICC 重名时追加序号。
+- **护照历史引用**：签样按 `passport_id` 或 `passport_hash` 命中版本引用（OR 语义），
+  因此旧签样缺少部分字段也能被识别；历史版本快照仍不可变。
+- **a11y**：模态自动生成 `aria-labelledby`/`aria-label`，背景 `inert`+`aria-hidden`，
+  Tab/Shift+Tab 圈闭、Esc 关闭与焦点还原经 Playwright 键盘路径验证；光谱 Canvas
+  增加 `role="img"`、摘要 `aria-label` 与指向数据表的 `aria-describedby`。
+
 ### V0.1 端点（保留，供工具箱使用）
 `/api/devices`、`/api/measurements`、`/api/color-checker/detect`、`/api/convert`、
 `/api/correction`、`/api/delta-e`（含 `/lab`）、`/api/closed-loop`、
@@ -317,20 +367,27 @@ verify 端点可携带 `measurement_session_id` 关联测量会话（补偿门�
 
 ## 版本
 
-> **V0.10 已于 2026-11-23 实现并验收**：`pytest` **233 passed**；
-> 隔离数据目录 + 8768 端口运行扩展 `scripts/e2e_http.py` 得到 **E2E ALL OK**。
-> 实现记录见 `docs/V0.10-实施记录.md`。
+> **V0.11 已于 2026-11-23 实现并验收**：`pytest` **260 passed**；
+> 隔离数据目录 + 8797 端口运行 `scripts/e2e_http.py` 得到 **E2E ALL OK**；
+> `scripts/shoot_v11.py` 产出 7 张截图，Playwright 键盘路径通过且无页面错误。
+> 实现记录见 `docs/V0.11-实施记录.md`，验收清单一见 `docs/V0.11-验收.md`。
 >
-> 已知限制：存储仍为 JSON；护照只导出 JSON/Markdown，不生成 PDF 文件；风险阈值固定、
-> 无 UI 配置；E2E 创建工艺依赖 Windows 系统 ICC（`RSWOP.icm`），跨平台需自备 ICC。
-> 护照写锁为进程内锁，多 worker 部署需外置文件锁或数据库事务。
-> 非阻断后续项（护照版本历史 UI、完整 200% 缩放/屏幕阅读器审计、光谱曲线非颜色编码）
-> 见 `docs/V0.10-实施记录.md`。
+> 已知限制：存储仍为 JSON；护照只导出 JSON/Markdown，不生成 PDF；归档写锁为进程内锁，
+> 多 worker 部署需外置文件锁或数据库事务；完整性修复不做启动自动修复；200% 缩放使用
+> CSS zoom 代理验证，完整 NVDA/VoiceOver 全页审计未完成。
 >
-> 当前路线图：V0.10 已交付；P1（拼版/专色/图像调整）与 P2（交付包/认证目标）
-> 尚未排入 V0.10，后续排期以待办清单为准。
+> 当前路线图：V0.11 已交付；P1（拼版/专色/图像调整）与 P2（交付包/认证目标）
+> 仍未排期，后续以 `docs/印前标准-7步进度评判.md` 的待办清单为准。
 
-- **V0.10（当前，已实现）**：工艺护照 + 配方语义 + 光谱风险 —— 新增版本化**工艺护照**
+- **V0.11（当前，已实现）**：生命周期完整性 + 护照历史 + 可用性修复 ——
+  `DELETE` 改为**归档优先**，默认列表排除归档，`include_archived=1` 可查看；归档
+  工艺只读、可恢复，所有写操作返回 409 `PROCESS_ARCHIVED`；永久清理仅限 archived +
+  匹配 confirm，删除工艺/ICC/配方/补偿/校准/护照，测量与评价解绑保留，签样标记
+  orphaned；新增依赖计数、完整性 `report/repair` API 与 `scripts/audit_data.py`
+  Dry Run/apply；护照版本历史新增最新标记与签样引用；模态补 `aria-labelledby`/`inert`，
+  光谱 Canvas 补摘要与数据表关联，375px 卡片化；E2E 去除 Windows ICC 依赖，
+  统一内置测试 profile。实施记录见 `docs/V0.11-实施记录.md`。
+- **V0.10（上一版）**：工艺护照 + 配方语义 + 光谱风险 —— 新增版本化**工艺护照**
   （ICC/补偿/校准轮次/测量会话/配方统计/光谱覆盖汇总，`valid/incomplete/stale/invalid`
   动态状态，不可变快照 + 规范化 sha256，幂等版本，每工艺最多 50 版）；工艺可选
   M0/M1/M2 测量条件；配方显式标注**分色值（设备值）**，新增配方单 JSON/MD 导出与

@@ -9,7 +9,7 @@ def test_health(api_client):
     assert r.status_code == 200
     data = r.json()
     assert data.get("status") == "ok"
-    assert data.get("version") == "0.10.0"
+    assert data.get("version") == "0.11.0"
     print("[PASS] /api/health")
 
 
@@ -25,13 +25,14 @@ def test_root_redirects_to_frontend(api_client):
 def test_static_shell_and_assets(api_client):
     shell = api_client.get("/static/index.html")
     assert shell.status_code == 200
-    assert "工艺库" in shell.text and "v0.10.0" in shell.text
+    assert "工艺库" in shell.text and "v0.11.0" in shell.text
     for path in ("/static/css/app.css", "/static/js/main.js", "/static/js/router.js"):
         r = api_client.get(path)
         assert r.status_code == 200, path
         assert r.content, path
     process_js = api_client.get("/static/js/views/processes.js")
     assert "工艺护照" in process_js.text and "measurement_condition" in process_js.text
+    assert "显示已归档" in process_js.text and "版本历史" in process_js.text
     monitor_js = api_client.get("/static/js/views/monitor.js")
     assert "同色异谱" in monitor_js.text and "spectral-compare" in monitor_js.text
     recipe_js = api_client.get("/static/js/views/recipes.js")
