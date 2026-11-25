@@ -16,7 +16,7 @@ export function toast(msg, type = "ok", { action } = {}) {
   const el = document.createElement("div");
   el.className = `toast toast-${type}`;
   const ic = type === "ok" ? "check" : type === "warn" ? "warn" : "xmark";
-  if (type === "err") host.setAttribute("aria-live", "assertive");
+  host.setAttribute("aria-live", type === "err" ? "assertive" : "polite");
   el.innerHTML = `${icon(ic)}<span></span>`;
   el.querySelector("span").textContent = msg;
   if (action && action.label) {
@@ -66,6 +66,31 @@ export function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/** 校验安全 hex 颜色串（防止 style 属性注入） */
+export function safeHex(color, fallback = "#8e8e93") {
+  const s = String(color ?? "").trim();
+  return /^#[0-9a-fA-F]{3,8}$/.test(s) ? s : fallback;
+}
+
+/** 校验安全图片 data URI（防止 src 属性注入） */
+export function safeImageUri(uri) {
+  const s = String(uri ?? "").trim();
+  return /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$/.test(s) ? s : "";
+}
+
+/** 以 Blob 方式下载纯文本/CSV/CGATS，替代废弃的 unescape + btoa data URI */
+export function downloadText(text, filename, mime = "text/plain;charset=utf-8") {
+  const blob = new Blob([String(text ?? "")], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+
 /* ---------- 徽标 ---------- */
 export function statusBadge(deltaE, tolerance = 2.0) {
   if (deltaE <= tolerance) return `<span class="badge badge-green">${icon("check")}达标 ΔE ${deltaE}</span>`;
@@ -96,8 +121,7 @@ function mul3(m, v) {
   ];
 }
 
-/** CIELAB（D50 白点，ICC PCS）→ sRGB hex（用于前端色块显示） */
-export function labToHex(lab) {
+function labToXyzD65(lab) {
   const [L, a, b] = lab;
   const fy = (L + 16) / 116;
   const fx = fy + a / 500;
@@ -108,37 +132,32 @@ export function labToHex(lab) {
     (L > 8 ? ((L + 16) / 116) ** 3 : L / (116 * 7.787)) * XYZ_D50[1],
     f2inv(fz) * XYZ_D50[2],
   ];
-  // Von Kries（Bradford 变换域）D50 → D65
   const rel = mul3(M_ADAPT, xyzD50);
-  const xyzD65 = rel.map((v, i) => (v * XYZ_D65[i]) / XYZ_D50[i]);
-  let rgb = mul3(M_XYZ2RGB, xyzD65).map((c) => {
-    c = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
-    return Math.round(Math.min(1, Math.max(0, c)) * 255);
-  });
+  return rel.map((v, i) => (v * XYZ_D65[i]) / XYZ_D50[i]);
+}
+
+function srgbOetf(c) {
+  const clamped = Math.min(1, Math.max(0, c));
+  return clamped <= 0.0031308 ? 12.92 * clamped : 1.055 * Math.pow(clamped, 1 / 2.4) - 0.055;
+}
+
+/** CIELAB（D50 白点，ICC PCS）→ sRGB hex（用于前端色块显示） */
+export function labToHex(lab) {
+  const xyzD65 = labToXyzD65(lab);
+  const rgb = mul3(M_XYZ2RGB, xyzD65).map((c) => Math.round(srgbOetf(c) * 255));
   return "#" + rgb.map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
 /** CIELAB（D50 PCS）→ linear sRGB [0,1]^3（WebGL 顶点色用，不经过 gamma） */
 export function labToLinearRgb(lab) {
-  const [L, a, b] = lab;
-  const fy = (L + 16) / 116;
-  const fx = fy + a / 500;
-  const fz = fy - b / 200;
-  const f2inv = (f) => (f ** 3 > 0.008856 ? f ** 3 : (f - 4 / 29) / 7.787);
-  const xyzD50 = [
-    f2inv(fx) * XYZ_D50[0],
-    (L > 8 ? ((L + 16) / 116) ** 3 : L / (116 * 7.787)) * XYZ_D50[1],
-    f2inv(fz) * XYZ_D50[2],
-  ];
-  const rel = mul3(M_ADAPT, xyzD50);
-  const xyzD65 = rel.map((v, i) => (v * XYZ_D65[i]) / XYZ_D50[i]);
+  const xyzD65 = labToXyzD65(lab);
   return mul3(M_XYZ2RGB, xyzD65).map((c) => Math.min(1, Math.max(0, c)));
 }
 
 export function swatch(lab, { size = "", label = "" } = {}) {
   const hex = labToHex(lab);
-  return `<div class="swatch ${size}" style="background:${labToCss(lab)}" title="Lab(${lab.map((v) => Math.round(v * 10) / 10).join(", ")})">
-    </div>${label ? `<div class="swatch-label">${label}<br><span class="swatch-meta">${hex}</span></div>` : ""}`;
+  return `<div class="swatch ${esc(size)}" style="background:${labToCss(lab)}" title="Lab(${lab.map((v) => Math.round(v * 10) / 10).join(", ")})">
+    </div>${label ? `<div class="swatch-label">${esc(label)}<br><span class="swatch-meta">${hex}</span></div>` : ""}`;
 }
 
 /* ---------- canvas 颜色工具（主题令牌 / L* 真彩 / display-p3） ---------- */
@@ -179,22 +198,12 @@ const M_XYZ2P3 = [
   [0.0358458, -0.0761724, 0.9568845],
 ];
 
-/** CIELAB（D50 PCS）→ CSS 颜色串。P3 可用时输出 color(display-p3 …)，否则 sRGB hex */
+/** CIELAB（D50 PCS）→ CSS 颜色串。P3 可用时经 Display-P3 OETF 编码输出 color(display-p3 …)，否则 sRGB hex */
 export function labToCss(lab) {
   if (!p3Available()) return labToHex(lab);
-  const [L, a, b] = lab;
-  const fy = (L + 16) / 116;
-  const fx = fy + a / 500;
-  const fz = fy - b / 200;
-  const f2inv = (f) => (f ** 3 > 0.008856 ? f ** 3 : (f - 4 / 29) / 7.787);
-  const xyzD50 = [
-    f2inv(fx) * XYZ_D50[0],
-    (L > 8 ? ((L + 16) / 116) ** 3 : L / (116 * 7.787)) * XYZ_D50[1],
-    f2inv(fz) * XYZ_D50[2],
-  ];
-  const rel = mul3(M_ADAPT, xyzD50);
-  const xyzD65 = rel.map((v, i) => (v * XYZ_D65[i]) / XYZ_D50[i]);
-  const rgb = mul3(M_XYZ2P3, xyzD65).map((c) => Math.min(1, Math.max(0, c)));
+  const xyzD65 = labToXyzD65(lab);
+  // CSS color(display-p3 r g b) 接收与 sRGB 相同的非线性伽马编码值（OETF）
+  const rgb = mul3(M_XYZ2P3, xyzD65).map((c) => srgbOetf(c));
   return `color(display-p3 ${rgb.map((v) => v.toFixed(4)).join(" ")})`;
 }
 
@@ -220,13 +229,14 @@ export function withAlpha(color, alpha) {
 const CHANNEL_COLORS = { C: "#30b0c7", M: "#af52de", Y: "#ffcc00", K: "#48484a", R: "#ff3b30", G: "#34c759", B: "#007aff" };
 
 export function recipeLine(recipe) {
-  return `<div class="recipe-line">${Object.entries(recipe)
+  return `<div class="recipe-line">${Object.entries(recipe || {})
     .map(([ch, val]) => {
       const color = CHANNEL_COLORS[ch] || "var(--accent)";
+      const num = Math.min(100, Math.max(0, Number(val) || 0));
       return `<div class="recipe-chip">
-        <span class="val">${val}</span>
-        <span class="ch" style="color:${color}">${ch}</span>
-        <span class="bar"><i style="width:${val}%;background:${color}"></i></span>
+        <span class="val">${esc(val)}</span>
+        <span class="ch" style="color:${color}">${esc(ch)}</span>
+        <span class="bar"><i style="width:${num}%;background:${color}"></i></span>
       </div>`;
     })
     .join("")}</div>`;
@@ -253,13 +263,18 @@ export function sparkline(values, { width = 120, height = 30, tolerance = 2.0 } 
 /* ---------- 折叠披露 ---------- */
 export function disclosure(title, bodyHtml, open = false) {
   return `<div class="disclosure ${open ? "open" : ""}">
-    <button class="disclosure-head" type="button">${icon("chevronR")}<span>${title}</span></button>
+    <button class="disclosure-head" type="button" aria-expanded="${open ? "true" : "false"}"><span class="chevron">${icon("chevronR")}</span><span>${esc(title)}</span></button>
     <div class="disclosure-body">${bodyHtml}</div>
   </div>`;
 }
 export function bindDisclosures(root) {
   root.querySelectorAll(".disclosure-head").forEach((btn) => {
-    btn.addEventListener("click", () => btn.closest(".disclosure").classList.toggle("open"));
+    btn.addEventListener("click", () => {
+      const wrap = btn.closest(".disclosure");
+      if (!wrap) return;
+      const isOpen = wrap.classList.toggle("open");
+      btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+    });
   });
 }
 
@@ -633,7 +648,7 @@ export function openModal(html, { onClose } = {}) {
 
   const prevFocus = document.activeElement;
   let closed = false;
-  const record = { mask, modal };
+  const record = { mask, modal, close: null };
 
   if (!modalStack.length) {
     modalA11ySnapshot = new Map();
@@ -700,6 +715,7 @@ export function openModal(html, { onClose } = {}) {
     }
   }
 
+  record.close = close;
   document.addEventListener("keydown", onKey, true);
   document.body.style.setProperty("overflow", "hidden");
   mask.addEventListener("click", (e) => {
@@ -707,6 +723,15 @@ export function openModal(html, { onClose } = {}) {
   });
 
   return { mask, modal, close };
+}
+
+/** 路由切换时关闭所有残留模态并还原背景 inert/滚动状态 */
+export function closeAllModals() {
+  while (modalStack.length) {
+    const top = modalStack[modalStack.length - 1];
+    if (top && typeof top.close === "function") top.close();
+    else break;
+  }
 }
 
 /** iOS 风格危险确认弹层（替代原生 confirm）。resolve(true)=确认 / false=取消 */

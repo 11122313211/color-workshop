@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from ..algorithms import convert_color, delta_e
+from ..algorithms import convert_color, delta_e_from_rgb
 
 
 # ---------------------------------------------------------------------------
@@ -176,11 +176,14 @@ def generate_calibration_profile(
             "note": "无参考色卡值，仅记录测量数据",
         }
 
-    # 构建测量->参考的线性校正（最小二乘）
-    measured = np.array([p.rgb for p in patches])
-    target = np.array(reference_rgb[:len(patches)])
+    # 构建测量->参考的线性校正（最小二乘），样本数对齐防止维度不匹配
+    n = min(len(patches), len(reference_rgb))
+    if n == 0:
+        return {"matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], "quality": 0.0, "patches": 0}
+    measured = np.array([p.rgb for p in patches[:n]], dtype=np.float64)
+    target = np.array(reference_rgb[:n], dtype=np.float64)
     M = np.linalg.lstsq(measured, target, rcond=None)[0].T
-    return {"matrix": M.tolist(), "quality": 0.9, "patches": len(patches)}
+    return {"matrix": M.tolist(), "quality": 0.9, "patches": n}
 
 
 # ---------------------------------------------------------------------------
@@ -231,40 +234,39 @@ def closed_loop_correct(
         de = delta_e_from_rgb(measured, target_rgb, space, method)
         converged = de <= tolerance
 
+        if converged:
+            iterations.append({
+                "iteration": i,
+                "measured_rgb": [round(v, 4) for v in measured],
+                "delta_e": round(de, 4),
+                "correction_applied": [0.0, 0.0, 0.0],
+                "converged": True,
+            })
+            break
+
+        # 自适应步长：越接近目标步长越小（最后一轮保留最小收敛步长）
+        step = 0.85 * max(0.15, 1.0 - (i - 1) / max(max_iterations, 1))
+        correction = [(t - m) * step for t, m in zip(target_rgb, measured)]
         iterations.append({
             "iteration": i,
             "measured_rgb": [round(v, 4) for v in measured],
             "delta_e": round(de, 4),
-            "correction_applied": [0.0, 0.0, 0.0],
-            "converged": converged,
+            "correction_applied": [round(c, 4) for c in correction],
+            "converged": False,
         })
-
-        if converged:
-            break
-
-        # 自适应步长：越接近目标步长越小
-        step = 0.85 * (1.0 - i / max(max_iterations, 1))
-        correction = [(t - m) * step for t, m in zip(target_rgb, measured)]
         measured = [round(m + c, 4) for m, c in zip(measured, correction)]
+
+    final_de = delta_e_from_rgb(measured, target_rgb, space, method)
+    if not converged and final_de <= tolerance:
+        converged = True
 
     return {
         "converged": converged,
         "iterations": iterations,
-        "final_delta_e": round(delta_e_from_rgb(measured, target_rgb, space, method), 4),
+        "final_delta_e": round(final_de, 4),
         "iterations_used": len(iterations),
         "final_measured_rgb": [round(v, 4) for v in measured],
     }
-
-
-def delta_e_from_rgb(
-    rgb1, rgb2, space: str = "srgb", method: str = "cie2000",
-) -> float:
-    """便捷色差计算（委托给算法层）。"""
-    return delta_e(
-        convert_color(rgb1, space, "lab"),
-        convert_color(rgb2, space, "lab"),
-        method=method,
-    )
 
 
 def decode_base64_image(b64: str) -> bytes:

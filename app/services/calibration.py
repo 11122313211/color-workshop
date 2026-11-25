@@ -10,7 +10,7 @@
 - 实地：模型误差补偿 p' = 2·预期 − 实测（与 recipe.run_verification 同式）
   后沿单色轴反查修正设备值 → 逐通道墨量建议（写入补偿模型）。
 
-数据政策：行业常量均以 #: 注明出处；不使用任何真实课程测量数据。
+数据政策：行业常量均以 #: 注明出处；不使用任何非公开实测数据。
 """
 
 from __future__ import annotations
@@ -74,13 +74,14 @@ def _iso_reference(pc: str | None) -> dict[str, tuple[float, float, float]] | No
 # 参考值（M1）：样张色块 → 预期 Lab（ICC 批量正查）+ ISO 参考列
 # ---------------------------------------------------------------------------
 
-def build_reference(process_doc: dict) -> dict:
+def build_reference(process_doc: dict, forward=None) -> dict:
     """校准版 28 色块的预期值参考表。
 
     expected_lab 来自工艺 ICC 批量正查（相对色度 intent，与配方预测同一正向模型）；
     iso_ref_lab 仅涂布纸的 C/M/Y/K/CMY 实地有色值。
     """
-    forward = _build_forward(process_doc_icc_bytes(process_doc), 4)
+    if forward is None:
+        forward = _build_forward(process_doc_icc_bytes(process_doc), 4)
     values = np.asarray([p["device"] for p in CAL_PATCHES], dtype=np.float64) / 100.0
     labs = forward(values)
     pc = paper_class(process_doc.get("paper", ""))
@@ -125,12 +126,27 @@ def _iso_solid_key(label: str) -> str | None:
 # 反查工具：单色轴最近 Lab 搜索
 # ---------------------------------------------------------------------------
 
-def _axis_search(forward, ch: int, target_lab) -> tuple[float, float]:
+def _precompute_axis_labs(forward) -> list[np.ndarray]:
+    """预计算四通道单色轴 Lab 表（4×401），避免同一份校准报告重复调用 20 次 forward。"""
+    grid = np.linspace(0.0, 1.0, _AXIS_GRID_N)
+    tables: list[np.ndarray] = []
+    for ch in range(4):
+        vals = np.zeros((_AXIS_GRID_N, 4), dtype=np.float64)
+        vals[:, ch] = grid
+        tables.append(forward(vals))
+    return tables
+
+
+def _axis_search(forward, ch: int, target_lab, axis_labs: list[np.ndarray] | None = None) -> tuple[float, float]:
     """沿第 ch 通道单色轴（其余通道 0）细网格搜索，返回 (设备值%, ΔE00)。"""
     grid = np.linspace(0.0, 1.0, _AXIS_GRID_N)
-    vals = np.zeros((_AXIS_GRID_N, 4))
-    vals[:, ch] = grid
-    des = delta_e_batch(forward(vals), np.asarray(target_lab, dtype=np.float64))
+    if axis_labs is not None:
+        labs = axis_labs[ch]
+    else:
+        vals = np.zeros((_AXIS_GRID_N, 4))
+        vals[:, ch] = grid
+        labs = forward(vals)
+    des = delta_e_batch(labs, np.asarray(target_lab, dtype=np.float64))
     i = int(np.argmin(des))
     return float(grid[i]) * 100.0, float(des[i])
 
@@ -172,7 +188,7 @@ def calibration_report(process_doc: dict, session: dict) -> dict:
     avg(ΔE_icc)>2.5 → suggest；命中 <4 patch → n/a；否则 ok。
     """
     forward = _build_forward(process_doc_icc_bytes(process_doc), 4)
-    ref = build_reference(process_doc)
+    ref = build_reference(process_doc, forward=forward)
     expected_by_label = {p["label"]: p["expected_lab"] for p in ref["patches"]}
     iso_by_label = {p["label"]: p["iso_ref_lab"] for p in ref["patches"] if p["iso_ref_lab"]}
     known = {p["label"]: p for p in CAL_PATCHES}
@@ -190,6 +206,7 @@ def calibration_report(process_doc: dict, session: dict) -> dict:
         iso_lab = iso_by_label.get(p["label"])
         iso_tol = (ISO_TOL_SOLID.get(_iso_solid_key(p["label"]) or "", WEDGE_DE_MAX)
                    if iso_lab else None)
+        de_iso_raw = float(delta_e(measured, iso_lab)) if iso_lab else None
         row = {
             "index": p["index"],
             "label": p["label"],
@@ -201,8 +218,8 @@ def calibration_report(process_doc: dict, session: dict) -> dict:
             "de_expected": round(float(delta_e(measured, expected)), 2),
             "comps": delta_e_components(expected, measured),
             "iso_tol": iso_tol if iso_lab else None,
-            "de_iso": (round(float(delta_e(measured, iso_lab)), 2) if iso_lab else None),
-            "pass_iso": (bool(delta_e(measured, iso_lab) <= iso_tol) if iso_lab else None),
+            "de_iso": round(de_iso_raw, 2) if de_iso_raw is not None else None,
+            "pass_iso": bool(de_iso_raw <= iso_tol) if de_iso_raw is not None else None,
         }
         rows.append(row)
 
@@ -236,13 +253,15 @@ def calibration_report(process_doc: dict, session: dict) -> dict:
         "patches": rows,
     }
 
-    report["ink_suggestions"] = _ink_suggestions(forward, matched, expected_by_label)
-    report["curves"] = _correction_curves(forward, matched)
+    axis_labs = _precompute_axis_labs(forward) if matched else None
+    report["ink_suggestions"] = _ink_suggestions(forward, matched, expected_by_label, axis_labs=axis_labs)
+    report["curves"] = _correction_curves(forward, matched, axis_labs=axis_labs)
     report["exports"] = _build_exports(process_doc, report, expected_by_label, matched)
     return report
 
 
-def _ink_suggestions(forward, matched: dict, expected_by_label: dict) -> list[dict]:
+def _ink_suggestions(forward, matched: dict, expected_by_label: dict,
+                     axis_labs: list[np.ndarray] | None = None) -> list[dict]:
     """逐通道墨量建议：由各自 100% 固体的模型误差补偿反查（单色轴）。"""
     out = []
     for ch, name in enumerate("CMYK"):
@@ -255,7 +274,7 @@ def _ink_suggestions(forward, matched: dict, expected_by_label: dict) -> list[di
         measured = np.mean(np.asarray(labs), dtype=np.float64, axis=0)
         expected = np.asarray(expected_by_label[label], dtype=np.float64)
         adjusted = _clip_lab(2.0 * expected - measured)
-        v_opt, ach = _axis_search(forward, ch, adjusted)
+        v_opt, ach = _axis_search(forward, ch, adjusted, axis_labs=axis_labs)
         delta = v_opt - 100.0
         out.append({
             "channel": name,
@@ -271,7 +290,8 @@ def _ink_suggestions(forward, matched: dict, expected_by_label: dict) -> list[di
     return out
 
 
-def _correction_curves(forward, matched: dict) -> dict[str, list[dict]]:
+def _correction_curves(forward, matched: dict,
+                       axis_labs: list[np.ndarray] | None = None) -> dict[str, list[dict]]:
     """校正曲线（ISO 10128 校正曲线法，Lab 有效网点反演口径）。
 
     梯级 t 的有效网点 e(t)=轴反查(实测 Lab)；校正后设备值 t_corr = e⁻¹(t)；
@@ -286,18 +306,20 @@ def _correction_curves(forward, matched: dict) -> dict[str, list[dict]]:
             if not labs:
                 continue
             measured = np.mean(np.asarray(labs), dtype=np.float64, axis=0)
-            e_val, _ = _axis_search(forward, ch, measured)
+            e_val, _ = _axis_search(forward, ch, measured, axis_labs=axis_labs)
             eff.append((float(t), float(np.clip(e_val, 0.0, 100.0))))
         if not eff:
             continue
-        # 反演：发送 e⁻¹(t) 使实际输出落在 ICC 预期上——在名义网点 t 处取逆
-        # （x=有效网点，须严格递增；重复有效网点取首个名义值）
-        by_e: dict[float, float] = {}
+        # 保序单调化：消除测量噪声引发的非单调翻转，并跳过与固定端点 0/100 碰撞的重复值
+        mono_pairs: list[tuple[float, float]] = []
+        last_e = 0.0
         for t, e in eff:
-            by_e.setdefault(round(e, 2), t)
-        pairs = sorted(by_e.items())
-        es = [0.0] + [e for e, _ in pairs] + [100.0]
-        ts = [0.0] + [t for _, t in pairs] + [100.0]
+            e_mono = max(e, last_e)
+            last_e = e_mono
+            if 0.01 < e_mono < 99.99 and (not mono_pairs or e_mono > mono_pairs[-1][0] + 1e-4):
+                mono_pairs.append((e_mono, t))
+        es = [0.0] + [e for e, _ in mono_pairs] + [100.0]
+        ts = [0.0] + [t for _, t in mono_pairs] + [100.0]
         entries = [{"t": 0.0, "effective": None, "corrected": 0.0}]
         for t, e in eff:
             t_corr = float(np.clip(np.interp(t, es, ts), 0.0, 100.0))
@@ -398,11 +420,11 @@ def _build_exports(process_doc: dict, report: dict, expected_by_label: dict,
 # 应用（M2）：建议写入补偿模型（预测立即联动）
 # ---------------------------------------------------------------------------
 
-def apply_suggestions(process_doc: dict, report: dict) -> dict:
+def apply_suggestions(process_doc: dict, report: dict, *, base_bias=None) -> dict:
     """把 ink_suggestions 的逐通道 delta 写入补偿模型（直接叠加，见 apply_calibration）。"""
     from .compensation import CompensationStore
 
     suggestions = report.get("ink_suggestions") or []
     delta = [float(s.get("delta_pct") or 0.0) / 100.0 for s in suggestions]
     return CompensationStore().apply_calibration(
-        process_doc["id"], process_doc.get("icc_sha256", ""), delta)
+        process_doc["id"], process_doc.get("icc_sha256", ""), delta, base_bias=base_bias)

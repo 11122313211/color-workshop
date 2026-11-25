@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import math
 import uuid
 from datetime import date, datetime
 from pathlib import Path
@@ -105,7 +106,7 @@ def _norm_coverage(raw: dict | None) -> dict[str, float]:
             num = float(value)
         except (TypeError, ValueError) as e:
             raise ValueError(f"色域覆盖 {key} 必须为数值") from e
-        if not 0 <= num <= 200:
+        if not math.isfinite(num) or not 0 <= num <= 200:
             raise ValueError(f"色域覆盖 {key} 超出 0–200%")
         out[str(key)] = round(num, 1)
     return out
@@ -117,13 +118,13 @@ def validate_targets(raw: dict | None) -> dict:
         luminance = float(raw.get("luminance_cd_m2", 120.0))
     except (TypeError, ValueError) as e:
         raise ValueError("目标亮度必须为数值（cd/m²）") from e
-    if not 40 <= luminance <= 400:
+    if not math.isfinite(luminance) or not 40 <= luminance <= 400:
         raise ValueError("目标亮度应在 40–400 cd/m²（印前软打样常用 100–120）")
     try:
         contrast = float(raw.get("contrast_ratio", 1000.0))
     except (TypeError, ValueError) as e:
         raise ValueError("对比度必须为数值") from e
-    if contrast < 100:
+    if not math.isfinite(contrast) or contrast < 100:
         raise ValueError("对比度应 ≥100:1")
     return {
         "white_point": _norm_white_point(raw.get("white_point", "D50")),
@@ -164,9 +165,12 @@ def validate_calibration(raw: dict | None) -> dict | None:
             record[key] = None
             continue
         try:
-            record[key] = round(float(value), 2)
+            num = float(value)
         except (TypeError, ValueError) as e:
             raise ValueError(f"{key} 必须为数值") from e
+        if not math.isfinite(num):
+            raise ValueError(f"{key} 必须为有限数值")
+        record[key] = round(num, 2)
     if record.get("contrast_ratio") is not None and record["contrast_ratio"] < 0:
         raise ValueError("实测对比度不能为负")
     return record
@@ -251,10 +255,18 @@ class DisplayStore:
         }
         if doc["calibration"]:
             doc["history"].append(doc["calibration"])
-        if doc["is_active"]:
-            self._deactivate_others(doc["id"])
-        self._store.put(doc["id"], doc)
-        return doc
+
+        def _insert(data: dict) -> dict:
+            if doc["is_active"]:
+                now = _now()
+                for other in data.values():
+                    if isinstance(other, dict) and other.get("is_active"):
+                        other["is_active"] = False
+                        other["updated_at"] = now
+            data[doc["id"]] = doc
+            return dict(doc)
+
+        return self._store.update(_insert)
 
     def get(self, display_id: str) -> dict | None:
         return self._store.get(display_id)
@@ -265,56 +277,80 @@ class DisplayStore:
         return docs
 
     def update(self, display_id: str, payload: dict) -> dict:
-        doc = self.get(display_id)
-        if doc is None:
-            raise KeyError("显示器档案不存在")
-        for key in ("name", "model", "serial", "notes"):
-            if key in payload and payload[key] is not None:
-                value = str(payload[key]).strip()
-                if key == "name" and not value:
-                    raise ValueError("显示器名称不能为空")
-                doc[key] = value
-        if payload.get("targets") is not None:
-            merged = {**(doc.get("targets") or {}), **(payload.get("targets") or {})}
-            doc["targets"] = validate_targets(merged)
-        if payload.get("is_active") is not None:
-            doc["is_active"] = bool(payload["is_active"])
-            if doc["is_active"]:
-                self._deactivate_others(display_id)
-        doc["updated_at"] = _now()
-        self._store.put(display_id, doc)
-        return doc
+        def _upd(data: dict) -> dict:
+            doc = data.get(display_id)
+            if doc is None:
+                raise KeyError("显示器档案不存在")
+            doc = dict(doc)
+            for key in ("name", "model", "serial", "notes"):
+                if key in payload and payload[key] is not None:
+                    value = str(payload[key]).strip()
+                    if key == "name" and not value:
+                        raise ValueError("显示器名称不能为空")
+                    doc[key] = value
+            if payload.get("targets") is not None:
+                merged = {**(doc.get("targets") or {}), **(payload.get("targets") or {})}
+                doc["targets"] = validate_targets(merged)
+            now = _now()
+            if payload.get("is_active") is not None:
+                doc["is_active"] = bool(payload["is_active"])
+                if doc["is_active"]:
+                    for oid, other in data.items():
+                        if oid != display_id and isinstance(other, dict) and other.get("is_active"):
+                            other["is_active"] = False
+                            other["updated_at"] = now
+            doc["updated_at"] = now
+            data[display_id] = doc
+            return dict(doc)
+
+        return self._store.update(_upd)
 
     def activate(self, display_id: str) -> dict:
-        doc = self.get(display_id)
-        if doc is None:
-            raise KeyError("显示器档案不存在")
-        self._deactivate_others(display_id)
-        doc["is_active"] = True
-        doc["updated_at"] = _now()
-        self._store.put(display_id, doc)
-        return doc
+        def _act(data: dict) -> dict:
+            doc = data.get(display_id)
+            if doc is None:
+                raise KeyError("显示器档案不存在")
+            now = _now()
+            for oid, other in data.items():
+                if oid != display_id and isinstance(other, dict) and other.get("is_active"):
+                    other["is_active"] = False
+                    other["updated_at"] = now
+            doc = dict(doc)
+            doc["is_active"] = True
+            doc["updated_at"] = now
+            data[display_id] = doc
+            return dict(doc)
+
+        return self._store.update(_act)
 
     def add_calibration(self, display_id: str, raw: dict) -> dict:
-        doc = self.get(display_id)
-        if doc is None:
-            raise KeyError("显示器档案不存在")
         record = validate_calibration(raw)
         if record is None:
             raise ValueError("缺少校准确认数据")
-        doc["calibration"] = record
-        doc.setdefault("history", []).append(record)
-        doc["updated_at"] = _now()
-        self._store.put(display_id, doc)
-        return doc
+
+        def _add(doc):
+            if doc is None:
+                raise KeyError("显示器档案不存在")
+            doc = dict(doc)
+            doc["calibration"] = record
+            doc["history"] = list(doc.get("history") or []) + [record]
+            doc["updated_at"] = _now()
+            return doc
+
+        return self._store.mutate_key(display_id, _add)
 
     def delete(self, display_id: str) -> bool:
-        doc = self.get(display_id)
-        if doc is not None:
+        def _del(data: dict) -> tuple[bool, str]:
+            doc = data.pop(display_id, None)
+            if doc is None:
+                return False, ""
             stored = Path(((doc.get("measurement") or {}).get("stored_file") or "")).name
-            if stored:
-                (MEASUREMENT_DIR / stored).unlink(missing_ok=True)
-        return self._store.delete(display_id)
+            return True, stored
+
+        deleted, stored = self._store.update(_del)
+        if stored:
+            (MEASUREMENT_DIR / stored).unlink(missing_ok=True)
+        return deleted
 
     def attach_measurement(self, display_id: str, raw: bytes, filename: str = "",
                            white_luminance_cd_m2: float | None = None) -> dict:
@@ -324,19 +360,24 @@ class DisplayStore:
         自发光屏幕，故仅接受 XYZ 字段。绝对亮度优先取请求参数，其次读 CGATS 头
         ``LUMINANCE_CD_M2`` 等键；都没有时留空，不猜测。
         """
-        doc = self.get(display_id)
-        if doc is None:
+        if self.get(display_id) is None:
             raise KeyError("显示器档案不存在")
         if not raw:
             raise ValueError("测量文件为空")
         if len(raw) > 5_000_000:
             raise ValueError("测量文件过大（>5MB）")
+        if white_luminance_cd_m2 is not None:
+            if not math.isfinite(float(white_luminance_cd_m2)) or float(white_luminance_cd_m2) < 0:
+                raise ValueError("实测白点亮度必须为非负有限数值")
         try:
             parsed = parse_measurement_text(raw)
         except CgatsParseError as e:
             raise ValueError(f"无法解析测量文件：{e}") from e
 
-        xyz_patches = [p for p in parsed.patches if p.xyz and len(p.xyz) == 3]
+        xyz_patches = [
+            p for p in parsed.patches
+            if p.xyz and len(p.xyz) == 3 and all(math.isfinite(float(v)) for v in p.xyz)
+        ]
         if len(xyz_patches) < 2:
             raise ValueError("显示器测量需至少 2 个含 XYZ 的色块（白与黑）；光谱反射数据不适用于自发光屏幕")
 
@@ -350,38 +391,52 @@ class DisplayStore:
         absolute = white_luminance_cd_m2
         if absolute is None:
             absolute = _meta_float(parsed.meta, ("LUMINANCE_CD_M2", "LUMINANCE_CDM2", "LUMINANCE"))
+        if absolute is not None and not math.isfinite(float(absolute)):
+            absolute = None
 
         MEASUREMENT_DIR.mkdir(parents=True, exist_ok=True)
-        previous = Path(((doc.get("measurement") or {}).get("stored_file") or "")).name
-        if previous:
-            (MEASUREMENT_DIR / previous).unlink(missing_ok=True)
-        stored = f"{doc['id']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        stored = f"{display_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}.txt"
         (MEASUREMENT_DIR / stored).write_bytes(raw)
+        previous_holder = [""]
 
-        doc["measurement"] = {
-            "filename": (filename or stored).strip(),
-            "stored_file": stored,
-            "sha256": hashlib.sha256(raw).hexdigest()[:16],
-            "kind": parsed.kind,
-            "patches": len(parsed.patches),
-            "xyz_patches": len(xyz_patches),
-            "source_condition": parsed.source_condition,
-            "white_xy": list(white_xy) if white_xy else None,
-            "white_y": round(wy, 3),
-            "black_y": round(by, 4),
-            "contrast_ratio": contrast,
-            "luminance_cd_m2": round(absolute, 1) if absolute is not None else None,
-            "imported_at": _now(),
-        }
-        calibration = doc.get("calibration")
-        if calibration:
-            if calibration.get("contrast_ratio") is None and contrast is not None:
-                calibration["contrast_ratio"] = contrast
-            if calibration.get("luminance_cd_m2") is None and absolute is not None:
-                calibration["luminance_cd_m2"] = round(absolute, 1)
-        doc["updated_at"] = _now()
-        self._store.put(display_id, doc)
-        return doc
+        def _attach(doc):
+            if doc is None:
+                raise KeyError("显示器档案不存在")
+            doc = dict(doc)
+            previous_holder[0] = Path(((doc.get("measurement") or {}).get("stored_file") or "")).name
+            doc["measurement"] = {
+                "filename": (filename or stored).strip(),
+                "stored_file": stored,
+                "sha256": hashlib.sha256(raw).hexdigest()[:16],
+                "kind": parsed.kind,
+                "patches": len(parsed.patches),
+                "xyz_patches": len(xyz_patches),
+                "source_condition": parsed.source_condition,
+                "white_xy": list(white_xy) if white_xy else None,
+                "white_y": round(wy, 3),
+                "black_y": round(by, 4),
+                "contrast_ratio": contrast,
+                "luminance_cd_m2": round(float(absolute), 1) if absolute is not None else None,
+                "imported_at": _now(),
+            }
+            calibration = dict(doc["calibration"]) if doc.get("calibration") else None
+            if calibration:
+                if calibration.get("contrast_ratio") is None and contrast is not None:
+                    calibration["contrast_ratio"] = contrast
+                if calibration.get("luminance_cd_m2") is None and absolute is not None:
+                    calibration["luminance_cd_m2"] = round(float(absolute), 1)
+                doc["calibration"] = calibration
+            doc["updated_at"] = _now()
+            return doc
+
+        try:
+            updated = self._store.mutate_key(display_id, _attach)
+        except Exception:
+            (MEASUREMENT_DIR / stored).unlink(missing_ok=True)
+            raise
+        if previous_holder[0] and previous_holder[0] != stored:
+            (MEASUREMENT_DIR / previous_holder[0]).unlink(missing_ok=True)
+        return updated
 
     def measurement_export(self, display_id: str) -> tuple[bytes, str, str]:
         """原样导出最近一次屏幕测量文件（供 DisplayCAL / i1Profiler 复核）。"""

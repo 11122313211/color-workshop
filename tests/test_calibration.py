@@ -3,7 +3,7 @@
 覆盖：校准色块集完整性、校准版渲染、参考表（ISO 列仅固体+CMY）、双基准报告
 （配对/分级/overall 判定）、校正曲线手算锚点（scaled-axis 构造：e(t)=0.8t）、
 逐通道墨量建议方向、补偿模型写入与门禁、导出文本结构、API 全流程。
-所有测量数据为合成（由 testbed ICC 正查构造，无真实课程数据）。
+所有测量数据为合成（由 testbed ICC 正查构造，无非公开实测数据）。
 """
 
 from __future__ import annotations

@@ -16,6 +16,7 @@ ImageCms 仅用于 sRGB ICC profile 的生成与读写。
 
 from __future__ import annotations
 
+import functools
 import io
 from typing import Literal
 
@@ -24,11 +25,13 @@ import colour
 import coloraide
 from PIL import Image, ImageCms
 
-# 支持的色彩空间（产品统一标识）
+# 支持的色彩空间（产品统一标识；CMYK 需绑定工艺 ICC 经 /api/recipes/forward 或 /api/files/convert）
 SUPPORTED_SPACES = {
     "srgb", "adobe-rgb", "dci-p3", "rec2020", "prophoto",
-    "lab", "xyz", "cmyk",
+    "lab", "xyz",
 }
+
+_RGB_SPACES = {"srgb", "adobe-rgb", "dci-p3", "rec2020", "prophoto"}
 
 # 渲染意图（ICC 标准）
 RenderingIntent = Literal[
@@ -44,6 +47,17 @@ _SPACE_TO_COLORAIDE = {
     "prophoto": "prophoto-rgb",
     "lab": "lab",
     "xyz": "xyz-d65",
+}
+
+# 直接分派底层色差函数，避免 colour.DELTA_E_METHODS 规范化键碰撞警告（ColourUsageWarning）与调度开销
+_DELTA_E_FUNCS = {
+    "cie2000": colour.difference.delta_E_CIE2000,
+    "cie 2000": colour.difference.delta_E_CIE2000,
+    "cie1976": colour.difference.delta_E_CIE1976,
+    "cie 1976": colour.difference.delta_E_CIE1976,
+    "cie1994": colour.difference.delta_E_CIE1994,
+    "cie 1994": colour.difference.delta_E_CIE1994,
+    "cmc": colour.difference.delta_E_CMC,
 }
 
 
@@ -72,24 +86,39 @@ def convert_color(rgb, from_space: str, to_space: str) -> list[float]:
     """
     from_space = from_space.lower()
     to_space = to_space.lower()
+    if from_space == "cmyk" or to_space == "cmyk":
+        raise ValueError("CMYK 依赖具体工艺 ICC，请使用工艺正查（/api/recipes/forward）或文件转换接口")
     if from_space not in SUPPORTED_SPACES:
         raise ValueError(f"不支持的色彩空间: {from_space}")
     if to_space not in SUPPORTED_SPACES:
         raise ValueError(f"不支持的色彩空间: {to_space}")
 
-    rgb = _to_float_rgb(rgb)
+    arr = _to_float_rgb(rgb) if from_space in _RGB_SPACES else np.asarray(rgb, dtype=np.float64)
+    if arr.shape != (3,) or not np.all(np.isfinite(arr)):
+        raise ValueError("颜色输入必须为 3 个有限数值")
 
     # 经 coloraide 统一转换（内部走 XYZ 中转，含色适应）
-    c = coloraide.Color(_SPACE_TO_COLORAIDE[from_space], list(rgb))
+    c = coloraide.Color(_SPACE_TO_COLORAIDE[from_space], arr.tolist())
     c = c.convert(_SPACE_TO_COLORAIDE[to_space])
     return [float(v) for v in c.coords()]
 
 
+_SPACE_TO_COLOUR_RGB = {
+    "srgb": "sRGB",
+    "adobe-rgb": "Adobe RGB (1998)",
+    "dci-p3": "Display P3",
+    "rec2020": "ITU-R BT.2020",
+    "prophoto": "ProPhoto RGB",
+}
+
+
 def _rgb_batch_to_xyz(rgb: np.ndarray, space: str) -> np.ndarray:
-    """将一批 RGB 值（Nx3，0-1 浮点）转换为 XYZ（D65）。"""
+    """将一批 RGB 值（Nx3，0-1 浮点）转换为 XYZ（D65），全 NumPy 向量化。"""
     if space == "srgb":
         return colour.sRGB_to_XYZ(rgb)
-    # 非 sRGB：逐个经 coloraide 转 XYZ
+    cs_name = _SPACE_TO_COLOUR_RGB.get(space)
+    if cs_name is not None:
+        return np.asarray(colour.RGB_to_XYZ(rgb, cs_name), dtype=np.float64)
     results = []
     for row in rgb:
         c = coloraide.Color(_SPACE_TO_COLORAIDE[space], list(row))
@@ -116,21 +145,21 @@ def delta_e(
     返回:
         色差值（float）
     """
-    lab1 = np.asarray(lab1, dtype=np.float64)
-    lab2 = np.asarray(lab2, dtype=np.float64)
-    m = method if method in colour.DELTA_E_METHODS else "cie2000"
-    return float(colour.delta_E(lab1, lab2, method=m))
+    lab1_arr = np.asarray(lab1, dtype=np.float64)
+    lab2_arr = np.asarray(lab2, dtype=np.float64)
+    fn = _DELTA_E_FUNCS.get(str(method).strip().lower(), colour.difference.delta_E_CIE2000)
+    return float(fn(lab1_arr, lab2_arr))
 
 
 def delta_e_batch(lab1, lab2, method: str = "cie2000") -> np.ndarray:
     """批量色差：lab1 (N,3) 对 lab2 (3,) 或 (N,3) 广播，返回 (N,) 数组。
 
-    colour.delta_E 为纯 numpy 向量化实现，批量调用远快于逐行 Python 循环。
+    直接分派 colour.difference 纯 numpy 向量化实现，零警告且无调度开销。
     """
-    lab1 = np.asarray(lab1, dtype=np.float64)
-    lab2 = np.asarray(lab2, dtype=np.float64)
-    m = method if method in colour.DELTA_E_METHODS else "cie2000"
-    return np.asarray(colour.delta_E(lab1, lab2, method=m), dtype=np.float64)
+    lab1_arr = np.asarray(lab1, dtype=np.float64)
+    lab2_arr = np.asarray(lab2, dtype=np.float64)
+    fn = _DELTA_E_FUNCS.get(str(method).strip().lower(), colour.difference.delta_E_CIE2000)
+    return np.asarray(fn(lab1_arr, lab2_arr), dtype=np.float64)
 
 
 def delta_e_components(lab1, lab2) -> dict:
@@ -296,9 +325,12 @@ def gamut_map_color(
 
 
 def _xyz_batch_to_rgb(xyz: np.ndarray, space: str) -> np.ndarray:
-    """将一批 XYZ 值（Nx3）转换为目标空间 RGB（0-1）。"""
+    """将一批 XYZ 值（Nx3）转换为目标空间 RGB（0-1），全 NumPy 向量化。"""
     if space == "srgb":
         return colour.XYZ_to_sRGB(xyz)
+    cs_name = _SPACE_TO_COLOUR_RGB.get(space)
+    if cs_name is not None:
+        return np.asarray(colour.XYZ_to_RGB(xyz, cs_name), dtype=np.float64)
     results = []
     for row in xyz:
         c = coloraide.Color("xyz-d65", list(row))
@@ -311,11 +343,15 @@ def _xyz_batch_to_rgb(xyz: np.ndarray, space: str) -> np.ndarray:
 # 色域计算（设备色域边界 / 覆盖率）
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=32)
 def compute_gamut_volume(space: str) -> float:
     """
-    计算指定色彩空间的色域体积（在 Lab 空间内，近似）。
+    计算指定色彩空间的色域体积（在 Lab 空间内，近似，带进程级缓存）。
     通过对 RGB 立方体采样求体积，用于色域大小量化。
     """
+    space = space.lower()
+    if space not in _RGB_SPACES:
+        raise ValueError(f"不支持的色域计算空间: {space}")
     gamut = _sample_gamut_lab(space, n=10)
     L_range = gamut[:, 0].max() - gamut[:, 0].min()
     a_range = gamut[:, 1].max() - gamut[:, 1].min()
@@ -323,11 +359,16 @@ def compute_gamut_volume(space: str) -> float:
     return float(L_range * a_range * b_range)
 
 
+@functools.lru_cache(maxsize=64)
 def gamut_coverage(target_space: str, reference_space: str = "srgb") -> float:
     """
-    计算目标空间对参考空间（sRGB）的色域覆盖率（近似百分比）。
+    计算目标空间对参考空间（sRGB）的色域覆盖率（近似百分比，带进程级缓存）。
     用 Lab 空间内参考空间色域点是否落入目标色域包围盒判断。
     """
+    target_space = target_space.lower()
+    reference_space = reference_space.lower()
+    if target_space not in _RGB_SPACES or reference_space not in _RGB_SPACES:
+        raise ValueError(f"不支持的色域覆盖空间: {target_space} / {reference_space}")
     ref_gamut = _sample_gamut_lab(reference_space, n=12)
     tgt_gamut = _sample_gamut_lab(target_space, n=30)
 
@@ -348,6 +389,8 @@ __all__ = [
     "RenderingIntent",
     "convert_color",
     "delta_e",
+    "delta_e_batch",
+    "delta_e_components",
     "delta_e_from_rgb",
     "create_srgb_profile",
     "load_profile_from_bytes",

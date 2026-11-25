@@ -76,7 +76,10 @@ router_measurements = APIRouter(prefix="/api/measurements", tags=["measurements"
 
 @router_measurements.post("", response_model=MeasurementOut)
 def add_measurement(data: Measurement):
-    return measurement_store.add(data)
+    try:
+        return measurement_store.add(data)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, str(e)) from e
 
 
 @router_measurements.get("", response_model=list[MeasurementOut])
@@ -105,7 +108,10 @@ router_convert = APIRouter(prefix="/api/convert", tags=["convert"])
 
 @router_convert.post("", response_model=ConvertResponse)
 def convert(req: ConvertRequest):
-    result = convert_color(req.rgb, req.from_space, req.to_space)
+    try:
+        result = convert_color(req.rgb, req.from_space, req.to_space)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, str(e)) from e
     return ConvertResponse(
         result=[round(v, 4) for v in result],
         from_space=req.from_space,
@@ -122,7 +128,10 @@ router_correction = APIRouter(prefix="/api/correction", tags=["correction"])
 
 @router_correction.post("", response_model=CorrectionResponse)
 def correction(req: CorrectionRequest):
-    return run_correction(device_store, req)
+    try:
+        return run_correction(device_store, req)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +143,10 @@ router_delta_e = APIRouter(prefix="/api/delta-e", tags=["delta-e"])
 
 @router_delta_e.post("", response_model=DeltaEResponse)
 def delta_e_check(req: DeltaERequest):
-    return run_delta_e(req)
+    try:
+        return run_delta_e(req)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, str(e)) from e
 
 
 @router_delta_e.post("/lab", response_model=DeltaEResponse)
@@ -160,7 +172,10 @@ router_closed_loop = APIRouter(prefix="/api/closed-loop", tags=["closed-loop"])
 
 @router_closed_loop.post("", response_model=ClosedLoopResponse)
 def closed_loop(req: ClosedLoopRequest):
-    return run_closed_loop(req)
+    try:
+        return run_closed_loop(req)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +187,13 @@ router_visualization = APIRouter(prefix="/api/visualization", tags=["visualizati
 
 @router_visualization.get("/gamut", response_model=GamutVisualizationResponse)
 def gamut_info(spaces: str = "srgb,dci-p3,adobe-rgb,rec2020"):
-    space_list = [s.strip() for s in spaces.split(",") if s.strip()]
-    data = gamut_visualization_data(space_list)
+    space_list = [s.strip().lower() for s in spaces.split(",") if s.strip()]
+    if not space_list:
+        raise HTTPException(422, "至少提供一个有效的 RGB 色彩空间")
+    try:
+        data = gamut_visualization_data(space_list)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, str(e)) from e
     return GamutVisualizationResponse(**data)
 
 
@@ -191,15 +211,26 @@ def delta_e_dist(
     space: str = "srgb",
     method: str = "cie2000",
 ):
-    target = [float(v) for v in target_rgb.split(",")]
-    # 生成一组模拟测量点（围绕目标加随机偏移）
+    import math
     import numpy as np
-    np.random.seed(42)
-    measured = []
-    for _ in range(20):
-        noise = np.random.randn(3) * 20
-        measured.append([float(v) for v in np.clip(target + noise, 0, 255)])
-    return delta_e_distribution(target, measured, space, method)
+
+    try:
+        target = [float(v.strip()) for v in target_rgb.split(",")]
+    except ValueError as e:
+        raise HTTPException(422, "target_rgb 必须为逗号分隔的 3 个数值") from e
+    if len(target) != 3 or not all(math.isfinite(v) for v in target):
+        raise HTTPException(422, "target_rgb 必须为 3 个有限数值")
+    # 使用局部 RNG 替代 np.random.seed 全局状态，保证并发线程安全
+    rng = np.random.default_rng(42)
+    target_arr = np.asarray(target, dtype=np.float64)
+    measured = [
+        [float(v) for v in np.clip(target_arr + rng.standard_normal(3) * 20, 0, 255)]
+        for _ in range(20)
+    ]
+    try:
+        return delta_e_distribution(target, measured, space, method)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, str(e)) from e
 
 
 # ---------------------------------------------------------------------------

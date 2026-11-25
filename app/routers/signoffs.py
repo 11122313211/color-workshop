@@ -28,6 +28,7 @@ from ..services.signoffs import (
     SignoffStore,
     summary,
 )
+from ._http import key_error_msg
 
 router = APIRouter(prefix="/api/signoffs", tags=["signoffs"])
 
@@ -119,6 +120,8 @@ def _act(signoff_id: str, action: str, req: SignoffActionRequest) -> dict:
     existing = store.get(signoff_id)
     if existing is None:
         raise HTTPException(404, "签样记录不存在")
+    if existing.get("orphaned_at"):
+        raise HTTPException(409, "签样所属工艺已永久清理，孤儿审计证据只读")
     if existing.get("process_id"):
         proc = _processes.get(existing.get("process_id", ""))
         if proc is not None:
@@ -126,7 +129,9 @@ def _act(signoff_id: str, action: str, req: SignoffActionRequest) -> dict:
     try:
         doc = store.transition(signoff_id, action, req.actor, req.note)
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "签样记录不存在")) from e
+    except PermissionError as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return summary(doc)
@@ -222,6 +227,8 @@ def delete_signoff(signoff_id: str):
     existing = store.get(signoff_id)
     if existing is None:
         raise HTTPException(404, "签样记录不存在")
+    if existing.get("orphaned_at"):
+        raise HTTPException(409, "签样所属工艺已永久清理，孤儿审计证据只读")
     if existing.get("process_id"):
         proc = _processes.get(existing.get("process_id", ""))
         if proc is not None:
@@ -229,7 +236,9 @@ def delete_signoff(signoff_id: str):
     try:
         deleted = store.delete(signoff_id)
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "签样记录不存在")) from e
+    except PermissionError as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(409, str(e)) from e
     return {"status": "deleted" if deleted else "not_found"}

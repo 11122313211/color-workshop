@@ -78,19 +78,27 @@ def template_items(template: str) -> list[str]:
     return [item for g in doc["groups"] for item in g["items"]]
 
 
-def validate_scores(template: str, scores: dict) -> dict[int]:
+def validate_scores(template: str, scores: dict) -> dict[str, int]:
     """校验打分：指标必须属于模板，分值必须为 1-5 整数。非法则抛 ValueError。"""
     items = template_items(template)
     if not scores:
         raise ValueError("打分不能为空")
-    out: dict[int] = {}
+    out: dict[str, int] = {}
     for key, val in scores.items():
         if key not in items:
             raise ValueError(f"指标不在模板中: {key}")
-        try:
+        if isinstance(val, bool):
+            raise ValueError(f"分值必须为 1-5 整数: {key}")
+        if isinstance(val, int):
+            v = val
+        elif isinstance(val, float):
+            if not math.isfinite(val) or not val.is_integer():
+                raise ValueError(f"分值必须为 1-5 整数: {key}")
             v = int(val)
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"分值必须为 1-5 整数: {key}") from e
+        elif isinstance(val, str) and val.strip().lstrip("+-").isdigit():
+            v = int(val.strip())
+        else:
+            raise ValueError(f"分值必须为 1-5 整数: {key}")
         if not 1 <= v <= 5:
             raise ValueError(f"分值超出 1-5: {key}={v}")
         out[key] = v
@@ -107,20 +115,23 @@ def evaluation_stats(evaluation: dict) -> dict:
     entries = evaluation.get("entries") or []
     rows = []
     warn_items = []
+    raw_means = []
     for item in items:
         vals = [float(e["scores"][item]) for e in entries
                 if item in (e.get("scores") or {})]
         n = len(vals)
-        mean = round(sum(vals) / n, 2) if n else None
-        std = round(math.sqrt(sum((v - mean) ** 2 for v in vals) / (n - 1)), 3) if n >= 2 else None
+        raw_mean = sum(vals) / n if n else None
+        mean = round(raw_mean, 2) if raw_mean is not None else None
+        std = round(math.sqrt(sum((v - raw_mean) ** 2 for v in vals) / (n - 1)), 3) if (n >= 2 and raw_mean is not None) else None
         if std is not None and std > SCORE_STD_WARN:
             warn_items.append(item)
+        if raw_mean is not None:
+            raw_means.append(raw_mean)
         rows.append({"item": item, "n": n, "mean": mean, "std": std})
-    scored = [r["mean"] for r in rows if r["mean"] is not None]
     return {
         "rows": rows,
         "entries": len(entries),
-        "overall": round(sum(scored) / len(scored), 2) if scored else None,
+        "overall": round(sum(raw_means) / len(raw_means), 2) if raw_means else None,
         "consistency_warn": warn_items,
     }
 
@@ -157,22 +168,25 @@ class EvaluationStore:
         return docs
 
     def add_entry(self, eid: str, evaluator: str, scores: dict) -> dict:
-        doc = self.get(eid)
-        if doc is None:
-            raise KeyError("评价不存在")
-        clean = validate_scores(doc.get("template", ""), scores)
         name = evaluator.strip()
         if not name:
             raise ValueError("评价人姓名不能为空")
-        entry = {
-            "id": _new_id("ent"),
-            "evaluator": name,
-            "scores": {k: int(v) for k, v in clean.items()},
-            "submitted_at": _now(),
-        }
-        doc.setdefault("entries", []).append(entry)
-        self._store.put(eid, doc)
-        return doc
+
+        def _mutate(doc):
+            if doc is None:
+                raise KeyError("评价不存在")
+            clean = validate_scores(doc.get("template", ""), scores)
+            doc = dict(doc)
+            entry = {
+                "id": _new_id("ent"),
+                "evaluator": name,
+                "scores": {k: int(v) for k, v in clean.items()},
+                "submitted_at": _now(),
+            }
+            doc["entries"] = list(doc.get("entries") or []) + [entry]
+            return doc
+
+        return self._store.mutate_key(eid, _mutate)
 
     def delete_evaluation(self, eid: str) -> bool:
         return self._store.delete(eid)

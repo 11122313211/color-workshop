@@ -47,25 +47,33 @@ class CalibrationStore:
 
         seq 为进程内单调递增序号——同秒落多轮时保证排序确定（created_at 只有秒精度）。
         """
-        existing = self.get_by_session(session_id)
-        rid = existing["id"] if existing else f"cal_{uuid.uuid4().hex[:12]}"
-        seq = existing["seq"] if existing else max(
-            (int(d.get("seq", 0)) for d in self._store.all().values()), default=0) + 1
-        doc = {
-            "id": rid,
-            "seq": seq,
-            "process_id": process_id,
-            "icc_sha256": icc_sha256,
-            "session_id": session_id,
-            "created_at": existing["created_at"] if existing else _now(),
-            "overall": report.get("overall", "n/a"),
-            "summary": report.get("summary", {}),
-            "ink_suggestions": report.get("ink_suggestions", []),
-            "bias_before": [round(float(v), 4) for v in bias_before],
-            "bias_after": [round(float(v), 4) for v in bias_after],
-        }
-        self._store.put(rid, doc)
-        return doc
+        def _save(data: dict) -> dict:
+            existing = next(
+                (d for d in data.values() if isinstance(d, dict) and d.get("session_id") == session_id),
+                None,
+            )
+            rid = existing["id"] if existing else f"cal_{uuid.uuid4().hex[:12]}"
+            seq = existing["seq"] if existing else max(
+                (int(d.get("seq", 0)) for d in data.values() if isinstance(d, dict)),
+                default=0,
+            ) + 1
+            doc = {
+                "id": rid,
+                "seq": seq,
+                "process_id": process_id,
+                "icc_sha256": icc_sha256,
+                "session_id": session_id,
+                "created_at": existing["created_at"] if existing else _now(),
+                "overall": report.get("overall", "n/a"),
+                "summary": report.get("summary", {}),
+                "ink_suggestions": report.get("ink_suggestions", []),
+                "bias_before": [round(float(v), 4) for v in bias_before],
+                "bias_after": [round(float(v), 4) for v in bias_after],
+            }
+            data[rid] = doc
+            return dict(doc)
+
+        return self._store.update(_save)
 
     def get_by_session(self, session_id: str) -> dict | None:
         for doc in self._store.all().values():
@@ -89,12 +97,11 @@ class CalibrationStore:
 
     def remove_process(self, process_id: str) -> int:
         """级联清理：删除某工艺的全部轮次（工艺删除时调用）。"""
-        removed = 0
-        for rid, doc in list(self._store.all().items()):
-            if doc.get("process_id") == process_id:
-                self._store.delete(rid)
-                removed += 1
-        return removed
+        keys = [
+            rid for rid, doc in self._store.all().items()
+            if isinstance(doc, dict) and doc.get("process_id") == process_id
+        ]
+        return self._store.delete_many(keys)
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +126,13 @@ def compare_rounds(current_report: dict, prev_round: dict) -> dict:
              if cur_summary.get("avg_de_expected") is not None and prev_avg is not None else None)
 
     verdict = "flat"
-    if rank_up or (d_max is not None and d_max < -VERDICT_EPS):
+    if rank_up:
         verdict = "improved"
-    elif rank_down or (d_max is not None and d_max > VERDICT_EPS):
+    elif rank_down:
+        verdict = "worsened"
+    elif d_max is not None and d_max < -VERDICT_EPS:
+        verdict = "improved"
+    elif d_max is not None and d_max > VERDICT_EPS:
         verdict = "worsened"
 
     cur_delta = {s.get("channel"): s.get("delta_pct")
@@ -161,15 +172,18 @@ def convergence_for_process(rounds: list[dict]) -> dict:
     if len(rounds) < 2:
         return {"status": "n/a", "status_label": CONVERGENCE_LABELS["n/a"], "rounds": len(rounds)}
     ordered = sorted(rounds, key=_round_order)
-    ok_rounds = [r for r in ordered if r.get("overall") == "ok"]
-    if ok_rounds:
+    trend = trend_series(ordered)
+    last, prev = ordered[-1], ordered[-2]
+    # 收敛必须以最新轮次达标为准；若历史曾达标但最新轮次已漂移恶化，不能误报已收敛
+    if last.get("overall") == "ok":
+        ok_rounds = [r for r in ordered if r.get("overall") == "ok"]
         return {
             "status": "converged",
             "status_label": CONVERGENCE_LABELS["converged"],
             "rounds": len(ordered),
             "converged_at": ok_rounds[0].get("created_at", ""),
+            "trend": trend,
         }
-    last, prev = ordered[-1], ordered[-2]
     last_max = (last.get("summary") or {}).get("max_de_expected")
     prev_max = (prev.get("summary") or {}).get("max_de_expected")
     if last_max is None or prev_max is None:
@@ -184,8 +198,7 @@ def convergence_for_process(rounds: list[dict]) -> dict:
         "status": status,
         "status_label": CONVERGENCE_LABELS[status],
         "rounds": len(ordered),
-        "trend": [round(float((r.get("summary") or {}).get("max_de_expected") or 0), 2)
-                  for r in ordered],
+        "trend": trend,
     }
 
 

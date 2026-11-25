@@ -435,6 +435,9 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       ? glCanvas
       : canvas;
 
+  let hoverRafId = 0;
+  let pendingHover = null;
+
   stage.addEventListener("pointermove", (e) => {
     if (mode === "3d" && dragging) {
       const dx = e.clientX - lastPointer.x;
@@ -445,21 +448,29 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
       schedule();
       return;
     }
-    const rect = activeCanvas().getBoundingClientRect();
-    const px = e.clientX - rect.left;
-    const py = e.clientY - rect.top;
-    const hitTest = renderers.get("canvas2d").hitTest;
-    let hit = showPoints ? hitTest(screenPts, px, py, mode === "3d" ? 8 : 10) : null;
-    if (mode === "2d" && showSpectrum) {
-      const spectralHit = hitTest(spectrumPts, px, py, 7);
-      if (spectralHit) {
-        const sampleDistance = hit ? Math.hypot(hit.sx - px, hit.sy - py) : Infinity;
-        const spectrumDistance = Math.hypot(spectralHit.sx - px, spectralHit.sy - py);
-        // 轨迹与点云重叠时稍微偏向轨迹，保证细线也能被选中。
-        if (!hit || spectrumDistance <= sampleDistance + 2.5) hit = spectralHit;
+    pendingHover = { clientX: e.clientX, clientY: e.clientY };
+    if (hoverRafId) return;
+    hoverRafId = requestAnimationFrame(() => {
+      hoverRafId = 0;
+      if (disposed || !pendingHover) return;
+      const { clientX, clientY } = pendingHover;
+      pendingHover = null;
+      const rect = activeCanvas().getBoundingClientRect();
+      const px = clientX - rect.left;
+      const py = clientY - rect.top;
+      const hitTest = renderers.get("canvas2d").hitTest;
+      let hit = showPoints ? hitTest(screenPts, px, py, mode === "3d" ? 8 : 10) : null;
+      if (mode === "2d" && showSpectrum) {
+        const spectralHit = hitTest(spectrumPts, px, py, 7);
+        if (spectralHit) {
+          const sampleDistance = hit ? Math.hypot(hit.sx - px, hit.sy - py) : Infinity;
+          const spectrumDistance = Math.hypot(spectralHit.sx - px, spectralHit.sy - py);
+          // 轨迹与点云重叠时稍微偏向轨迹，保证细线也能被选中。
+          if (!hit || spectrumDistance <= sampleDistance + 2.5) hit = spectralHit;
+        }
       }
-    }
-    showTip(hit, e.clientX, e.clientY);
+      showTip(hit, clientX, clientY);
+    });
   });
   stage.addEventListener("pointerleave", hideTip);
   stage.addEventListener("pointerdown", (e) => {
@@ -535,7 +546,8 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     schedule();
   });
 
-  const disposers = [observeRedraw(canvas, schedule)];
+  // 监听 stage 而非 2D canvas，确保 3D 模式下 canvas.hidden=true 时窗口缩放也能重绘
+  const disposers = [observeRedraw(stage, schedule)];
 
   load();
 
@@ -565,6 +577,7 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     destroy() {
       disposed = true;
       if (rafId) cancelAnimationFrame(rafId);
+      if (hoverRafId) cancelAnimationFrame(hoverRafId);
       disposers.forEach((d) => d());
       const threeR = renderers.get("three");
       if (threeR && threeR.dispose) threeR.dispose();

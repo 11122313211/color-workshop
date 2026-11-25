@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -37,12 +38,23 @@ app = FastAPI(
     version="0.11.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 默认仅允许本机回环来源跨域，生产/局域网部署可通过 COLORFORGE_CORS_ORIGINS（逗号分隔）显式配置
+_cors_env = os.environ.get("COLORFORGE_CORS_ORIGINS", "").strip()
+if _cors_env:
+    _allow_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allow_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
+    )
 
 # 注册所有路由
 app.include_router(router_system)

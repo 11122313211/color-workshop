@@ -109,10 +109,12 @@ async function openCreateModal(view, holder) {
     </div>
   `);
   modal.querySelector("#ev-cancel").addEventListener("click", close);
-  modal.querySelector("#ev-save").addEventListener("click", async () => {
+  const saveBtn = modal.querySelector("#ev-save");
+  saveBtn.addEventListener("click", async () => {
     const template = modal.querySelector("#ev-tpl").value;
     const title = modal.querySelector("#ev-title").value.trim();
     const processId = modal.querySelector("#ev-proc").value;
+    saveBtn.disabled = true;
     try {
       await apiPost(`/api/qc/evaluations?template=${encodeURIComponent(template)}&title=${encodeURIComponent(title)}&process_id=${encodeURIComponent(processId)}`, {});
       toast("评价已创建，开始录入打分");
@@ -120,6 +122,8 @@ async function openCreateModal(view, holder) {
       renderEvalCardInto(view, holder);
     } catch (e) {
       toast(e.message, "err");
+    } finally {
+      if (saveBtn.isConnected) saveBtn.disabled = false;
     }
   });
 }
@@ -145,9 +149,9 @@ async function openScoreModal(view, holder, eid, template) {
       ${g.items.map((item, idx) => `
         <div class="ev-score-row" data-item="${esc(item)}" style="display:flex; align-items:center; gap:8px; padding:7px 0; border-top:1px solid var(--separator)">
           <span style="flex:1; min-width:180px; font-size:13px; color:var(--label)">${esc(item)}</span>
-          <div style="display:flex; gap:4px">
+          <div role="radiogroup" aria-label="${esc(item)}" style="display:flex; gap:4px">
             ${[1, 2, 3, 4, 5].map((v) => `
-              <button type="button" class="btn btn-secondary btn-sm ev-vote" data-v="${v}"
+              <button type="button" class="btn btn-secondary btn-sm ev-vote" data-v="${v}" aria-pressed="false"
                 title="${esc(scale[String(v)] || v)}" style="min-width:32px; padding:4px 0">${v}</button>`).join("")}
           </div>
         </div>`).join("")}
@@ -173,15 +177,18 @@ async function openScoreModal(view, holder, eid, template) {
         row.querySelectorAll(".ev-vote").forEach((b) => {
           b.style.background = "";
           b.style.color = "";
+          b.setAttribute("aria-pressed", "false");
         });
         btn.style.background = "var(--accent, var(--brand, #2c6e49))";
         btn.style.color = "#fff";
+        btn.setAttribute("aria-pressed", "true");
       });
     });
   });
 
   modal.querySelector("#ev-cancel").addEventListener("click", close);
-  modal.querySelector("#ev-submit").addEventListener("click", async () => {
+  const submitBtn = modal.querySelector("#ev-submit");
+  submitBtn.addEventListener("click", async () => {
     const evaluator = modal.querySelector("#ev-name").value.trim();
     if (!evaluator) {
       toast("请填写评价人", "err");
@@ -197,6 +204,7 @@ async function openScoreModal(view, holder, eid, template) {
       toast(`还有 ${missing} 项未打分`, "err");
       return;
     }
+    submitBtn.disabled = true;
     try {
       await apiPost(`/api/qc/evaluations/entries?evaluation_id=${encodeURIComponent(eid)}&evaluator=${encodeURIComponent(evaluator)}`, scores);
       toast("打分已录入");
@@ -204,6 +212,8 @@ async function openScoreModal(view, holder, eid, template) {
       renderEvalCardInto(view, holder);
     } catch (e) {
       toast(e.message, "err");
+    } finally {
+      if (submitBtn.isConnected) submitBtn.disabled = false;
     }
   });
 }

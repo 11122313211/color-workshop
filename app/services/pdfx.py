@@ -86,7 +86,9 @@ def _box_copy(page, key: str) -> ArrayObject | None:
 
 
 def _out_name(filename: str) -> str:
-    stem = (filename or "document.pdf").strip()
+    from pathlib import Path
+
+    stem = Path((filename or "document.pdf").strip()).name or "document.pdf"
     if stem.lower().endswith(".pdf"):
         stem = stem[:-4]
     return f"{stem}-PDFX4.pdf"
@@ -113,7 +115,7 @@ def package_pdfx(
         raise PdfxError("PDF 过大（>40MB），请拆分后再封装")
 
     try:
-        report = preflight(pdf_bytes, filename)
+        report = preflight(pdf_bytes, filename, render_thumbnail=False)
     except Exception as e:  # noqa: BLE001 —— 解析失败统一转封装错误
         raise PdfxError(f"PDF 预检失败：{e}") from e
     if report.get("format") != "PDF" or report.get("status") == "error":

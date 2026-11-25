@@ -2,7 +2,7 @@
 
 import { apiGet, apiPost, apiPostRaw, fileToBase64, downloadDataUri } from "../api.js";
 import { icon } from "../icons.js";
-import { toast, emptyState } from "../components.js";
+import { toast, emptyState, errorState, esc, safeHex, safeImageUri } from "../components.js";
 
 const INTENTS = [
   ["relative_colorimetric", "相对比色", "色域内精确匹配，白点跟随纸张"],
@@ -12,7 +12,7 @@ const INTENTS = [
 ];
 
 let state = {
-  file: null,       // {name, b64}
+  file: null,       // {name, b64, raw}
   report: null,     // preflight report
   processes: [],
   processId: null,
@@ -23,9 +23,15 @@ let state = {
   pdfxStrict: true,
   displayStatus: null,  // 软打样显示器校准状态
 };
+let uploadSeq = 0;
 
-export async function renderFilesView(view) {
+function safeLevel(level) {
+  return level === "warn" || level === "error" ? level : "info";
+}
+
+export async function renderFilesView(view, params = {}) {
   reset();
+  const isActive = params.isActive || (() => true);
   view.innerHTML = `
     <div class="page-head">
       <div>
@@ -35,17 +41,27 @@ export async function renderFilesView(view) {
     </div>
     <div class="stepper" id="stepper"></div>
   `;
-  try {
-    const [procs, disp] = await Promise.all([
-      apiGet("/api/processes"),
-      apiGet("/api/displays/active-status").catch(() => null),
-    ]);
-    state.processes = procs;
-    state.displayStatus = disp;
-  } catch (_) {
-    state.processes = [];
+  async function loadInit() {
+    try {
+      const [procs, disp] = await Promise.all([
+        apiGet("/api/processes", { signal: params.signal }),
+        apiGet("/api/displays/active-status", { signal: params.signal }).catch(() => null),
+      ]);
+      if (!isActive()) return;
+      state.processes = procs;
+      state.displayStatus = disp;
+      renderStepper(view, isActive);
+    } catch (e) {
+      if (e && e.name === "AbortError") return;
+      if (!isActive()) return;
+      const el = view.querySelector("#stepper");
+      if (el) {
+        el.innerHTML = errorState(`加载工艺列表失败：${e.message}`);
+        el.querySelector(".btn-retry")?.addEventListener("click", loadInit);
+      }
+    }
   }
-  renderStepper(view);
+  await loadInit();
 }
 
 function reset() {
@@ -86,10 +102,11 @@ function currentStage() {
   return 3;
 }
 
-function renderStepper(view) {
+function renderStepper(view, isActive = () => true) {
   const cur = currentStage();
   const defs = stageDefs();
   const el = view.querySelector("#stepper");
+  if (!el) return;
   el.innerHTML = defs
     .map((d, i) => {
       const cls = i < cur ? "done" : i === cur ? "current" : "locked";
@@ -105,7 +122,7 @@ function renderStepper(view) {
       </div>`;
     })
     .join("");
-  bindStage(view);
+  bindStage(view, isActive);
 }
 
 function stageBody(key, view) {
@@ -120,7 +137,7 @@ function uploadBody(view) {
   const r = state.report;
   if (!r) {
     return `<div class="step-card">
-      <div class="dropzone" id="dz">${icon("upload")}
+      <div class="dropzone" id="dz" role="button" tabindex="0" aria-label="点击或拖入客户文件">${icon("upload")}
         <div style="font-weight:600">点击或拖入客户文件</div>
         <div style="font-size:12px;margin-top:4px">支持 PNG / JPEG / TIFF 图像与 PDF 文档</div>
       </div>
@@ -128,8 +145,10 @@ function uploadBody(view) {
   }
   const issues = r.issues
     .map(
-      (i) =>
-        `<div class="issue issue-${i.level}">${icon(i.level === "warn" ? "warn" : i.level === "error" ? "xmark" : "info")}<span>${esc(i.message)}</span></div>`
+      (i) => {
+        const lvl = safeLevel(i.level);
+        return `<div class="issue issue-${lvl}">${icon(lvl === "warn" ? "warn" : lvl === "error" ? "xmark" : "info")}<span>${esc(i.message)}</span></div>`;
+      }
     )
     .join("");
   const badge = r.status === "pass" ? `<span class="badge badge-green">${icon("check")}预检通过</span>` : `<span class="badge badge-orange">${icon("warn")}有建议项</span>`;
@@ -142,17 +161,18 @@ function uploadBody(view) {
     ? `${fe.total} 个 · ${fe.embedded} 嵌入${fe.not_embedded.length ? ` · <span class="badge badge-orange">${fe.not_embedded.length} 未嵌入</span>` : ` <span class="badge badge-green">全部嵌入</span>`}`
     : "";
   const bleedText = bleed.checked
-    ? (bleed.min_mm == null ? "—" : `${bleed.min_mm} mm ${bleed.ok ? `<span class="badge badge-green">达标</span>` : `<span class="badge badge-red">不足</span>`} <span style="color:var(--label-3)">${bleed.source || ""}</span>`)
+    ? (bleed.min_mm == null ? "—" : `${bleed.min_mm} mm ${bleed.ok ? `<span class="badge badge-green">达标</span>` : `<span class="badge badge-red">不足</span>`} <span style="color:var(--label-3)">${esc(bleed.source || "")}</span>`)
     : "未能判定";
   const dpiText = ed.checked
     ? (ed.min == null ? "无位图对象" : `${ed.min} DPI ${ed.low_count ? `<span class="badge badge-orange">${ed.low_count} 处不足</span>` : `<span class="badge badge-green">达标</span>`}`)
     : "未能解析绘制尺寸";
   const formatText = pf
-    ? (pf.match ? `${pf.name} · ${pf.size_mm[0]}×${pf.size_mm[1]} mm` : `异形 · ${pf.size_mm[0]}×${pf.size_mm[1]} mm`)
+    ? (pf.match ? `${esc(pf.name)} · ${pf.size_mm[0]}×${pf.size_mm[1]} mm` : `异形 · ${pf.size_mm[0]}×${pf.size_mm[1]} mm`)
     : "—";
+  const thumbUri = safeImageUri(r.thumbnail_b64);
   const pdfBlock = isPdf && r.pdf ? `
     <div style="display:flex; gap:14px; margin-top:12px; flex-wrap:wrap; align-items:flex-start">
-      ${r.thumbnail_b64 ? `<img src="${r.thumbnail_b64}" alt="PDF 首页缩略图" style="max-width:180px; max-height:240px; border:1px solid var(--separator); border-radius:10px">` : ""}
+      ${thumbUri ? `<img src="${thumbUri}" alt="PDF 首页缩略图" style="max-width:180px; max-height:240px; border:1px solid var(--separator); border-radius:10px">` : ""}
       <dl class="kv" style="flex:1; min-width:220px">
         <dt>页数</dt><dd>${r.pages}</dd>
         <dt>页面尺寸</dt><dd>${r.pdf.page_sizes_mm.map((s) => `${s[0]}×${s[1]} mm`).slice(0, 3).join(" · ")}${r.pdf.page_sizes_mm.length > 3 ? " …" : ""}</dd>
@@ -167,7 +187,7 @@ function uploadBody(view) {
     </div>` : "";
   const chip = isPdf
     ? `<span class="chip chip-mono">PDF · ${r.pages} 页 · ${r.size[0]}×${r.size[1]} mm</span>`
-    : `<span class="chip chip-mono">${r.format} · ${r.mode} · ${r.size[0]}×${r.size[1]}${r.dpi ? ` · ${r.dpi} DPI` : ""}</span>`;
+    : `<span class="chip chip-mono">${esc(r.format)} · ${esc(r.mode)} · ${r.size[0]}×${r.size[1]}${r.dpi ? ` · ${r.dpi} DPI` : ""}</span>`;
   return `<div class="step-card">
     <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px">
       ${badge}
@@ -176,8 +196,8 @@ function uploadBody(view) {
     </div>
     <div class="issue-list">${issues || '<div class="issue issue-info">' + icon("check") + "<span>未发现问题</span></div>"}</div>
     ${pdfBlock}
-    ${!isPdf && r.dominant_colors.length ? `<div class="dom-colors">${r.dominant_colors.map((c) => `<div class="swatch swatch-sm" style="background:${c}" title="${c}"></div>`).join("")}<span style="font-size:12px;color:var(--label-2);align-self:center;margin-left:4px">主导色</span></div>` : ""}
-    <div style="margin-top:12px"><button class="btn btn-ghost btn-sm" id="reupload">${icon("upload")}换一个文件</button></div>
+    ${!isPdf && r.dominant_colors.length ? `<div class="dom-colors">${r.dominant_colors.map((c) => { const hc = safeHex(c); return `<div class="swatch swatch-sm" style="background:${hc}" title="${esc(hc)}"></div>`; }).join("")}<span style="font-size:12px;color:var(--label-2);align-self:center;margin-left:4px">主导色</span></div>` : ""}
+    <div style="margin-top:12px"><button class="btn btn-ghost btn-sm" data-act="reupload">${icon("upload")}换一个文件</button></div>
   </div>`;
 }
 
@@ -211,10 +231,10 @@ function pdfxBody(view) {
     <div class="field">
       <label>输出意图（目标工艺 ICC）</label>
       <select class="input" id="sel-pdfx-process">
-        ${procs.map((p) => `<option value="${p.id}" ${p.id === proc.id ? "selected" : ""}>${esc(p.name)} · ${esc(p.icc_meta.description || "")}</option>`).join("")}
+        ${procs.map((p) => `<option value="${esc(p.id)}" ${p.id === proc.id ? "selected" : ""}>${esc(p.name)} · ${esc(p.icc_meta.description || "")}</option>`).join("")}
       </select>
       <div style="font-size:12px;color:var(--label-2);margin-top:6px">
-        成品：${esc(proc.name)} · ${proc.icc_meta.device_space} · ICC 指纹 <span class="chip chip-mono">${(proc.icc_sha256 || "").slice(0, 8)}</span>
+        成品：${esc(proc.name)} · ${esc(proc.icc_meta.device_space)} · ICC 指纹 <span class="chip chip-mono">${esc((proc.icc_sha256 || "").slice(0, 8))}</span>
       </div>
     </div>
     <label style="display:flex;gap:8px;align-items:flex-start;margin-top:12px;font-size:13px;line-height:1.5">
@@ -231,7 +251,10 @@ function pdfxDoneBody(view) {
   const c = state.pdfx;
   if (!c) return "";
   const checks = (c.checks || [])
-    .map((i) => `<div class="issue issue-${i.level}">${icon(i.level === "warn" ? "warn" : i.level === "error" ? "xmark" : "info")}<span>${esc(i.message)}</span></div>`)
+    .map((i) => {
+      const lvl = safeLevel(i.level);
+      return `<div class="issue issue-${lvl}">${icon(lvl === "warn" ? "warn" : lvl === "error" ? "xmark" : "info")}<span>${esc(i.message)}</span></div>`;
+    })
     .join("");
   const badge = c.status === "pass"
     ? `<span class="badge badge-green">${icon("check")}结构完整</span>`
@@ -240,7 +263,7 @@ function pdfxDoneBody(view) {
     <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap">
       ${badge}
       <b>${esc(c.filename)}</b>
-      <span class="chip chip-mono">${c.mode} · ${c.pages} 页</span>
+      <span class="chip chip-mono">${esc(c.mode)} · ${c.pages} 页</span>
     </div>
     <dl class="kv">
       <dt>输出意图</dt><dd>${esc(c.output_intent.identifier)} · ${c.output_intent.channels} 通道</dd>
@@ -251,7 +274,7 @@ function pdfxDoneBody(view) {
     ${(c.notes || []).map((n) => `<div class="issue issue-info" style="margin-top:6px">${icon("info")}<span>${esc(n)}</span></div>`).join("")}
     <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap">
       <button class="btn" id="pdfx-download">${icon("download")}下载 ${esc(c.filename)}</button>
-      <button class="btn btn-secondary btn-sm" id="reupload">${icon("upload")}换一个文件</button>
+      <button class="btn btn-secondary btn-sm" data-act="reupload">${icon("upload")}换一个文件</button>
     </div>
   </div>`;
 }
@@ -264,26 +287,32 @@ function dataUrlToBytes(dataUrl) {
   return bytes;
 }
 
-async function doPdfx(view) {
+async function doPdfx(view, isActive = () => true) {
   const btn = view.querySelector("#btn-pdfx");
   if (!btn) return;
   btn.disabled = true;
   btn.innerHTML = `<span class="spinner"></span>封装中…`;
   try {
+    // 优先直接读原始 File 的 ArrayBuffer，避免 base64 解码带来 3 倍内存峰值
+    const rawBytes = state.file.raw ? await state.file.raw.arrayBuffer() : dataUrlToBytes(state.file.b64);
     const result = await apiPostRaw("/api/files/pdfx", {
       process_id: state.pdfxProcessId,
       filename: state.file.name,
       strict: state.pdfxStrict ? "1" : "0",
-    }, dataUrlToBytes(state.file.b64));
+    }, rawBytes);
+    if (!isActive()) return;
     state.pdfx = result;
-    renderStepper(view);
+    renderStepper(view, isActive);
     toast(result.status === "pass" ? "PDF/X-4 已生成" : "已生成，请查看检查项",
       result.status === "pass" ? "ok" : "warn");
     document.getElementById("main")?.scrollTo?.({ top: 500, behavior: "smooth" });
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     toast(e.message, "err");
-    btn.disabled = false;
-    btn.innerHTML = `${icon("doc")}封装为 PDF/X-4`;
+    if (btn && btn.isConnected) {
+      btn.disabled = false;
+      btn.innerHTML = `${icon("doc")}封装为 PDF/X-4`;
+    }
   }
 }
 
@@ -301,7 +330,7 @@ function setupBody(view) {
     <div class="field" style="margin-bottom:12px">
       <label>目标工艺</label>
       <select class="input" id="sel-process">
-        ${state.processes.map((p) => `<option value="${p.id}" ${p.id === state.processId ? "selected" : ""}>${esc(p.name)} · ${p.icc_meta.device_space} · ${esc(p.icc_meta.description || "")}</option>`).join("")}
+        ${state.processes.map((p) => `<option value="${esc(p.id)}" ${p.id === state.processId ? "selected" : ""}>${esc(p.name)} · ${esc(p.icc_meta.device_space)} · ${esc(p.icc_meta.description || "")}</option>`).join("")}
       </select>
     </div>
     <div class="field">
@@ -330,18 +359,19 @@ function convertBody(view) {
   const spLine = sp.message
     ? `<div class="issue issue-${sp.calibrated ? "info" : "warn"}" style="margin-bottom:12px">${icon(sp.calibrated ? "check" : "warn")}<span>${esc(sp.message)}${sp.expires_at ? `（到期 ${esc(sp.expires_at)}）` : ""}</span></div>`
     : "";
+  const previewUri = safeImageUri(c.preview_b64);
   return `<div class="step-card">
     ${spLine}
     <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; align-items:start">
       <div>
         <div style="font-size:13px;font-weight:600;color:var(--label-2);margin-bottom:8px">软打样预览（模拟成品外观）</div>
-        <img src="${c.preview_b64}" style="max-width:100%; border-radius:12px; box-shadow:var(--shadow-card)" alt="软打样预览">
+        ${previewUri ? `<img src="${previewUri}" style="max-width:100%; border-radius:12px; box-shadow:var(--shadow-card)" alt="软打样预览">` : `<div class="swatch-meta">预览不可用</div>`}
       </div>
       <div>
         <div style="font-size:13px;font-weight:600;color:var(--label-2);margin-bottom:8px">输出信息</div>
         <dl class="kv">
-          <dt>输出模式</dt><dd>${c.output_mode}</dd>
-          <dt>文件格式</dt><dd>${c.file_format}</dd>
+          <dt>输出模式</dt><dd>${esc(c.output_mode)}</dd>
+          <dt>文件格式</dt><dd>${esc(c.file_format)}</dd>
           <dt>源 profile</dt><dd>${esc(c.source_profile)}</dd>
         </dl>
         <button class="btn" id="btn-download" style="margin-top:14px">${icon("download")}下载成品文件</button>
@@ -359,7 +389,7 @@ function doneBody(view) {
 }
 
 /* ---------- 事件绑定 ---------- */
-function bindStage(view) {
+function bindStage(view, isActive = () => true) {
   // 阶段 1
   const dz = view.querySelector("#dz");
   if (dz) {
@@ -369,20 +399,24 @@ function bindStage(view) {
     input.style.display = "none";
     dz.appendChild(input);
     dz.addEventListener("click", () => input.click());
-    input.addEventListener("change", () => input.files[0] && handleFile(view, input.files[0]));
+    dz.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+    });
+    input.addEventListener("change", () => input.files[0] && handleFile(view, input.files[0], isActive));
     dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag"); });
     dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
     dz.addEventListener("drop", (e) => {
       e.preventDefault();
       dz.classList.remove("drag");
-      if (e.dataTransfer.files[0]) handleFile(view, e.dataTransfer.files[0]);
+      if (e.dataTransfer.files[0]) handleFile(view, e.dataTransfer.files[0], isActive);
     });
   }
-  const re = view.querySelector("#reupload");
-  if (re) re.addEventListener("click", () => {
-    state.file = null; state.report = null; state.converted = null;
-    state.pdfx = null; state.pdfxProcessId = null;
-    renderStepper(view);
+  view.querySelectorAll('[data-act="reupload"]').forEach((re) => {
+    re.addEventListener("click", () => {
+      state.file = null; state.report = null; state.converted = null;
+      state.pdfx = null; state.pdfxProcessId = null;
+      renderStepper(view, isActive);
+    });
   });
 
   const go = view.querySelector("#goto-processes");
@@ -394,7 +428,7 @@ function bindStage(view) {
     pxSel.addEventListener("change", () => {
       state.pdfxProcessId = pxSel.value;
       state.pdfx = null;
-      renderStepper(view);
+      renderStepper(view, isActive);
     });
   }
   const pxStrict = view.querySelector("#pdfx-strict");
@@ -402,12 +436,12 @@ function bindStage(view) {
     pxStrict.addEventListener("change", () => { state.pdfxStrict = pxStrict.checked; });
   }
   const pxBtn = view.querySelector("#btn-pdfx");
-  if (pxBtn) pxBtn.addEventListener("click", () => doPdfx(view));
+  if (pxBtn) pxBtn.addEventListener("click", () => doPdfx(view, isActive));
   const pxReset = view.querySelector("#pdfx-reset");
   if (pxReset) {
     pxReset.addEventListener("click", () => {
       state.pdfx = null;
-      renderStepper(view);
+      renderStepper(view, isActive);
     });
   }
   const pxDl = view.querySelector("#pdfx-download");
@@ -423,17 +457,17 @@ function bindStage(view) {
     sel.addEventListener("change", () => {
       state.processId = sel.value;
       state.converted = null;
-      renderStepper(view);
+      renderStepper(view, isActive);
     });
     view.querySelectorAll("#seg-intent button").forEach((b) => {
       b.addEventListener("click", () => {
         state.intent = b.dataset.v;
         state.converted = null;
-        renderStepper(view);
+        renderStepper(view, isActive);
       });
     });
     const convBtn = view.querySelector("#btn-convert");
-    if (convBtn) convBtn.addEventListener("click", () => doConvert(view));
+    if (convBtn) convBtn.addEventListener("click", () => doConvert(view, isActive));
   }
 
   // 阶段 3
@@ -450,31 +484,33 @@ function bindStage(view) {
     nx.addEventListener("click", () => {
       state.file = null; state.report = null; state.converted = null;
       state.pdfx = null; state.pdfxProcessId = null;
-      renderStepper(view);
-      view.querySelector("#main")?.scrollTo?.(0, 0);
-      document.getElementById("main").scrollTop = 0;
+      renderStepper(view, isActive);
+      document.getElementById("main")?.scrollTo?.(0, 0);
     });
   }
 }
 
-async function handleFile(view, file) {
+async function handleFile(view, file, isActive = () => true) {
+  const seq = ++uploadSeq;
   toast(`正在预检 ${file.name}…`);
   try {
     const b64 = await fileToBase64(file);
     const report = await apiPost("/api/files/preflight", { image_b64: b64, filename: file.name });
-    state.file = { name: file.name, b64 };
+    if (!isActive() || seq !== uploadSeq) return;
+    state.file = { name: file.name, b64, raw: file };
     state.report = report;
     state.converted = null;
     state.pdfx = null;
     state.pdfxProcessId = null;
-    renderStepper(view);
+    renderStepper(view, isActive);
     toast(report.status === "pass" ? "预检通过" : "预检有建议项，请查看", report.status === "pass" ? "ok" : "warn");
   } catch (e) {
-    toast(e.message, "err");
+    if (e && e.name === "AbortError") return;
+    if (seq === uploadSeq) toast(e.message, "err");
   }
 }
 
-async function doConvert(view) {
+async function doConvert(view, isActive = () => true) {
   const btn = view.querySelector("#btn-convert");
   btn.disabled = true;
   btn.innerHTML = `<span class="spinner"></span>转换中…`;
@@ -485,17 +521,17 @@ async function doConvert(view) {
       intent: state.intent,
       display_id: state.displayStatus?.display_id || "",
     });
+    if (!isActive()) return;
     state.converted = c;
-    renderStepper(view);
+    renderStepper(view, isActive);
     toast("转换完成");
-    document.getElementById("main").scrollTo({ top: 600, behavior: "smooth" });
+    document.getElementById("main")?.scrollTo?.({ top: 600, behavior: "smooth" });
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     toast(e.message, "err");
-    btn.disabled = false;
-    btn.innerHTML = `${icon("wand")}执行转换`;
+    if (btn && btn.isConnected) {
+      btn.disabled = false;
+      btn.innerHTML = `${icon("wand")}执行转换`;
+    }
   }
-}
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }

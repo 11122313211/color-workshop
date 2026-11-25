@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import hashlib
 import io
+import threading
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from typing import Callable
 
+import colour
 import numpy as np
 from PIL import Image, ImageCms
 
@@ -48,10 +51,50 @@ REFINE_STEP_MIN = 1.0 / 2048.0  # ≈0.05% 墨量
 # 总开关（测试对照用：False 时完全走 V0.3 粗搜路径）
 REFINE_ENABLED = True
 
-# 进程内缓存：按 profile 内容哈希复用变换、粗查表与插值器
-_transforms: dict[str, ImageCms.ImageCmsTransform] = {}
-_luts: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-_interps: dict[str, Callable] = {}
+# 有界进程内缓存：按 profile 内容哈希复用粗查表与插值器；Transform 按线程隔离防止 lcms2 跨线程并发风险
+_CACHE_MAX = 24
+_cache_lock = threading.RLock()
+_tls = threading.local()
+_luts: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = OrderedDict()
+_interps: OrderedDict[str, Callable] = OrderedDict()
+_UNIT_OFFSETS: dict[int, np.ndarray] = {}
+
+_D50_ILLUMINANT = colour.CCS_ILLUMINANTS["CIE 1931 2 Degree Standard Observer"]["D50"]
+_BRADFORD_D50_TO_D65 = np.array(
+    [
+        [0.9555766, -0.0230393, 0.0631636],
+        [-0.0282895, 1.0099416, 0.0210077],
+        [0.0122982, -0.0204830, 1.3299098],
+    ],
+    dtype=np.float64,
+)
+
+
+def evict_icc_cache(sha16: str) -> None:
+    """按 ICC 内容哈希清理 LUT 与插值缓存。"""
+    prefix = f"{sha16}:"
+    with _cache_lock:
+        for cache in (_luts, _interps):
+            for key in [k for k in cache if k.startswith(prefix)]:
+                cache.pop(key, None)
+
+
+def _thread_transforms() -> OrderedDict[str, ImageCms.ImageCmsTransform]:
+    cache = getattr(_tls, "transforms", None)
+    if cache is None:
+        cache = OrderedDict()
+        _tls.transforms = cache
+    return cache
+
+
+def _unit_offsets(channels: int) -> np.ndarray:
+    arr = _UNIT_OFFSETS.get(channels)
+    if arr is None:
+        axes = np.array([-1.0, 0.0, 1.0], dtype=np.float64)
+        grids = np.meshgrid(*([axes] * channels), indexing="ij")
+        arr = np.stack([g.ravel() for g in grids], axis=1)
+        _UNIT_OFFSETS[channels] = arr
+    return arr
 
 
 def _sha(icc_bytes: bytes) -> str:
@@ -70,15 +113,16 @@ def _image_mode(channels: int) -> str:
 def _build_forward(icc_bytes: bytes, channels: int) -> Callable:
     """构建正向评估器 forward(values(NxC, 0-1)) -> Lab(Nx3)。
 
-    变换对象与粗查表按 profile 内容哈希缓存，同一工艺重复预测零开销。
+    变换对象按线程独立缓存（避免 lcms2 Transform 跨线程并发调用风险），有界 LRU 淘汰。
     """
-    key = _sha(icc_bytes)
-    if key not in _transforms:
+    tkey = f"{_sha(icc_bytes)}:{channels}"
+    transforms = _thread_transforms()
+    xform = transforms.get(tkey)
+    if xform is None:
         prof_dev = ImageCms.getOpenProfile(io.BytesIO(icc_bytes))
         prof_lab = ImageCms.createProfile("LAB")
         mode = _image_mode(channels)
         last_err: Exception | None = None
-        xform = None
         for in_mode in _IN_MODE_CANDIDATES.get(channels, ["RGB"]):
             try:
                 xform = ImageCms.buildTransform(
@@ -90,14 +134,18 @@ def _build_forward(icc_bytes: bytes, channels: int) -> Callable:
                 last_err = e
         if xform is None:
             raise ValueError(f"无法为该 ICC 构建 {mode}→LAB 变换: {last_err}")
-        _transforms[key] = xform
+        transforms[tkey] = xform
+        while len(transforms) > _CACHE_MAX:
+            transforms.popitem(last=False)
+    else:
+        transforms.move_to_end(tkey)
 
-    xform = _transforms[key]
     mode = _image_mode(channels)
 
-    def forward(values: np.ndarray) -> np.ndarray:
-        n = values.shape[0]
-        arr = (np.clip(values, 0.0, 1.0) * 255.0).round().astype("uint8")
+    def forward(values) -> np.ndarray:
+        vals = np.asarray(values, dtype=np.float64)
+        n = vals.shape[0]
+        arr = (np.clip(vals, 0.0, 1.0) * 255.0).round().astype("uint8")
         # L 模式需 2D 数组；RGB/CMYK 为 (n,1,C)
         shape = (n, channels) if mode == "L" else (n, 1, channels)
         img = Image.fromarray(arr.reshape(shape), mode=mode)
@@ -116,11 +164,15 @@ def _make_interp(pts: np.ndarray, labs: np.ndarray, levels: int, channels: int) 
     """基于粗查表格点的多线性插值连续正向估计器。
 
     LUT 格点按 meshgrid(indexing="ij") 行主序排列（与 _build_forward 的采样顺序一致）。
-    8-bit 格点值携带 ±0.4 量化噪声，插值等价于对该噪声做低通，并使目标函数连续化——
-    可分辨 8-bit 评价下无法区分的更优配方。
+    预计算展平 LUT 与角点位掩码矩阵，避免热路径内重复分配。
     """
-    lut_labs = labs.reshape((levels,) * channels + (3,))
-    strides = np.array([levels ** (channels - 1 - k) for k in range(channels)])
+    flat_labs = np.ascontiguousarray(labs, dtype=np.float64).reshape(-1, 3)
+    strides = np.array([levels ** (channels - 1 - k) for k in range(channels)], dtype=np.int64)
+    corner_bits = [
+        np.array([(mask >> k) & 1 for k in range(channels)], dtype=np.int64)
+        for mask in range(1 << channels)
+    ]
+    corner_offsets = [int(bits @ strides) for bits in corner_bits]
 
     def interp(values: np.ndarray) -> np.ndarray:
         v = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
@@ -128,13 +180,14 @@ def _make_interp(pts: np.ndarray, labs: np.ndarray, levels: int, channels: int) 
         g = v * (levels - 1)
         i0 = np.clip(np.floor(g).astype(np.int64), 0, levels - 2)
         w = g - i0  # [0,1]；v=1 时 w=1，全部权重落在上角点
+        one_minus_w = 1.0 - w
+        base_flat = i0 @ strides
         lab = np.zeros((n, 3), dtype=np.float64)
-        for mask in range(1 << channels):
-            bits = np.array([(mask >> k) & 1 for k in range(channels)])
-            corner_w = np.where(bits == 1, w, 1.0 - w)
-            prod = corner_w.prod(axis=1)
-            flat = (i0 + bits) @ strides
-            lab += prod[:, None] * lut_labs.reshape(-1, 3)[flat]
+        for bits, off in zip(corner_bits, corner_offsets):
+            prod = np.ones(n, dtype=np.float64)
+            for k in range(channels):
+                prod *= w[:, k] if bits[k] else one_minus_w[:, k]
+            lab += prod[:, None] * flat_labs[base_flat + off]
         return lab
 
     return interp
@@ -151,7 +204,7 @@ def predict_recipe(
 ) -> dict:
     """给定目标 LAB，反查最优墨量配方。
 
-    device_bias: 工艺级补偿偏置（0-1 单位，长度=通道数），作用于搜索种子。
+    device_bias: 工艺级补偿偏置（0-1 单位，长度=通道数），作用于搜索种子并同步重算真实预测 Lab。
 
     返回:
         target_lab / predicted_lab / recipe(通道名→百分比) / delta_e /
@@ -161,24 +214,47 @@ def predict_recipe(
     channels = SPACE_CHANNELS.get(device_space, 3)
     forward = _build_forward(icc_bytes, channels)
     target = np.asarray(target_lab, dtype=np.float64)
+    unit_off = _unit_offsets(channels)
 
     key = _sha(icc_bytes)
     lut_key = f"{key}:{LUT_LEVELS}:{channels}"
-    if lut_key not in _luts:
+    with _cache_lock:
+        cached_lut = _luts.get(lut_key)
+        cached_interp = _interps.get(lut_key)
+        if cached_lut is not None:
+            _luts.move_to_end(lut_key)
+        if cached_interp is not None:
+            _interps.move_to_end(lut_key)
+
+    if cached_lut is None:
         axes = np.linspace(0.0, 1.0, LUT_LEVELS)
         grids = np.meshgrid(*([axes] * channels), indexing="ij")
         pts = np.stack([g.ravel() for g in grids], axis=1)
-        _luts[lut_key] = (pts, forward(pts))
-    lut_pts, lut_labs = _luts[lut_key]
-    if lut_key not in _interps:
-        _interps[lut_key] = _make_interp(lut_pts, lut_labs, LUT_LEVELS, channels)
-    interp = _interps[lut_key]
+        computed = (pts, forward(pts))
+        with _cache_lock:
+            _luts[lut_key] = computed
+            _luts.move_to_end(lut_key)
+            while len(_luts) > _CACHE_MAX:
+                _luts.popitem(last=False)
+        lut_pts, lut_labs = computed
+    else:
+        lut_pts, lut_labs = cached_lut
 
-    bias = (
-        np.clip(np.asarray(device_bias, dtype=np.float64), -0.15, 0.15)
-        if device_bias is not None
-        else None
-    )
+    if cached_interp is None:
+        interp = _make_interp(lut_pts, lut_labs, LUT_LEVELS, channels)
+        with _cache_lock:
+            _interps[lut_key] = interp
+            _interps.move_to_end(lut_key)
+            while len(_interps) > _CACHE_MAX:
+                _interps.popitem(last=False)
+    else:
+        interp = cached_interp
+
+    bias = None
+    if device_bias is not None:
+        bias_arr = np.asarray(device_bias, dtype=np.float64)
+        if bias_arr.shape == (channels,) and np.all(np.isfinite(bias_arr)):
+            bias = np.clip(bias_arr, -0.15, 0.15)
 
     predictions = 0
     # Lab 最近邻粗排，取 3 个种子并行精搜
@@ -189,18 +265,22 @@ def predict_recipe(
     for si in seed_idx:
         cur_val = lut_pts[si].copy()
         if bias is not None:
-            cur_val = np.clip(cur_val + bias, 0.0, 1.0)
-        cur_lab = lut_labs[si].copy()
+            shifted = np.clip(cur_val + bias, 0.0, 1.0)
+            if not np.array_equal(shifted, cur_val):
+                cur_val = shifted
+                # 种子发生偏置位移后必须用真实 forward 同步重算 Lab，防止配方与 predicted_lab 脱节
+                cur_lab = forward(cur_val.reshape(1, channels))[0]
+                predictions += 1
+            else:
+                cur_lab = lut_labs[si].copy()
+        else:
+            cur_lab = lut_labs[si].copy()
         cur_de = float(delta_e(cur_lab, target, method))
         traj = [round(cur_de, 3)]
         step = 1.0 / (LUT_LEVELS - 1)
 
         for _ in range(max_rounds):
-            offsets = np.array([-step, 0.0, step])
-            grids = np.meshgrid(*([offsets] * channels), indexing="ij")
-            cand = np.clip(
-                np.stack([g.ravel() for g in grids], axis=1) + cur_val, 0.0, 1.0
-            )
+            cand = np.clip(cur_val + step * unit_off, 0.0, 1.0)
             cand_labs = forward(cand)
             predictions += len(cand)
             des = delta_e_batch(cand_labs, target, method)
@@ -227,8 +307,6 @@ def predict_recipe(
             }
 
     # —— 插值精搜：连续插值目标引导更细步长的下降，候选经真实 forward 定夺 ——
-    # 插值面只是真实映射的低通近似，其极小值可能偏离真实极小值；因此以插值排序、
-    # 真实 ΔE 定夺：每轮对插值最优的 top-2 候选做真实评估，记录真实更优者。
     refine_preds = 0
     if REFINE_ENABLED and best is not None and best["delta_e"] > REFINE_FLOOR:
         cur_val = best["value"].copy()
@@ -236,28 +314,28 @@ def predict_recipe(
         bt_val, bt_lab, bt_de = best["value"].copy(), best["lab"].copy(), best["delta_e"]
         step = (1.0 / (LUT_LEVELS - 1)) / 4.0  # 1/64 ≈ 1.56%
         for _ in range(max_rounds * 2):
-            offsets = np.array([-step, 0.0, step])
-            grids = np.meshgrid(*([offsets] * channels), indexing="ij")
-            cand = np.clip(
-                np.stack([g.ravel() for g in grids], axis=1) + cur_val, 0.0, 1.0
-            )
+            cand = np.clip(cur_val + step * unit_off, 0.0, 1.0)
             des_i = delta_e_batch(interp(cand), target, method)
             refine_preds += len(cand)
-            # 插值 top-2 候选做真实评估（每轮 ≤2 次 forward 调用；重复候选去重）
-            last_checked = None
-            for k in np.argsort(des_i)[:2]:
-                kv = cand[int(k)]
-                if last_checked is not None and np.array_equal(kv, last_checked):
-                    continue
-                last_checked = kv
-                tl = forward(kv.reshape(1, channels))[0]
-                predictions += 1
-                td = float(delta_e(tl, target, method))
-                if td + 1e-9 < bt_de:
-                    bt_val, bt_lab, bt_de = kv.copy(), tl, td
-            if des_i.min() + 1e-12 < cur_de_i:
-                cur_de_i = float(des_i.min())
-                cur_val = cand[int(np.argmin(des_i))].copy()
+            # 插值 top-2 去重后单次批量真实评估
+            top_idx = np.argsort(des_i)[:2]
+            top_vals = [cand[int(top_idx[0])]]
+            if len(top_idx) > 1 and not np.array_equal(cand[int(top_idx[1])], top_vals[0]):
+                top_vals.append(cand[int(top_idx[1])])
+            top_batch = np.asarray(top_vals, dtype=np.float64)
+            top_labs = forward(top_batch)
+            predictions += len(top_batch)
+            top_des = delta_e_batch(top_labs, target, method)
+            best_t = int(np.argmin(top_des))
+            if float(top_des[best_t]) + 1e-9 < bt_de:
+                bt_val = top_batch[best_t].copy()
+                bt_lab = top_labs[best_t]
+                bt_de = float(top_des[best_t])
+
+            min_i = int(np.argmin(des_i))
+            if float(des_i[min_i]) + 1e-12 < cur_de_i:
+                cur_de_i = float(des_i[min_i])
+                cur_val = cand[min_i].copy()
             else:
                 step /= 2.0
                 if step < REFINE_STEP_MIN:
@@ -311,19 +389,8 @@ def forward_query(
 
 def _lab_to_hex(lab) -> str:
     """Lab（D50 PCS）→ sRGB hex（Bradford 线性矩阵色适应 D50→D65），用于前端色块。"""
-    import colour
-
-    d50 = colour.CCS_ILLUMINANTS["CIE 1931 2 Degree Standard Observer"]["D50"]
-    xyz_d50 = np.asarray(colour.Lab_to_XYZ(np.asarray(lab), illuminant=d50))
-    # Bradford D50→D65 色适应（Lindbloom 线性矩阵，与前端 JS 实现一致）
-    bradford = np.array(
-        [
-            [0.9555766, -0.0230393, 0.0631636],
-            [-0.0282895, 1.0099416, 0.0210077],
-            [0.0122982, -0.0204830, 1.3299098],
-        ]
-    )
-    xyz_d65 = bradford @ xyz_d50
+    xyz_d50 = np.asarray(colour.Lab_to_XYZ(np.asarray(lab, dtype=np.float64), illuminant=_D50_ILLUMINANT))
+    xyz_d65 = _BRADFORD_D50_TO_D65 @ xyz_d50
     rgb = np.clip(colour.XYZ_to_sRGB(xyz_d65) * 255, 0, 255).round().astype(int)
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
@@ -374,9 +441,9 @@ class RecipeStore:
     def __init__(self) -> None:
         self._store = JsonStore(DATA_DIR / "recipes.json")
 
-    def create(self, process_doc: dict, result: dict, label: str = "") -> dict:
+    def _build_doc(self, process_doc: dict, result: dict, label: str = "") -> dict:
         rid = uuid.uuid4().hex[:12]
-        doc = {
+        return {
             "id": rid,
             "label": label,
             "process_id": process_doc["id"],
@@ -401,8 +468,17 @@ class RecipeStore:
             "verifications": [],
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
-        self._store.put(rid, doc)
+
+    def create(self, process_doc: dict, result: dict, label: str = "") -> dict:
+        doc = self._build_doc(process_doc, result, label)
+        self._store.put(doc["id"], doc)
         return doc
+
+    def create_many(self, process_doc: dict, items: list[tuple[dict, str]]) -> list[dict]:
+        """批量创建配方记录（单次原子落盘，消除批量预测 N 次写盘放大）。"""
+        docs = [self._build_doc(process_doc, result, label) for result, label in items]
+        self._store.put_many({doc["id"]: doc for doc in docs})
+        return docs
 
     def get(self, rid: str) -> dict | None:
         doc = self._store.get(rid)
@@ -434,18 +510,21 @@ class RecipeStore:
         return self._store.delete(rid)
 
     def remove_process(self, process_id: str) -> int:
-        """级联清理：删除某工艺的全部配方记录（工艺删除时调用）。"""
-        removed = 0
-        for rid, doc in self._store.all().items():
-            if doc.get("process_id") == process_id:
-                self._store.delete(rid)
-                removed += 1
-        return removed
+        """级联清理：删除某工艺的全部配方记录（单次原子落盘）。"""
+        keys = [
+            rid for rid, doc in self._store.all().items()
+            if isinstance(doc, dict) and doc.get("process_id") == process_id
+        ]
+        return self._store.delete_many(keys)
 
     def append_verification(self, rid: str, verification: dict) -> dict | None:
-        doc = self.get(rid)
-        if not doc:
-            return None
-        doc.setdefault("verifications", []).append(verification)
-        self._store.put(rid, doc)
-        return doc
+        def _append(data: dict):
+            doc = data.get(rid)
+            if not doc:
+                return None
+            doc = self._with_defaults(doc)
+            doc["verifications"] = list(doc.get("verifications") or []) + [verification]
+            data[rid] = doc
+            return dict(doc)
+
+        return self._store.update(_append)

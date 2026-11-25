@@ -179,6 +179,8 @@ def _session_patches(session: dict) -> dict[str, dict]:
         ),
     )
     for record in records:
+        if record.get("reliability") == "rejected":
+            continue
         for patch in record.get("patches", []):
             spectral = patch.get("spectral")
             if not spectral:
@@ -316,23 +318,39 @@ def process_spectral_overview(process_id: str, sessions: list[dict]) -> dict:
     worst_risk = "none"
     pair_warnings: list[str] = []
     session_ids = sorted(with_data)
+    # 一次性按 (sid, label, condition) 预计算 Lab，避免 O(S²) 重复解析会话与重复光谱积分
+    lab_cache: dict[tuple[str, str], dict[str, list[float]]] = {}
+
+    def _get_labs(sid: str, label: str) -> dict[str, list[float]]:
+        key = (sid, label)
+        cached = lab_cache.get(key)
+        if cached is None:
+            sp = with_data[sid][label]["spectral"]
+            cached = {cond: _condition_labs(sp, cond) for cond in DEFAULT_CONDITIONS}
+            lab_cache[key] = cached
+        return cached
+
     for i, sid_a in enumerate(session_ids):
+        pa = with_data[sid_a]
         for sid_b in session_ids[i + 1:]:
-            if not _shared_labels(with_data[sid_a], with_data[sid_b]):
+            pb = with_data[sid_b]
+            shared = _shared_labels(pa, pb)
+            if not shared:
                 continue
             comparable_sessions.update((sid_a, sid_b))
-            result = compare_sessions(
-                next((s for s in relevant if s.get("id") == sid_a), {"records": {}}),
-                next((s for s in relevant if s.get("id") == sid_b), {"records": {}}),
-                top_n=1,
-            )
-            if result["max_delta_e"] is not None and (
-                worst_de is None or result["max_delta_e"] > worst_de
-            ):
-                worst_de = result["max_delta_e"]
-                worst_condition = result["worst_condition"]
-                worst_risk = result["risk"]
-            pair_warnings.extend(result.get("warnings") or [])
+            for label in shared:
+                if tuple(pa[label]["spectral"]) != tuple(pb[label]["spectral"]):
+                    pair_warnings.append("两个样本波长网格不同；各自独立积分，未做重采样")
+                labs_a = _get_labs(sid_a, label)
+                labs_b = _get_labs(sid_b, label)
+                for cond in DEFAULT_CONDITIONS:
+                    de = round(delta_e(labs_a[cond], labs_b[cond], "cie2000"), 4)
+                    if not math.isfinite(float(de)):
+                        continue
+                    if worst_de is None or de > worst_de:
+                        worst_de = de
+                        worst_condition = cond
+                        worst_risk = risk_for_delta_e(de)
 
     warnings: list[str] = []
     if not with_data:

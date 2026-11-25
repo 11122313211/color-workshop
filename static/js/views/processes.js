@@ -10,7 +10,7 @@ import {
 } from "../api.js";
 import { icon } from "../icons.js";
 import {
-  toast, emptyState, errorState, skeletonCards, esc,
+  toast, emptyState, errorState, skeletonCards, esc, downloadText,
   labToHex, sparkline, openModal, confirmDanger, drawCie, fetchSpectrum,
 } from "../components.js";
 import { createGamutView, SRGB_XY } from "../gamut-view.js";
@@ -19,8 +19,10 @@ import { updateNavCount } from "./shell.js";
 /* ---------- 列表页 ---------- */
 
 const listState = { search: "", filter: "all", sort: "created", cache: [], includeArchived: false };
+let listReqSeq = 0;
 
-export async function renderProcessesView(view) {
+export async function renderProcessesView(view, params = {}) {
+  const isActive = params.isActive || (() => true);
   view.innerHTML = `
     <div class="page-head">
       <div>
@@ -32,18 +34,17 @@ export async function renderProcessesView(view) {
     <div class="process-toolbar">
       <div class="input-search-wrap">
         ${icon("search")}
-        <input class="input" id="proc-search" placeholder="搜索名称 / 纸张 / 墨水…" aria-label="搜索工艺">
+        <input class="input" id="proc-search" placeholder="搜索名称 / 纸张 / 墨水…" aria-label="搜索工艺" value="${esc(listState.search)}">
       </div>
       <div class="seg" data-role="filter" aria-label="按色彩空间筛选">
-        <button data-f="all" class="active">全部</button>
-        <button data-f="CMYK">CMYK</button>
-        <button data-f="RGB">RGB</button>
-        <button data-f="GRAY">GRAY</button>
+        ${[["all", "全部"], ["CMYK", "CMYK"], ["RGB", "RGB"], ["GRAY", "GRAY"]].map(([v, t]) =>
+          `<button data-f="${v}" class="${listState.filter === v ? "active" : ""}">${t}</button>`
+        ).join("")}
       </div>
       <div class="seg" data-role="sort" aria-label="排序">
-        <button data-s="created" class="active">最新</button>
-        <button data-s="volume">体积</button>
-        <button data-s="pass">达标</button>
+        ${[["created", "最新"], ["volume", "体积"], ["pass", "达标"]].map(([v, t]) =>
+          `<button data-s="${v}" class="${listState.sort === v ? "active" : ""}">${t}</button>`
+        ).join("")}
       </div>
       <button class="archive-toggle" id="proc-show-archived" type="button" aria-pressed="false"
         title="显示已归档工艺（只读，可恢复或永久删除）">
@@ -66,18 +67,20 @@ export async function renderProcessesView(view) {
   archivedToggle.addEventListener("click", () => {
     listState.includeArchived = !listState.includeArchived;
     syncArchivedToggle();
-    loadList(view);
+    loadList(view, isActive);
   });
 
   view.querySelector("#btn-new").addEventListener("click", () =>
-    openProcessEditor(view, { mode: "create", onDone: loadList })
+    openProcessEditor(view, { mode: "create", onDone: () => loadList(view, isActive) })
   );
 
   // 搜索（300ms debounce，纯前端过滤）
   let debounce = 0;
+  params.onCleanup?.(() => clearTimeout(debounce));
   view.querySelector("#proc-search").addEventListener("input", (e) => {
     clearTimeout(debounce);
     debounce = setTimeout(() => {
+      if (!isActive()) return;
       listState.search = e.target.value.trim().toLowerCase();
       renderCards(view);
     }, 300);
@@ -97,23 +100,28 @@ export async function renderProcessesView(view) {
     renderCards(view);
   });
 
-  await loadList(view);
+  await loadList(view, isActive, params.signal);
 }
 
-async function loadList(view) {
+async function loadList(view, isActive = () => true, signal) {
   const box = view.querySelector("#process-list");
   if (!box) return;
+  const reqId = ++listReqSeq;
   box.innerHTML = `<div class="spinner"></div>`;
   try {
     // summary=1：一次请求带出色域摘要与达标率（消除逐卡 N+1）
     const query = new URLSearchParams({ summary: "1" });
     if (listState.includeArchived) query.set("include_archived", "1");
-    listState.cache = await apiGet(`/api/processes?${query.toString()}`);
+    const docs = await apiGet(`/api/processes?${query.toString()}`, { signal });
+    if (!isActive() || reqId !== listReqSeq) return;
+    listState.cache = docs;
     updateNavCount();
     renderCards(view);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (!isActive() || reqId !== listReqSeq) return;
     box.innerHTML = errorState(e.message);
-    box.querySelector(".btn-retry").addEventListener("click", () => loadList(view));
+    box.querySelector(".btn-retry")?.addEventListener("click", () => loadList(view, isActive));
   }
 }
 
@@ -317,14 +325,14 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
           ? `<div class="icc-current">
               <div class="icc-line">当前 ICC：${esc(process.icc_original_name)} · ${(process.icc_size / 1024).toFixed(1)} KB
                 <span class="chip chip-mono">${process.icc_sha256.slice(0, 8)}</span></div>
-              <div class="dropzone dropzone-sm" id="pe-drop">
+              <div class="dropzone dropzone-sm" id="pe-drop" role="button" tabindex="0" aria-label="拖入新 ICC 文件可替换">
                 ${icon("swap")}
                 <div style="font-weight:600">拖入新 ICC 文件可替换</div>
                 <div style="font-size:12px;margin-top:4px" id="pe-file-label">不更换则保持现状</div>
               </div>
               <div class="icc-diff" id="pe-diff" hidden></div>
             </div>`
-          : `<div class="dropzone" id="pe-drop">
+          : `<div class="dropzone" id="pe-drop" role="button" tabindex="0" aria-label="点击或拖入 ICC 文件">
               ${icon("upload")}
               <div style="font-weight:600">点击或拖入 ICC 文件</div>
               <div style="font-size:12px;margin-top:4px" id="pe-file-label">.icc / .icm</div>
@@ -371,6 +379,13 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
       // 默认工艺名 = 文件名去扩展名（仅当用户没填名字时）
       if (!nameInput.value.trim()) nameInput.value = f.name.replace(/\.(ic[cm]|iccprofile)$/i, "");
     }
+    const diff = modal.querySelector("#pe-diff");
+    if (isEdit && diff) {
+      diff.hidden = !iccFile;
+      diff.textContent = iccFile
+        ? `将替换为 ${iccFile.name}（保存后色域缓存失效，补偿模型重置，原签样需重新确认）`
+        : "";
+    }
     refreshOk();
   };
   input.addEventListener("change", () => {
@@ -379,8 +394,6 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
       openQueue(files);
     } else {
       setFile(files[0] || null);
-      const diff = modal.querySelector("#pe-diff");
-      if (isEdit && diff) diff.hidden = !iccFile;
     }
   });
 
@@ -394,6 +407,9 @@ function openProcessEditor(view, { mode = "create", process = null, onDone } = {
   nameInput.addEventListener("input", refreshOk);
 
   drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+  });
   drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("drag"); });
   drop.addEventListener("dragleave", () => drop.classList.remove("drag"));
   drop.addEventListener("drop", (e) => {
@@ -699,7 +715,7 @@ function spectralRiskBadge(risk) {
 function passportCard(p, latest) {
   const archived = isArchived(p);
   if (!latest) {
-    return `<div class="card" style="padding:14px 16px; margin-top:12px">
+    return `<div class="card passport-card" style="padding:14px 16px; margin-top:12px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span class="card-title" style="margin:0">${icon("doc")}工艺护照</span>
         <span class="badge badge-gray">未生成</span>
@@ -882,20 +898,23 @@ function openPassportVersions(p) {
   load();
 }
 
-async function renderPassportSlot(view, p) {
+async function renderPassportSlot(view, p, isActive = () => true, signal) {
   const slot = view.querySelector("#passport-slot");
   if (!slot) return;
   const archived = isArchived(p);
   let latest = null;
   try {
-    latest = await apiGet(`/api/processes/${encodeURIComponent(p.id)}/passport`);
+    latest = await apiGet(`/api/processes/${encodeURIComponent(p.id)}/passport`, { signal });
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     if (!String(e.message).includes("尚未生成")) {
-      slot.innerHTML = `<div class="card passport-card" style="margin-top:12px"><div class="issue issue-warn">${icon("warn")}<span>${esc(e.message)}</span></div></div>`;
+      if (isActive() && slot.isConnected) {
+        slot.innerHTML = `<div class="card passport-card" style="margin-top:12px"><div class="issue issue-warn">${icon("warn")}<span>${esc(e.message)}</span></div></div>`;
+      }
       return;
     }
   }
-  if (!view.isConnected) return;
+  if (!isActive() || !slot.isConnected) return;
   slot.innerHTML = passportCard(p, latest);
   const card = slot.querySelector(".passport-card");
   if (!card) return;
@@ -907,10 +926,10 @@ async function renderPassportSlot(view, p) {
     try {
       const next = await apiPost(`/api/processes/${encodeURIComponent(p.id)}/passport`, {});
       toast(next.created ? `护照 v${next.version} 已生成` : `内容未变，沿用护照 v${next.version}`, "ok");
-      await renderPassportSlot(view, p);
+      await renderPassportSlot(view, p, isActive, signal);
     } catch (e) {
       toast(e.message, "err");
-      btn.disabled = false;
+      if (btn.isConnected) btn.disabled = false;
     }
   });
   card.querySelector('[data-pp="detail"]')?.addEventListener("click", () => openPassportDetail(latest));
@@ -1163,11 +1182,12 @@ async function openCalibrationModal(view, p) {
   const renderSteps = () => {
     const names = ["① 生成校准版", "② 测量与报告", "③ 应用与导出"];
     $("#cal-steps").innerHTML = names
-      .map((n, i) => `<span style="${state.step === i + 1 ? "color:var(--text); font-weight:700" : "color:var(--label-3)"}">${n}</span>`)
+      .map((n, i) => `<span style="${state.step === i + 1 ? "color:var(--label); font-weight:700" : "color:var(--label-3)"}">${n}</span>`)
       .join(`<span style="color:var(--label-3)">→</span>`);
   };
 
   const renderStep1 = () => {
+    state.step = 1;
     renderSteps();
     $("#cal-body").innerHTML = `
       <p class="swatch-meta">A4 编号色块矩阵（28 色块 × 左右双点）：单色梯级 100/75/50/25/10、三色叠印、灰平衡、纸白。
@@ -1208,9 +1228,10 @@ async function openCalibrationModal(view, p) {
           downloadDataUri(`data:application/pdf;base64,${state.form.pdf_b64}`, `calibration-${p.name}-${dpi}dpi.pdf`));
         $(".cal-tiff").addEventListener("click", () =>
           downloadDataUri(`data:image/tiff;base64,${state.form.tiff_b64}`, `calibration-${p.name}-${dpi}dpi.tif`));
-        $(".cal-ref").addEventListener("click", () => downloadDataUri(
-          `data:text/plain;base64,${btoa(unescape(encodeURIComponent(ref.cgats_reference || "")))}`,
-          `calibration-reference-${p.name}.txt`));
+        $(".cal-ref").addEventListener("click", () => downloadText(
+          ref.reference_cgats || ref.cgats_reference || "",
+          `calibration-reference-${p.name}.txt`,
+          "text/plain;charset=utf-8"));
         $(".cal-next1").addEventListener("click", renderStep2);
       } catch (e) {
         $("#cal-gen-result").innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
@@ -1220,6 +1241,7 @@ async function openCalibrationModal(view, p) {
   };
 
   const renderStep2 = () => {
+    state.step = 2;
     renderSteps();
     const now = new Date();
     now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
@@ -1242,6 +1264,10 @@ async function openCalibrationModal(view, p) {
         <button class="btn cal-next2" type="button" disabled>下一步：应用与导出 →</button>
       </div>`;
     $(".cal-back2").addEventListener("click", renderStep1);
+    // 一次性绑定下一步，避免多次导入后叠加回调
+    $(".cal-next2").addEventListener("click", () => {
+      if (state.report && state.report.overall !== "n/a") renderStep3();
+    });
 
     const renderReport = (rep) => {
       const sugChips = (rep.ink_suggestions || []).map((s) => {
@@ -1285,7 +1311,6 @@ async function openCalibrationModal(view, p) {
         </div>`;
       const canProceed = rep.overall !== "n/a";
       $(".cal-next2").disabled = !canProceed;
-      if (canProceed) $(".cal-next2").addEventListener("click", renderStep3);
     };
 
     $(".cal-import").addEventListener("click", async () => {
@@ -1319,6 +1344,7 @@ async function openCalibrationModal(view, p) {
   };
 
   const renderStep3 = () => {
+    state.step = 3;
     renderSteps();
     const rep = state.report;
     const sugRows = (rep.ink_suggestions || []).filter((s) => s.available).map((s) => `
@@ -1344,15 +1370,18 @@ async function openCalibrationModal(view, p) {
         <button class="btn btn-secondary cal-back3" type="button">← 上一步</button>
       </div>`;
     $(".cal-back3").addEventListener("click", renderStep2);
-    $(".cal-csv").addEventListener("click", () => downloadDataUri(
-      `data:text/csv;base64,${btoa(unescape(encodeURIComponent(state.report.exports.curves_csv)))}`,
-      `calibration-curves-${p.name}.csv`));
-    $(".cal-char").addEventListener("click", () => downloadDataUri(
-      `data:text/plain;base64,${btoa(unescape(encodeURIComponent(state.report.exports.characterization_cgats)))}`,
-      `characterization-${p.name}.txt`));
-    $(".cal-corr").addEventListener("click", () => downloadDataUri(
-      `data:text/plain;base64,${btoa(unescape(encodeURIComponent(state.report.exports.corrected_cgats)))}`,
-      `characterization-corrected-${p.name}.txt`));
+    $(".cal-csv").addEventListener("click", () => downloadText(
+      "\ufeff" + (state.report.exports.curves_csv || ""),
+      `calibration-curves-${p.name}.csv`,
+      "text/csv;charset=utf-8"));
+    $(".cal-char").addEventListener("click", () => downloadText(
+      state.report.exports.characterization_cgats || "",
+      `characterization-${p.name}.txt`,
+      "text/plain;charset=utf-8"));
+    $(".cal-corr").addEventListener("click", () => downloadText(
+      state.report.exports.corrected_cgats || "",
+      `characterization-corrected-${p.name}.txt`,
+      "text/plain;charset=utf-8"));
     $(".cal-apply").addEventListener("click", async () => {
       const ok = await confirmDanger({
         title: "应用校准建议？",
@@ -1666,18 +1695,32 @@ function openPermanentDeleteModal(p) {
 }
 
 export async function renderProcessDetail(view, params) {
+  const isActive = params.isActive || (() => true);
+  const signal = params.signal;
+  let activeGamutView = null;
+  const disposeDetail = () => {
+    if (activeGamutView && typeof activeGamutView.destroy === "function") {
+      try { activeGamutView.destroy(); } catch (_) {}
+      activeGamutView = null;
+    }
+  };
+  params.onCleanup?.(disposeDetail);
+
   view.innerHTML = `<div class="spinner"></div>`;
   let p;
   try {
-    p = await apiGet(`/api/processes/${params.id}`);
+    p = await apiGet(`/api/processes/${encodeURIComponent(params.id)}`, { signal });
   } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (!isActive()) return;
     view.innerHTML = errorState(e.message, { retry: false });
     return;
   }
+  if (!isActive()) return;
 
   const archived = isArchived(p);
-  const gamutPromise = apiGet(`/api/processes/${p.id}/gamut?levels=7`);
-  const recipesPromise = apiGet(`/api/recipes?process_id=${p.id}`);
+  const gamutPromise = apiGet(`/api/processes/${encodeURIComponent(p.id)}/gamut?levels=7`, { signal });
+  const recipesPromise = apiGet(`/api/recipes?process_id=${encodeURIComponent(p.id)}`, { signal });
 
   view.innerHTML = `
     <div class="page-head">
@@ -1732,9 +1775,9 @@ export async function renderProcessDetail(view, params) {
       <div class="card">
         <div class="card-title">${icon("stack")}ICC 特性文件</div>
         <dl class="kv" style="margin-top:10px">
-          <dt>设备色彩空间</dt><dd>${p.icc_meta.device_space}（${p.icc_meta.channels} 通道）</dd>
-          <dt>测量条件</dt><dd>${p.measurement_condition || "未登记"}</dd>
-          <dt>ICC 指纹</dt><dd><span class="chip chip-mono">${p.icc_sha256.slice(0, 8)}</span></dd>
+          <dt>设备色彩空间</dt><dd>${esc(p.icc_meta.device_space)}（${p.icc_meta.channels} 通道）</dd>
+          <dt>测量条件</dt><dd>${esc(p.measurement_condition || "未登记")}</dd>
+          <dt>ICC 指纹</dt><dd><span class="chip chip-mono">${esc((p.icc_sha256 || "").slice(0, 8))}</span></dd>
           <dt>文件名</dt><dd>${esc(p.icc_original_name)}</dd>
           <dt>大小</dt><dd>${(p.icc_size / 1024).toFixed(1)} KB</dd>
           <dt>描述</dt><dd>${esc(p.icc_meta.description || "-")}</dd>
@@ -1742,10 +1785,10 @@ export async function renderProcessDetail(view, params) {
           ${p.paper ? `<dt>纸张</dt><dd>${esc(p.paper)}</dd>` : ""}
           ${p.ink ? `<dt>墨水</dt><dd>${esc(p.ink)}</dd>` : ""}
           ${p.notes ? `<dt>备注</dt><dd>${esc(p.notes)}</dd>` : ""}
-          <dt>创建时间</dt><dd>${p.created_at}</dd>
+          <dt>创建时间</dt><dd>${esc(p.created_at)}</dd>
         </dl>
         <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap">
-          <a class="btn btn-secondary btn-sm" href="/api/processes/${p.id}/icc" download="${esc(p.icc_original_name)}">${icon("download")}下载 ICC</a>
+          <a class="btn btn-secondary btn-sm" href="/api/processes/${encodeURIComponent(p.id)}/icc" download="${esc(p.icc_original_name)}">${icon("download")}下载 ICC</a>
           <button class="btn btn-secondary btn-sm" id="btn-replace"
             ${archived ? `disabled aria-disabled="true" title="工艺已归档，恢复后才能替换 ICC"` : ""}>${icon("swap")}替换 ICC</button>
         </div>
@@ -1758,8 +1801,11 @@ export async function renderProcessDetail(view, params) {
     </div>
   `;
 
-  const reload = () => renderProcessDetail(view, params);
-  renderPassportSlot(view, p);
+  const reload = () => {
+    disposeDetail();
+    return renderProcessDetail(view, params);
+  };
+  renderPassportSlot(view, p, isActive, signal);
 
   const compResetBtn = view.querySelector("#btn-comp-reset");
   if (compResetBtn && !archived) {
@@ -1782,7 +1828,7 @@ export async function renderProcessDetail(view, params) {
 
   view.querySelector(".btn-back").addEventListener("click", () => (location.hash = "#/processes"));
   if (!archived) {
-    view.querySelector("#btn-use").addEventListener("click", () => (location.hash = `#/recipes?process=${p.id}`));
+    view.querySelector("#btn-use").addEventListener("click", () => (location.hash = `#/recipes?process=${encodeURIComponent(p.id)}`));
     view.querySelector("#btn-edit").addEventListener("click", () =>
       openProcessEditor(view, { mode: "edit", process: p, onDone: reload })
     );
@@ -1806,57 +1852,66 @@ export async function renderProcessDetail(view, params) {
   if (calSlot) {
     (async () => {
       try {
-        const hist = await apiGet(`/api/qc/calibration/history?process_id=${encodeURIComponent(p.id)}`);
+        const hist = await apiGet(`/api/qc/calibration/history?process_id=${encodeURIComponent(p.id)}`, { signal });
+        if (!isActive() || !calSlot.isConnected) return;
         if (!hist.rounds.length) { calSlot.innerHTML = ""; return; }
         calSlot.innerHTML = calibrationHistoryCard(hist, archived);
         if (!archived) {
           calSlot.querySelector("[data-cal-open]")?.addEventListener("click", () =>
             openCalibrationModal(view, { ...p, compensation: undefined }));
         }
-      } catch (_) { calSlot.innerHTML = ""; }
+      } catch (e) {
+        if (e && e.name === "AbortError") return;
+        if (isActive() && calSlot.isConnected) calSlot.innerHTML = "";
+      }
     })();
   }
 
   // V0.9：签样卡（状态机 + 放行门禁；ICC 变更后门禁自动失效）
   const sgSlot = view.querySelector("#signoff-slot");
-  if (sgSlot) {
-    (async () => {
-      try {
-        const [rows, gate] = await Promise.all([
-          apiGet(`/api/signoffs?process_id=${encodeURIComponent(p.id)}`),
-          apiGet(`/api/signoffs/gate?process_id=${encodeURIComponent(p.id)}`),
-        ]);
-        if (!view.isConnected) return;
-        sgSlot.innerHTML = signoffCard(rows, gate, archived);
-        const card = sgSlot.querySelector(".card");
-        const reload = () => renderProcessDetail(view, params);
-        card.querySelectorAll("[data-sg]").forEach((btn) => {
-          btn.addEventListener("click", async () => {
-            const action = btn.dataset.sg;
-            if (action === "create") return openSignoffCreate(p, reload);
-            if (action === "manifest") return downloadSignoffManifest(p);
-            if (action === "delete") {
-              const ok = await confirmDanger({
-                title: "删除签样草稿？",
-                message: "草稿及其证据关联将被移除，此操作不可撤销。",
-                confirmText: "删除",
-              });
-              if (!ok) return;
-              try {
-                await apiDelete(`/api/signoffs/${rows[0].id}`);
-                toast("签样草稿已删除", "ok");
-                reload();
-              } catch (e) {
-                toast(e.message, "err");
-              }
-              return;
+  const loadSignoffSlot = async () => {
+    if (!sgSlot) return;
+    try {
+      const [rows, gate] = await Promise.all([
+        apiGet(`/api/signoffs?process_id=${encodeURIComponent(p.id)}`, { signal }),
+        apiGet(`/api/signoffs/gate?process_id=${encodeURIComponent(p.id)}`, { signal }),
+      ]);
+      if (!isActive() || !sgSlot.isConnected) return;
+      sgSlot.innerHTML = signoffCard(rows, gate, archived);
+      const card = sgSlot.querySelector(".card");
+      card.querySelectorAll("[data-sg]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const action = btn.dataset.sg;
+          if (action === "create") return openSignoffCreate(p, reload);
+          if (action === "manifest") return downloadSignoffManifest(p);
+          if (action === "delete") {
+            const ok = await confirmDanger({
+              title: "删除签样草稿？",
+              message: "草稿及其证据关联将被移除，此操作不可撤销。",
+              confirmText: "删除",
+            });
+            if (!ok) return;
+            try {
+              await apiDelete(`/api/signoffs/${encodeURIComponent(rows[0].id)}`);
+              toast("签样草稿已删除", "ok");
+              reload();
+            } catch (e) {
+              toast(e.message, "err");
             }
-            return openSignoffAction(action, rows[0], reload);
-          });
+            return;
+          }
+          return openSignoffAction(action, rows[0], reload);
         });
-      } catch (_) { sgSlot.innerHTML = ""; }
-    })();
-  }
+      });
+    } catch (e) {
+      if (e && e.name === "AbortError") return;
+      if (!isActive() || !sgSlot.isConnected) return;
+      sgSlot.innerHTML = errorState(`签样门禁加载失败：${e.message}`);
+      sgSlot.querySelector(".btn-retry")?.addEventListener("click", loadSignoffSlot);
+    }
+  };
+  if (sgSlot) loadSignoffSlot();
+
   const restoreBtn = view.querySelector("#btn-restore-process");
   if (restoreBtn) {
     restoreBtn.addEventListener("click", async () => {
@@ -1877,7 +1932,7 @@ export async function renderProcessDetail(view, params) {
   // 色域主区（2D/3D 组件）+ 概览指标
   try {
     const [gamut, recipes] = await Promise.all([gamutPromise, recipesPromise]);
-    if (!view.isConnected) return; // 用户已切走
+    if (!isActive()) return; // 用户已切走
     view.querySelector("#st-volume").textContent = formatVolume(gamut.volume);
     view.querySelector("#st-lrange").textContent = `${gamut.L_range[0]} – ${gamut.L_range[1]}`;
     view.querySelector("#st-cov").textContent = `${Math.round(gamut.coverage_srgb * 100)}%`;
@@ -1886,13 +1941,19 @@ export async function renderProcessDetail(view, params) {
       ? passRateHtml(recent.filter((r) => r.converged).length / recent.length)
       : `<span class="pass-none">—</span>`;
 
-    createGamutView(view.querySelector("#gamut-view"), {
-      getData: () => gamutPromise,
-      levels: 7,
-    });
+    disposeDetail();
+    const gamutHolder = view.querySelector("#gamut-view");
+    if (gamutHolder) {
+      activeGamutView = createGamutView(gamutHolder, {
+        getData: () => gamutPromise,
+        levels: 7,
+      });
+    }
 
     renderHistory(view, recipes);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (!isActive()) return;
     const holder = view.querySelector("#gamut-view");
     if (holder) holder.innerHTML = errorState(`色域数据加载失败：${e.message}`);
   }
@@ -1900,6 +1961,7 @@ export async function renderProcessDetail(view, params) {
 
 function renderHistory(view, recipes) {
   const box = view.querySelector("#recipe-history");
+  if (!box) return;
   if (!recipes.length) {
     box.innerHTML = emptyState({
       iconName: "flask", title: "暂无配方记录",
@@ -1913,7 +1975,7 @@ function renderHistory(view, recipes) {
       <a class="group-row hist-row" href="#/recipes">
         <div class="grow">
           <div class="row-title">${r.label ? esc(r.label) : "未命名颜色"} ${statusChip(r)}</div>
-          <div class="row-sub">${Object.entries(r.recipe).map(([k, v]) => `${k} ${v}`).join(" · ")} · 目标 Lab(${r.target_lab.map((x) => Math.round(x)).join(",")})</div>
+          <div class="row-sub">${Object.entries(r.recipe).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(" · ")} · 目标 Lab(${r.target_lab.map((x) => Math.round(x)).join(",")})</div>
         </div>
         ${sparkline(r.iterations, { width: 90, height: 24, tolerance: r.tolerance })}
       </a>`

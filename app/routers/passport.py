@@ -13,8 +13,9 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
 from ..services.lifecycle import archived_detail, is_archived
-from ..services.passport import PassportStore
+from ..services.passport import PassportStore, build_eval_context
 from ..services.processes import ProcessStore
+from ._http import content_disposition
 
 router = APIRouter(prefix="/api/processes", tags=["passports"])
 
@@ -55,27 +56,33 @@ def get_latest_passport(pid: str):
 def list_passport_versions(pid: str):
     proc = _process_or_404(pid)
     store = PassportStore()
-    latest = store.latest_snapshot(pid)
-    latest_version = int((latest or {}).get("version", 0) or 0)
+    versions = store.list_versions(pid)
+    latest_version = int((versions[0] if versions else {}).get("version", 0) or 0)
+    # 一次性预计算当前工艺评估上下文与该工艺签样列表，消除 50 次重复解析 ICC 与 150+ 次读盘
+    eval_ctx = build_eval_context(proc) if versions else None
     from ..services.signoffs import SignoffStore
 
-    signoffs = SignoffStore()
+    proc_signoffs = SignoffStore().list(process_id=pid) if versions else []
     out = []
-    for snapshot in store.list_versions(pid):
-        exposed = store.expose(snapshot, proc)
-        references = signoffs.references_for_passport(
-            pid,
-            exposed.get("id", ""),
-            exposed.get("passport_hash", ""),
-        )
-        referenced_by = [
-            {
-                "id": doc.get("id", ""),
-                "state": doc.get("state", "draft"),
-                "title": doc.get("title", ""),
-            }
-            for doc in references
-        ]
+    for snapshot in versions:
+        exposed = store.expose(snapshot, proc, context=eval_ctx)
+        pp_id = str(exposed.get("id", "") or "")
+        pp_hash = str(exposed.get("passport_hash", "") or "")
+        referenced_by = []
+        for doc in proc_signoffs:
+            matched = False
+            for source in (doc.get("snapshot") or {}, doc.get("evidence") or {}):
+                s_id = str(source.get("passport_id", "") or "")
+                s_hash = str(source.get("passport_hash", "") or "")
+                if (pp_id and s_id == pp_id) or (pp_hash and s_hash == pp_hash):
+                    matched = True
+                    break
+            if matched:
+                referenced_by.append({
+                    "id": doc.get("id", ""),
+                    "state": doc.get("state", "draft"),
+                    "title": doc.get("title", ""),
+                })
         out.append({
             "id": exposed["id"],
             "version": exposed["version"],
@@ -117,7 +124,7 @@ def export_passport(
     return Response(
         content=content.encode("utf-8"),
         media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename, fallback=filename)},
     )
 
 

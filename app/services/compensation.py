@@ -47,25 +47,36 @@ class CompensationStore:
         cap: float = BIAS_CAP,
     ) -> dict:
         """累积一次有效修正的设备空间偏置。delta_device 为 0-1 单位、长度=通道数。"""
-        delta = np.clip(np.asarray(delta_device, dtype=np.float64), -cap, cap)
-        doc = self._store.get(pid)
-        if not doc or doc.get("icc_sha256") != icc_sha256:
-            doc = {"icc_sha256": icc_sha256, "n": 0, "bias_device": [0.0] * len(delta)}
-        bias = (1.0 - alpha) * np.asarray(doc["bias_device"], dtype=np.float64) + alpha * delta
-        bias = np.clip(bias, -cap, cap)
-        doc["n"] = int(doc["n"]) + 1
-        doc["bias_device"] = [round(float(v), 4) for v in bias]
-        doc.setdefault("history", []).append(
-            {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "delta_device": [round(float(v), 4) for v in delta],
-            }
-        )
-        if len(doc["history"]) > HISTORY_MAX:
-            doc["history"] = doc["history"][-HISTORY_MAX:]
-        doc["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        self._store.put(pid, doc)
-        return doc
+        raw_delta = np.asarray(delta_device, dtype=np.float64)
+        if raw_delta.ndim != 1 or raw_delta.size == 0 or not np.all(np.isfinite(raw_delta)):
+            raise ValueError("delta_device 必须为有限的一维数值序列")
+        delta = np.clip(raw_delta, -cap, cap)
+
+        def _mutate(doc):
+            if (
+                not doc
+                or doc.get("icc_sha256") != icc_sha256
+                or len(doc.get("bias_device") or []) != len(delta)
+            ):
+                doc = {"icc_sha256": icc_sha256, "n": 0, "bias_device": [0.0] * len(delta), "history": []}
+            else:
+                doc = dict(doc)
+            bias = (1.0 - alpha) * np.asarray(doc["bias_device"], dtype=np.float64) + alpha * delta
+            bias = np.clip(bias, -cap, cap)
+            doc["n"] = int(doc["n"]) + 1
+            doc["bias_device"] = [round(float(v), 4) for v in bias]
+            hist = list(doc.get("history") or [])
+            hist.append(
+                {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "delta_device": [round(float(v), 4) for v in delta],
+                }
+            )
+            doc["history"] = hist[-HISTORY_MAX:]
+            doc["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            return doc
+
+        return self._store.mutate_key(pid, _mutate)
 
     def bias_for_predict(self, pid: str, icc_sha256: str) -> list[float] | None:
         """返回可应用的偏置（sha 匹配且样本数达标），否则 None。"""
@@ -76,28 +87,55 @@ class CompensationStore:
             return None
         return doc.get("bias_device")
 
-    def apply_calibration(self, pid: str, icc_sha256: str, delta_device) -> dict:
+    def apply_calibration(
+        self,
+        pid: str,
+        icc_sha256: str,
+        delta_device,
+        *,
+        base_bias=None,
+    ) -> dict:
         """校准建议写入（V0.7）：直接叠加（区别于 EMA——校准是用户显式确认的动作）。
 
         sha 不匹配时按既有语义重置（新 ICC 的墨量行为可能完全不同）；
         n 提升至 MIN_N（显式校准视为可信样本，越过应用门槛）。
+        若提供 base_bias（同会话幂等重复应用时传入原轮次的 bias_before），
+        则以 base_bias 为基准叠加，防止同会话重复点击导致偏置翻倍。
         """
-        delta = np.clip(np.asarray(delta_device, dtype=np.float64), -BIAS_CAP, BIAS_CAP)
-        doc = self._store.get(pid)
-        if not doc or doc.get("icc_sha256") != icc_sha256:
-            doc = {"icc_sha256": icc_sha256, "n": 0, "bias_device": [0.0] * len(delta)}
-        bias = np.clip(np.asarray(doc["bias_device"], dtype=np.float64) + delta, -BIAS_CAP, BIAS_CAP)
-        doc["n"] = max(int(doc.get("n", 0)), MIN_N)
-        doc["bias_device"] = [round(float(v), 4) for v in bias]
-        doc.setdefault("history", []).append(
-            {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "source": "calibration",
-                "delta_device": [round(float(v), 4) for v in delta],
-            }
-        )
-        if len(doc["history"]) > HISTORY_MAX:
-            doc["history"] = doc["history"][-HISTORY_MAX:]
-        doc["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        self._store.put(pid, doc)
-        return doc
+        raw_delta = np.asarray(delta_device, dtype=np.float64)
+        if raw_delta.ndim != 1 or raw_delta.size == 0 or not np.all(np.isfinite(raw_delta)):
+            raise ValueError("delta_device 必须为有限的一维数值序列")
+        delta = np.clip(raw_delta, -BIAS_CAP, BIAS_CAP)
+
+        base_arr = None
+        if base_bias is not None and len(base_bias) == len(delta):
+            arr = np.asarray(base_bias, dtype=np.float64)
+            if np.all(np.isfinite(arr)):
+                base_arr = np.clip(arr, -BIAS_CAP, BIAS_CAP)
+
+        def _mutate(doc):
+            if (
+                not doc
+                or doc.get("icc_sha256") != icc_sha256
+                or len(doc.get("bias_device") or []) != len(delta)
+            ):
+                doc = {"icc_sha256": icc_sha256, "n": 0, "bias_device": [0.0] * len(delta), "history": []}
+            else:
+                doc = dict(doc)
+            cur = base_arr if base_arr is not None else np.asarray(doc["bias_device"], dtype=np.float64)
+            bias = np.clip(cur + delta, -BIAS_CAP, BIAS_CAP)
+            doc["n"] = max(int(doc.get("n", 0)), MIN_N)
+            doc["bias_device"] = [round(float(v), 4) for v in bias]
+            hist = list(doc.get("history") or [])
+            hist.append(
+                {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "source": "calibration",
+                    "delta_device": [round(float(v), 4) for v in delta],
+                }
+            )
+            doc["history"] = hist[-HISTORY_MAX:]
+            doc["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            return doc
+
+        return self._store.mutate_key(pid, _mutate)

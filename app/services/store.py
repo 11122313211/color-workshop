@@ -10,8 +10,8 @@ from datetime import datetime
 
 import numpy as np
 
-from ..algorithms import convert_color, create_srgb_profile, load_profile_from_bytes
-from ..ai import closed_loop_correct, detect_color_checker, generate_calibration_profile
+from ..algorithms import convert_color
+from ..ai import closed_loop_correct, detect_color_checker
 from ..models.schemas import (
     DeviceCreate,
     DeviceOut,
@@ -131,11 +131,12 @@ def run_correction(store: DeviceStore, req: CorrectionRequest) -> CorrectionResp
     from ..algorithms import delta_e_from_rgb
     de_before = delta_e_from_rgb(req.measured_rgb, req.target_rgb, req.space, req.method.value)
 
-    # 简单线性校正：测量值 -> 目标值的最小二乘矩阵
-    measured = np.array([req.measured_rgb])
-    target = np.array([req.target_rgb])
-    M = np.linalg.lstsq(measured, target, rcond=None)[0].T
-    corrected = (measured @ M)[0]
+    # 简单线性校正：测量值 -> 目标值的最小二乘矩阵（measured @ X ≈ target）
+    measured = np.array([req.measured_rgb], dtype=np.float64)
+    target = np.array([req.target_rgb], dtype=np.float64)
+    X = np.linalg.lstsq(measured, target, rcond=None)[0]
+    M = X.T
+    corrected = (measured @ X)[0]
     de_after = delta_e_from_rgb(corrected, req.target_rgb, req.space, req.method.value)
 
     converged = de_after <= req.tolerance

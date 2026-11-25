@@ -13,14 +13,20 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import threading
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PIL import ImageCms
 
-from .filedb import JsonStore
+from .filedb import JsonStore, MAINTENANCE_LOCK
+
+
+class ProcessArchivedError(Exception):
+    """尝试对已归档工艺执行只读门禁拒绝的写操作。"""
 
 # 数据目录：可用环境变量 COLORFORGE_DATA_DIR 重定向（测试隔离用）
 DATA_DIR = Path(
@@ -96,9 +102,11 @@ class ProcessStore:
     ) -> dict:
         if measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS:
             raise ValueError("measurement_condition 仅支持空串 / M0 / M1 / M2")
+        # 先解析校验 ICC，再持全局维护锁原子落盘 ICC 与注册表，避免合法 ICC 被并发审计误隔离
+        meta = self.parse_meta(icc_bytes)
         pid = uuid.uuid4().hex[:12]
         icc_file = f"{pid}.icc"
-        (PROFILE_DIR / icc_file).write_bytes(icc_bytes)
+        sha = hashlib.sha256(icc_bytes).hexdigest()[:16]
         doc = {
             "id": pid,
             "name": name,
@@ -107,17 +115,20 @@ class ProcessStore:
             "notes": notes,
             "measurement_condition": measurement_condition,
             "icc_file": icc_file,
-            "icc_original_name": filename or icc_file,
+            "icc_original_name": Path(filename).name if filename else icc_file,
             "icc_size": len(icc_bytes),
-            "icc_sha256": hashlib.sha256(icc_bytes).hexdigest()[:16],
-            "icc_meta": self.parse_meta(icc_bytes),
+            "icc_sha256": sha,
+            "icc_meta": meta,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "archived_at": "",
             "archive_reason": "",
             "archived_by": "",
         }
-        self._store.put(pid, doc)
-        return doc
+        with MAINTENANCE_LOCK:
+            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            (PROFILE_DIR / icc_file).write_bytes(icc_bytes)
+            self._store.put(pid, doc)
+        return self._with_defaults(doc)
 
     def get(self, pid: str) -> dict | None:
         doc = self._store.get(pid)
@@ -142,43 +153,70 @@ class ProcessStore:
         out["is_archived"] = bool(out.get("archived_at"))
         return out
 
+    def _evict_sha_if_unused(self, sha: str) -> None:
+        if not sha:
+            return
+        in_use = any(
+            isinstance(d, dict) and d.get("icc_sha256") == sha
+            for d in self._store.all().values()
+        )
+        if not in_use:
+            evict_gamut_cache(sha)
+            try:
+                from .recipe import evict_icc_cache
+                evict_icc_cache(sha)
+            except Exception:
+                pass
+
     def archive(self, pid: str, reason: str = "manual_archive", actor: str = "") -> dict:
         """归档工艺（可逆）。已归档时幂等返回，不刷新归档时间。"""
-        doc = self._store.get(pid)
-        if not doc:
-            raise KeyError(pid)
-        if doc.get("archived_at"):
-            return self._with_defaults(doc)
-        doc["archived_at"] = datetime.now().isoformat(timespec="seconds")
-        doc["archive_reason"] = (reason or "").strip() or "manual_archive"
-        doc["archived_by"] = (actor or "").strip()
-        self._store.put(pid, doc)
-        return self._with_defaults(doc)
+        def _mutate(doc):
+            if not doc:
+                raise KeyError(pid)
+            if doc.get("archived_at"):
+                return doc
+            doc = dict(doc)
+            doc["archived_at"] = datetime.now().isoformat(timespec="seconds")
+            doc["archive_reason"] = (reason or "").strip() or "manual_archive"
+            doc["archived_by"] = (actor or "").strip()
+            return doc
+
+        with MAINTENANCE_LOCK:
+            updated = self._store.mutate_key(pid, _mutate)
+        return self._with_defaults(updated)
 
     def restore(self, pid: str) -> dict:
         """恢复归档工艺为 active。未归档时幂等返回。"""
-        doc = self._store.get(pid)
-        if not doc:
-            raise KeyError(pid)
-        if not doc.get("archived_at"):
-            return self._with_defaults(doc)
-        doc["archived_at"] = ""
-        doc["archive_reason"] = ""
-        doc["archived_by"] = ""
-        self._store.put(pid, doc)
-        return self._with_defaults(doc)
+        def _mutate(doc):
+            if not doc:
+                raise KeyError(pid)
+            if not doc.get("archived_at"):
+                return doc
+            doc = dict(doc)
+            doc["archived_at"] = ""
+            doc["archive_reason"] = ""
+            doc["archived_by"] = ""
+            return doc
+
+        with MAINTENANCE_LOCK:
+            updated = self._store.mutate_key(pid, _mutate)
+        return self._with_defaults(updated)
 
     def delete(self, pid: str) -> bool:
         """内部硬删除：删除工艺元数据与 ICC 文件（API 不直接暴露）。"""
-        doc = self._store.get(pid)
-        if not doc:
-            return False
-        self._store.delete(pid)
-        try:
-            (PROFILE_DIR / doc["icc_file"]).unlink(missing_ok=True)
-        except OSError:
-            pass
-        return True
+        with MAINTENANCE_LOCK:
+            doc = self._store.get(pid)
+            if not doc:
+                return False
+            self._store.delete(pid)
+            icc_name = Path(str(doc.get("icc_file") or "")).name
+            if icc_name:
+                try:
+                    (PROFILE_DIR / icc_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._evict_sha_if_unused(str(doc.get("icc_sha256") or ""))
+            return True
 
     def update(
         self,
@@ -188,59 +226,112 @@ class ProcessStore:
         ink=None,
         notes=None,
         measurement_condition=None,
+        *,
+        require_active: bool = False,
     ) -> dict | None:
         """编辑工艺元数据（None 字段保持不变）。"""
-        doc = self._store.get(pid)
-        if not doc:
-            return None
-        if name is not None:
-            doc["name"] = name
-        if paper is not None:
-            doc["paper"] = paper
-        if ink is not None:
-            doc["ink"] = ink
-        if notes is not None:
-            doc["notes"] = notes
-        if measurement_condition is not None:
-            if measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS:
-                raise ValueError("measurement_condition 仅支持空串 / M0 / M1 / M2")
-            doc["measurement_condition"] = measurement_condition
-        self._store.put(pid, doc)
-        return self._with_defaults(doc)
+        if measurement_condition is not None and measurement_condition not in PROCESS_MEASUREMENT_CONDITIONS:
+            raise ValueError("measurement_condition 仅支持空串 / M0 / M1 / M2")
 
-    def replace_icc(self, pid: str, icc_bytes: bytes, filename: str = "") -> dict:
+        missing = object()
+
+        def _mutate(doc):
+            if not doc:
+                return missing
+            if require_active and doc.get("archived_at"):
+                raise ProcessArchivedError("工艺已归档，只读")
+            doc = dict(doc)
+            if name is not None:
+                doc["name"] = name
+            if paper is not None:
+                doc["paper"] = paper
+            if ink is not None:
+                doc["ink"] = ink
+            if notes is not None:
+                doc["notes"] = notes
+            if measurement_condition is not None:
+                doc["measurement_condition"] = measurement_condition
+            return doc
+
+        with MAINTENANCE_LOCK:
+            def _update_all(data: dict):
+                cur = data.get(pid)
+                nxt = _mutate(cur)
+                if nxt is missing:
+                    return None
+                data[pid] = nxt
+                return nxt
+
+            updated = self._store.update(_update_all)
+        return self._with_defaults(updated) if updated else None
+
+    def replace_icc(
+        self,
+        pid: str,
+        icc_bytes: bytes,
+        filename: str = "",
+        *,
+        require_active: bool = False,
+    ) -> dict:
         """替换 ICC 文件：覆盖落盘 + 重解析元数据 + 更新 sha 指纹。
 
-        sha 变更会天然击穿 LUT/变换/色域的按内容哈希缓存。
+        sha 变更会天然击穿 LUT/变换/色域的按内容哈希缓存，并主动回收旧缓存。
         """
-        doc = self._store.get(pid)
-        if not doc:
-            raise KeyError(pid)
         meta = self.parse_meta(icc_bytes)
-        (PROFILE_DIR / doc["icc_file"]).write_bytes(icc_bytes)
-        doc.update(
-            {
-                "icc_original_name": filename or doc["icc_original_name"],
-                "icc_size": len(icc_bytes),
-                "icc_sha256": hashlib.sha256(icc_bytes).hexdigest()[:16],
-                "icc_meta": meta,
-            }
-        )
-        self._store.put(pid, doc)
-        return doc
+        new_sha = hashlib.sha256(icc_bytes).hexdigest()[:16]
+        clean_name = Path(filename).name if filename else ""
+
+        with MAINTENANCE_LOCK:
+            doc = self._store.get(pid)
+            if not doc:
+                raise KeyError(pid)
+            if require_active and doc.get("archived_at"):
+                raise ProcessArchivedError("工艺已归档，只读")
+            old_sha = str(doc.get("icc_sha256") or "")
+            icc_name = Path(str(doc.get("icc_file") or "")).name
+            if not icc_name:
+                icc_name = f"{pid}.icc"
+                doc["icc_file"] = icc_name
+            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            (PROFILE_DIR / icc_name).write_bytes(icc_bytes)
+            doc.update(
+                {
+                    "icc_original_name": clean_name or doc.get("icc_original_name") or icc_name,
+                    "icc_size": len(icc_bytes),
+                    "icc_sha256": new_sha,
+                    "icc_meta": meta,
+                }
+            )
+            self._store.put(pid, doc)
+            if old_sha and old_sha != new_sha:
+                self._evict_sha_if_unused(old_sha)
+        return self._with_defaults(doc)
 
     def icc_bytes(self, pid: str) -> bytes:
         doc = self.get(pid)
         if not doc:
             raise KeyError(pid)
-        return (PROFILE_DIR / doc["icc_file"]).read_bytes()
+        icc_name = Path(str(doc.get("icc_file") or "")).name
+        if not icc_name:
+            raise FileNotFoundError(f"工艺 {pid} 缺少 ICC 文件名")
+        return (PROFILE_DIR / icc_name).read_bytes()
 
 
 # ---------------------------------------------------------------------------
 # 工艺色域采样（供 CIE 色度图展示）
 # ---------------------------------------------------------------------------
 
-_gamut_cache: dict[str, dict] = {}
+_GAMUT_CACHE_MAX = 48
+_gamut_lock = threading.RLock()
+_gamut_cache: OrderedDict[str, dict] = OrderedDict()
+
+
+def evict_gamut_cache(icc_sha256: str) -> None:
+    """按 ICC 内容哈希清理对应的色域采样缓存。"""
+    prefix = f"{icc_sha256}:"
+    with _gamut_lock:
+        for key in [k for k in _gamut_cache if k.startswith(prefix)]:
+            _gamut_cache.pop(key, None)
 
 # sRGB 三原色 xy 色度坐标（D65），与前端色度图绘制的参考三角形一致
 _SRGB_PRIMARIES_XY = ((0.6400, 0.3300), (0.3000, 0.6000), (0.1500, 0.0600))
@@ -304,13 +395,17 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
     """
     # 缓存键必须含 levels：同工艺不同采样密度是不同结果
     key = f"{process['icc_sha256']}:{levels}"
-    if key in _gamut_cache:
-        return _gamut_cache[key]
+    with _gamut_lock:
+        cached = _gamut_cache.get(key)
+        if cached is not None:
+            _gamut_cache.move_to_end(key)
+            return cached
 
     import colour
     from PIL import Image, ImageCms
 
-    icc_bytes = (PROFILE_DIR / process["icc_file"]).read_bytes()
+    icc_name = Path(str(process.get("icc_file") or "")).name
+    icc_bytes = (PROFILE_DIR / icc_name).read_bytes()
     channels = process["icc_meta"]["channels"]
     # Pillow 合法模式：GRAY 通道即 "L"（"GRAY" 不是合法图像模式）
     in_modes = {1: ["L", "GRAY"], 3: ["RGB"], 4: ["CMYK"]}.get(channels, ["CMYK"])
@@ -389,7 +484,11 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
         "b_range": [round(float(lab[:, 2].min()), 1), round(float(lab[:, 2].max()), 1)],
         "sampled": int(len(lab)),
     }
-    _gamut_cache[key] = result
+    with _gamut_lock:
+        _gamut_cache[key] = result
+        _gamut_cache.move_to_end(key)
+        while len(_gamut_cache) > _GAMUT_CACHE_MAX:
+            _gamut_cache.popitem(last=False)
     return result
 
 

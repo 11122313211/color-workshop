@@ -22,10 +22,10 @@ _INTENT_MAP = {
 }
 
 
-def preflight(data: bytes, filename: str = "") -> dict:
+def preflight(data: bytes, filename: str = "", *, render_thumbnail: bool = True) -> dict:
     """印前预检入口：PDF 走结构化检查（pypdf），图像走原有检查。"""
     if data[:5] == b"%PDF-":
-        return _pdf_preflight(data, filename)
+        return _pdf_preflight(data, filename, render_thumbnail=render_thumbnail)
     return _image_preflight(data, filename)
 
 
@@ -333,7 +333,7 @@ def _image_draw_dpi(reader, page, max_depth: int = 4) -> list[dict]:
     return results
 
 
-def _pdf_preflight(data: bytes, filename: str = "") -> dict:
+def _pdf_preflight(data: bytes, filename: str = "", *, render_thumbnail: bool = True) -> dict:
     """PDF 印前预检（pypdf）：页面/色彩空间/专色/输出意图/字体/透明度/出血/有效 DPI。
 
     字体嵌入按 FontDescriptor→FontFile* 判定；出血按 TrimBox/BleedBox 计算；
@@ -342,20 +342,27 @@ def _pdf_preflight(data: bytes, filename: str = "") -> dict:
     """
     issues: list[dict] = []
 
-    # 首页缩略图（pypdfium2 可选依赖，缺失时静默降级）
+    # 首页缩略图（pypdfium2 可选依赖，缺失时静默降级；封装路径可关闭以省开销）
     thumbnail_b64 = None
-    try:
-        import pypdfium2 as pdfium
+    if render_thumbnail:
+        doc = None
+        try:
+            import pypdfium2 as pdfium
 
-        doc = pdfium.PdfDocument(data)
-        pil = doc[0].render(scale=1.0).to_pil().convert("RGB")
-        pil.thumbnail((460, 460))
-        tbuf = io.BytesIO()
-        pil.save(tbuf, format="PNG")
-        thumbnail_b64 = "data:image/png;base64," + base64.b64encode(tbuf.getvalue()).decode("ascii")
-        doc.close()
-    except Exception:  # noqa: BLE001 —— 缩略图失败不影响预检
-        thumbnail_b64 = None
+            doc = pdfium.PdfDocument(data)
+            pil = doc[0].render(scale=1.0).to_pil().convert("RGB")
+            pil.thumbnail((460, 460))
+            tbuf = io.BytesIO()
+            pil.save(tbuf, format="PNG")
+            thumbnail_b64 = "data:image/png;base64," + base64.b64encode(tbuf.getvalue()).decode("ascii")
+        except Exception:  # noqa: BLE001 —— 缩略图失败不影响预检
+            thumbnail_b64 = None
+        finally:
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
     from pypdf import PdfReader
 
@@ -388,7 +395,9 @@ def _pdf_preflight(data: bytes, filename: str = "") -> dict:
         "page_format": None,
     }
 
-    def _colorspace_name(cs, page_res=None) -> str:
+    def _colorspace_name(cs, page_res=None, depth: int = 0, seen: set[str] | None = None) -> str:
+        if depth > 6:
+            return "Unknown"
         cs_obj = cs.get_object() if hasattr(cs, "get_object") else cs
         if isinstance(cs_obj, list) and cs_obj:
             head = str(cs_obj[0])
@@ -402,9 +411,13 @@ def _pdf_preflight(data: bytes, filename: str = "") -> dict:
                 return f"Separation:{cs_obj[1]}"
             return head
         name = str(cs_obj)
-        # 命名色彩空间 → 页面资源里查实际定义
-        if page_res and name in page_res.get("/ColorSpace", {}):
-            return _colorspace_name(page_res["/ColorSpace"][name], page_res)
+        # 命名色彩空间 → 页面资源里查实际定义（带环检测防恶意 PDF 递归栈溢出）
+        cs_map = _deref(page_res.get("/ColorSpace")) if page_res else None
+        if isinstance(cs_map, dict) and name in cs_map:
+            visited = seen or set()
+            if name not in visited:
+                visited.add(name)
+                return _colorspace_name(cs_map[name], page_res, depth + 1, visited)
         return name.lstrip("/")
 
     for pi, page in enumerate(reader.pages):
@@ -424,29 +437,33 @@ def _pdf_preflight(data: bytes, filename: str = "") -> dict:
         for draw in _image_draw_dpi(reader, page):
             draw["page"] = pi + 1
             pdf["effective_dpi"]["items"].append(draw)
-        # 专色：页面 /ColorSpace 资源里的 /Separation 定义
-        for _k, v in (res.get("/ColorSpace") or {}).items():
-            arr = v.get_object()
-            if isinstance(arr, list) and arr and str(arr[0]) == "/Separation" and len(arr) > 1:
-                spot = str(arr[1]).lstrip("/")
-                if spot not in pdf["spot_colors"]:
-                    pdf["spot_colors"].append(spot)
-        # 图像 XObject
-        for _name, ref in (res.get("/XObject") or {}).items():
-            xo = ref.get_object()
-            if xo.get("/Subtype") != "/Image":
-                continue
-            cs_name = _colorspace_name(xo.get("/ColorSpace"), res)
-            if "/SMask" in xo or "/Mask" in xo:
-                pdf["transparency"] = True
-            pdf["images"].append(
-                {
-                    "page": pi + 1,
-                    "px": [int(xo.get("/Width", 0)), int(xo.get("/Height", 0))],
-                    "colorspace": cs_name,
-                    "resource": str(_name).lstrip("/"),
-                }
-            )
+        # 专色：页面 /ColorSpace 资源里的 /Separation 定义（兼容间接对象）
+        cs_res = _deref(res.get("/ColorSpace"))
+        if isinstance(cs_res, dict):
+            for _k, v in cs_res.items():
+                arr = _deref(v)
+                if isinstance(arr, list) and arr and str(arr[0]) == "/Separation" and len(arr) > 1:
+                    spot = str(arr[1]).lstrip("/")
+                    if spot not in pdf["spot_colors"]:
+                        pdf["spot_colors"].append(spot)
+        # 图像 XObject（兼容间接对象）
+        xobj_res = _deref(res.get("/XObject"))
+        if isinstance(xobj_res, dict):
+            for _name, ref in xobj_res.items():
+                xo = _deref(ref)
+                if not hasattr(xo, "get") or xo.get("/Subtype") != "/Image":
+                    continue
+                cs_name = _colorspace_name(xo.get("/ColorSpace"), res)
+                if "/SMask" in xo or "/Mask" in xo:
+                    pdf["transparency"] = True
+                pdf["images"].append(
+                    {
+                        "page": pi + 1,
+                        "px": [int(xo.get("/Width", 0)), int(xo.get("/Height", 0))],
+                        "colorspace": cs_name,
+                        "resource": str(_name).lstrip("/"),
+                    }
+                )
 
     # 输出意图（PDF/X 常见）
     try:

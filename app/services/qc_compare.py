@@ -56,7 +56,11 @@ def trend_for_process(measurements_store, process_id: str) -> list[dict]:
         if session.get("process_id") != process_id:
             continue
         sid = session["id"]
-        records = measurements_store.records(sid)
+        records = (
+            list(session["records"].values())
+            if isinstance(session.get("records"), dict)
+            else measurements_store.records(sid)
+        )
         q = ink_quality_from_records(records)
         metric = _metric(q)
         trap_vals = [t for t in metric["trapping"].values() if t is not None]

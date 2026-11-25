@@ -15,19 +15,26 @@ function initTheme() {
   const preferDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   applyTheme(saved || (preferDark ? "dark" : "light"));
 
-  document.getElementById("theme-btn").addEventListener("click", () => {
-    const cur = document.documentElement.dataset.theme;
-    const next = cur === "dark" ? "light" : "dark";
-    localStorage.setItem("theme", next);
-    applyTheme(next);
+  document.querySelectorAll("[data-theme-toggle]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const cur = document.documentElement.dataset.theme;
+      const next = cur === "dark" ? "light" : "dark";
+      localStorage.setItem("theme", next);
+      applyTheme(next);
+    });
   });
 }
 
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
-  document.getElementById("theme-text").textContent = theme === "dark" ? "亮色" : "暗色";
-  const iconEl = document.querySelector("#theme-btn [data-icon]");
-  iconEl.innerHTML = icon(theme === "dark" ? "sun" : "moon");
+  const label = theme === "dark" ? "亮色" : "暗色";
+  const iconSvg = icon(theme === "dark" ? "sun" : "moon");
+  document.querySelectorAll("[data-theme-toggle]").forEach((btn) => {
+    const textEl = btn.querySelector("[data-theme-text]");
+    if (textEl) textEl.textContent = label;
+    const iconEl = btn.querySelector("[data-icon]");
+    if (iconEl) iconEl.innerHTML = iconSvg;
+  });
   // 通知 canvas 类组件按新主题重绘（observeRedraw 监听）
   window.dispatchEvent(new CustomEvent("themechange", { detail: { theme } }));
 }

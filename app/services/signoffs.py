@@ -214,55 +214,65 @@ class SignoffStore:
 
     # -- 状态迁移 ---------------------------------------------------------
     def transition(self, sid: str, action: str, actor: str = "", note: str = "") -> dict:
-        doc = self.get(sid)
-        if doc is None:
-            raise KeyError("签样记录不存在")
-        state = doc.get("state", "draft")
-        target = TRANSITIONS.get(state, {}).get(action)
-        if target is None:
-            raise ValueError(f"当前状态 {state} 不支持操作 {action}")
-
         actor = (actor or "").strip()
         note = (note or "").strip()
-        if not actor:
-            raise ValueError("操作人不能为空")
-        if action == "reject" and not note:
-            raise ValueError("驳回必须填写理由")
-        if action == "submit" and not _has_evidence(doc.get("evidence")):
-            raise ValueError("提交前需关联至少一项依据（校准会话/测量会话/评价/样张/文件）")
 
-        now = _now()
-        if action in ("approve", "reject"):
-            doc["decision"] = {
-                "action": action,
-                "by": actor,
+        def _mutate(doc):
+            if doc is None:
+                raise KeyError("签样记录不存在")
+            if doc.get("orphaned_at"):
+                raise PermissionError("签样所属工艺已永久清理，孤儿审计证据只读")
+            state = doc.get("state", "draft")
+            target = TRANSITIONS.get(state, {}).get(action)
+            if target is None:
+                raise ValueError(f"当前状态 {state} 不支持操作 {action}")
+            if not actor:
+                raise ValueError("操作人不能为空")
+            if action == "reject" and not note:
+                raise ValueError("驳回必须填写理由")
+            if action == "submit" and not _has_evidence(doc.get("evidence")):
+                raise ValueError("提交前需关联至少一项依据（校准会话/测量会话/评价/样张/文件）")
+
+            doc = dict(doc)
+            now = _now()
+            if action in ("approve", "reject"):
+                doc["decision"] = {
+                    "action": action,
+                    "by": actor,
+                    "at": now,
+                    "note": note,
+                }
+            if action == "lock":
+                doc["locked_at"] = now
+                doc["release_token"] = _release_token(doc)
+
+            doc["history"] = list(doc.get("history") or []) + [{
                 "at": now,
+                "action": action,
+                "from": state,
+                "to": target,
+                "by": actor,
                 "note": note,
-            }
-        if action == "lock":
-            doc["locked_at"] = now
-            doc["release_token"] = _release_token(doc)
+            }]
+            doc["state"] = target
+            doc["updated_at"] = now
+            return doc
 
-        doc["history"] = (doc.get("history") or []) + [{
-            "at": now,
-            "action": action,
-            "from": state,
-            "to": target,
-            "by": actor,
-            "note": note,
-        }]
-        doc["state"] = target
-        doc["updated_at"] = now
-        self._store.put(sid, doc)
-        return doc
+        return self._store.mutate_key(sid, _mutate)
 
     def delete(self, sid: str) -> bool:
-        doc = self.get(sid)
-        if doc is None:
-            raise KeyError("签样记录不存在")
-        if doc.get("state") != "draft":
-            raise ValueError("仅草稿状态的签样可删除")
-        return self._store.delete(sid)
+        def _delete(data: dict) -> bool:
+            doc = data.get(sid)
+            if doc is None:
+                raise KeyError("签样记录不存在")
+            if doc.get("orphaned_at"):
+                raise PermissionError("签样所属工艺已永久清理，孤儿审计证据只读")
+            if doc.get("state") != "draft":
+                raise ValueError("仅草稿状态的签样可删除")
+            del data[sid]
+            return True
+
+        return self._store.update(_delete)
 
     # -- 门禁 -----------------------------------------------------------
     def gate(self, process_doc: dict) -> dict:
@@ -300,11 +310,11 @@ class SignoffStore:
                 "message": "签样快照缺少 ICC 指纹，无法判定有效性",
                 "signoff_id": latest["id"],
             }
-        if current_sha and snapshot_sha != current_sha:
+        if not current_sha or snapshot_sha != current_sha:
             return {
                 "allowed": False,
                 "reason": "icc_changed",
-                "message": "工艺 ICC 已替换，原签样失效，需重新签样",
+                "message": "工艺 ICC 指纹缺失或已替换，原签样失效，需重新签样",
                 "signoff_id": latest["id"],
                 "snapshot_icc": snapshot_sha,
                 "current_icc": current_sha,

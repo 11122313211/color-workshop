@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from urllib.parse import quote
+import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
@@ -27,6 +27,12 @@ from ..models.schemas import (
     DisplayUpdateRequest,
 )
 from ..services.displays import DisplayStore, calibration_status
+from ._http import (
+    MAX_DISPLAY_MEASUREMENT_BYTES,
+    content_disposition,
+    key_error_msg,
+    read_body_limited,
+)
 
 router = APIRouter(prefix="/api/displays", tags=["displays"])
 
@@ -74,7 +80,7 @@ def update_display(display_id: str, req: DisplayUpdateRequest):
     try:
         doc = _store.update(display_id, req.model_dump(exclude_unset=True))
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "显示器档案不存在")) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return _with_status(doc)
@@ -92,7 +98,7 @@ def activate_display(display_id: str):
     try:
         doc = _store.activate(display_id)
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "显示器档案不存在")) from e
     return _with_status(doc)
 
 
@@ -101,7 +107,7 @@ def add_calibration(display_id: str, req: DisplayCalibrationRequest):
     try:
         doc = _store.add_calibration(display_id, req.model_dump())
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "显示器档案不存在")) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return _with_status(doc)
@@ -112,7 +118,7 @@ def display_status(display_id: str):
     try:
         return _store.status(display_id)
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "显示器档案不存在")) from e
 
 
 @router.get("/{display_id}/report")
@@ -120,7 +126,7 @@ def display_report(display_id: str):
     try:
         return _store.report(display_id)
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "显示器档案不存在")) from e
 
 
 @router.post("/{display_id}/measurements")
@@ -131,11 +137,17 @@ async def import_display_measurement(
     white_luminance_cd_m2: float | None = Query(None, description="白场绝对亮度（可选，cd/m²）"),
 ):
     """导入屏幕测量文件（raw CGATS.17 / TSV，需含 XYZ 白/黑色块）。"""
-    raw = await request.body()
+    raw = await read_body_limited(
+        request,
+        MAX_DISPLAY_MEASUREMENT_BYTES,
+        too_large_detail="测量文件过大（>5MB）",
+    )
     try:
-        doc = _store.attach_measurement(display_id, raw, filename, white_luminance_cd_m2)
+        doc = await asyncio.to_thread(
+            _store.attach_measurement, display_id, raw, filename, white_luminance_cd_m2
+        )
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "显示器档案不存在")) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return _with_status(doc)
@@ -147,12 +159,12 @@ def export_display_measurement(display_id: str):
     try:
         raw, filename, digest = _store.measurement_export(display_id)
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "屏幕测量文件不存在")) from e
     return Response(
         content=raw,
         media_type="text/plain; charset=utf-8",
         headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "Content-Disposition": content_disposition(filename, fallback="display-measurement.txt"),
             "X-Content-SHA256": digest,
         },
     )

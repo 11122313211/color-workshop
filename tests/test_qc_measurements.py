@@ -2,7 +2,7 @@
 
 覆盖：CGATS.17 / Xrite530 TSV 解析（编码容错、结构变体）、CIE 积分白点自检、
 五条可靠性规则（正反用例）、导入 API 全流程（含 rejected 场景与补偿无关的门禁语义）。
-fixtures 全部为合成数据（课程真实导出仅作格式模板，不入库）。
+fixtures 全部为合成数据（仪器导出仅作格式模板，不入库）。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from app.services.measurement_qa import grade_session
 pytestmark = pytest.mark.api
 
 # ---------------------------------------------------------------------------
-# 合成测量文件构造器（课程格式的结构模板，数值为合成）
+# 合成测量文件构造器（标准格式结构模板，数值为合成）
 # ---------------------------------------------------------------------------
 
 SPECTRAL_FIELDS = "\t".join(["SampleID", "SAMPLE_NAME"] + [f"nm{w}" for w in range(380, 731, 10)])

@@ -93,10 +93,14 @@ def _is_white_patch(p: dict) -> bool:
     if str(p.get("label", "")).strip().lower() in WHITE_LABELS:
         return True
     spectral = p.get("spectral")
-    # 光谱记录：高反射率块视为纸白候选（课程梯尺布局纸白在末位）
+    # 光谱记录：高反射率且中性无明显色偏的块才视为纸白候选（避免误伤浅黄/Y100 等高亮度彩色块）
     if spectral and len(spectral) >= 4:
-        vals = list(spectral.values())
-        return sum(vals) / len(vals) > 0.75
+        vals = [float(v) for v in spectral.values()]
+        if sum(vals) / len(vals) > 0.75 and min(vals) > 0.45:
+            lab_ref = p.get("lab") or p.get("lab_integrated")
+            if lab_ref and (abs(float(lab_ref[1])) > 20.0 or abs(float(lab_ref[2])) > 20.0):
+                return False
+            return True
     return False
 
 
@@ -183,12 +187,18 @@ def check_patch(
     spectral = p.get("spectral")
     if spectral and lab:
         ill, obs = declared
-        lab_int = integrate_lab({int(k): v for k, v in spectral.items()}, ill, obs)
-        de = float(delta_e_batch([lab_int], lab, "cie2000")[0])
-        if de > LAB_XYZ_TOL:
+        try:
+            lab_int = integrate_lab({int(k): v for k, v in spectral.items()}, ill, obs)
+        except (KeyError, ValueError) as exc:
             findings.append(PatchFinding(
-                f"色块 {label}：光谱积分 Lab 与仪器 Lab 不一致（ΔE={de:.2f} > {LAB_XYZ_TOL}，按声明条件 {ill}/{obs}°）",
-                "rejected"))
+                f"色块 {label}：光谱按声明条件 {ill}/{obs}° 无法积分校验（{exc}）",
+                "warning"))
+        else:
+            de = float(delta_e_batch([lab_int], lab, "cie2000")[0])
+            if de > LAB_XYZ_TOL:
+                findings.append(PatchFinding(
+                    f"色块 {label}：光谱积分 Lab 与仪器 Lab 不一致（ΔE={de:.2f} > {LAB_XYZ_TOL}，按声明条件 {ill}/{obs}°）",
+                    "rejected"))
 
     # ---- 规则 2：纸白校验 ----
     if _is_white_patch(p):
@@ -280,33 +290,39 @@ def grade_session(session: dict, records: list[dict], paper_white_lab: list[floa
                     by_label.setdefault(label, []).append((ri, lab))
                 elif pt.get("densities"):
                     by_label_dens.setdefault(label, []).append((ri, pt["densities"]))
-        if len(eligible) >= 2:
-            for label, entries in by_label.items():
-                if len(entries) < 2:
-                    continue
-                labs = [e[1] for e in entries]
-                worst = float(np.max(delta_e_batch(labs[1:], labs[0], "cie2000")))
-                if worst > REPEAT_MAX_DE:
-                    for ri, _ in entries:
-                        repeat_findings.setdefault(ri, []).append(
-                            f"复测不一致：标签 {label} 跨记录 ΔE={worst:.2f} > {REPEAT_MAX_DE}")
-            # 纯密度复测对：同标签在 Lab 配对缺席时按密度通道逐项比对
-            for label, entries in by_label_dens.items():
-                if label in by_label or len(entries) < 2:
-                    continue
-                channels = set(entries[0][1].keys())
-                for _, dens in entries[1:]:
-                    channels &= set(dens.keys())
-                channels = {c for c in channels if c in ("C", "M", "Y", "K")}
-                if not channels:
-                    continue
-                worst = max(abs(float(dens[c]) - float(entries[0][1][c]))
-                            for _, dens in entries[1:] for c in channels)
-                if worst > REPEAT_MAX_DENSITY:
-                    for ri, _ in entries:
-                        repeat_findings.setdefault(ri, []).append(
-                            f"复测不一致：标签 {label} 跨记录密度差 {worst:.2f} > {REPEAT_MAX_DENSITY}")
-        # 复测模式下无任何可配对同标签（Lab 或密度，含仅 1 条记录）→ 尚不构成有效复测
+        # 同标签只要有 ≥2 次测量（跨记录或单页双点重复），必须全部通过两两最大极差检验
+        for label, entries in by_label.items():
+            if len(entries) < 2:
+                continue
+            labs = [e[1] for e in entries]
+            worst = 0.0
+            for i in range(len(labs) - 1):
+                pair_max = float(np.max(delta_e_batch(labs[i + 1:], labs[i], "cie2000")))
+                if pair_max > worst:
+                    worst = pair_max
+            if worst > REPEAT_MAX_DE:
+                for ri in {e[0] for e in entries}:
+                    repeat_findings.setdefault(ri, []).append(
+                        f"复测不一致：标签 {label} 复测最大 ΔE={worst:.2f} > {REPEAT_MAX_DE}")
+        # 纯密度复测对：同标签在 Lab 配对缺席时按密度通道计算全样本极差（max - min）
+        for label, entries in by_label_dens.items():
+            if label in by_label or len(entries) < 2:
+                continue
+            channels = set(entries[0][1].keys())
+            for _, dens in entries[1:]:
+                channels &= set(dens.keys())
+            channels = {c for c in channels if c in ("C", "M", "Y", "K")}
+            if not channels:
+                continue
+            worst = max(
+                max(float(dens[c]) for _, dens in entries) - min(float(dens[c]) for _, dens in entries)
+                for c in channels
+            )
+            if worst > REPEAT_MAX_DENSITY:
+                for ri in {e[0] for e in entries}:
+                    repeat_findings.setdefault(ri, []).append(
+                        f"复测不一致：标签 {label} 复测最大密度差 {worst:.2f} > {REPEAT_MAX_DENSITY}")
+        # 复测模式下无任何可配对同标签（Lab 或密度）→ 尚不构成有效复测
         has_pair = (any(len(v) >= 2 for v in by_label.values())
                     or any(len(v) >= 2 for v in by_label_dens.values()))
         if not has_pair:

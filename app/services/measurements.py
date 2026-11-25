@@ -70,14 +70,16 @@ class MeasurementStore:
 
     def update_session(self, sid: str, **fields) -> dict | None:
         """更新会话登记字段（repeat_mode 等）；改后由调用方重分级。"""
-        session = self.get_session(sid)
-        if session is None:
-            return None
-        for key, value in fields.items():
-            if key == "repeat_mode" and value in ("single", "repeat"):
-                session[key] = value
-        self._store.put(sid, session)
-        return session
+        def _upd(data: dict):
+            session = data.get(sid)
+            if session is None:
+                return None
+            for key, value in fields.items():
+                if key == "repeat_mode" and value in ("single", "repeat"):
+                    session[key] = value
+            return dict(session)
+
+        return self._store.update(_upd)
 
     def list_sessions(self) -> list[dict]:
         sessions = list(self._store.all().values())
@@ -104,8 +106,7 @@ class MeasurementStore:
 
         parse 失败抛 :class:`CgatsParseError`；返回新记录 doc。
         """
-        session = self.get_session(sid)
-        if session is None:
+        if self.get_session(sid) is None:
             raise KeyError(sid)
         parsed = parse_measurement_text(raw)
         rid = _new_id("ms")
@@ -138,19 +139,26 @@ class MeasurementStore:
             })
         record["labels"] = [pt.label for pt in parsed.patches]
 
-        session.setdefault("records", {})[rid] = record
-        self._regrade(session, process_doc)
-        self._store.put(sid, session)
-        return record
+        def _append(data: dict) -> dict:
+            session = data.get(sid)
+            if session is None:
+                raise KeyError(sid)
+            session.setdefault("records", {})[rid] = record
+            self._regrade(session, process_doc)
+            return dict(session["records"][rid])
+
+        return self._store.update(_append)
 
     def delete_record(self, sid: str, rid: str, process_doc: dict | None = None) -> bool:
-        session = self.get_session(sid)
-        if session is None or rid not in session.get("records", {}):
-            return False
-        del session["records"][rid]
-        self._regrade(session, process_doc)
-        self._store.put(sid, session)
-        return True
+        def _remove(data: dict) -> bool:
+            session = data.get(sid)
+            if session is None or rid not in session.get("records", {}):
+                return False
+            del session["records"][rid]
+            self._regrade(session, process_doc)
+            return True
+
+        return self._store.update(_remove)
 
     # -- 内部 -----------------------------------------------------------
 
@@ -175,11 +183,13 @@ def _icc_paper_white(process_doc: dict) -> list[float] | None:
     if meta.get("device_space") != "CMYK":
         return None
     try:
+        import numpy as np
+
         from .recipe import _build_forward
 
         channels = int(meta.get("channels", 4))
         forward = _build_forward(process_doc_icc_bytes(process_doc), channels)
-        return [float(v) for v in forward([[0.0] * channels])[0]]
+        return [float(v) for v in forward(np.zeros((1, channels), dtype=np.float64))[0]]
     except Exception:
         return None
 
@@ -190,5 +200,8 @@ def process_doc_icc_bytes(process_doc: dict) -> bytes:
 
     from .processes import PROFILE_DIR
 
-    path = Path(PROFILE_DIR) / process_doc.get("icc_file", "")
+    icc_name = Path(str(process_doc.get("icc_file", "") or "")).name
+    if not icc_name:
+        raise FileNotFoundError("工艺缺少 ICC 文件名")
+    path = Path(PROFILE_DIR) / icc_name
     return path.read_bytes()

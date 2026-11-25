@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from .filedb import JsonStore
+from pathlib import Path
+
+from .filedb import JsonStore, MAINTENANCE_LOCK
 from .processes import DATA_DIR
 
 ARCHIVED_CODE = "PROCESS_ARCHIVED"
@@ -163,83 +165,83 @@ def permanently_delete_process(process_doc: dict) -> dict:
     """
     from .calibration_history import CalibrationStore
     from .compensation import CompensationStore
-    from .evaluations import EvaluationStore
-    from .measurements import MeasurementStore
     from .passport import PassportStore
+    from .processes import ProcessStore
     from .recipe import RecipeStore
-    from .signoffs import SignoffStore
-
-    if not is_archived(process_doc):
-        raise ProcessNotArchivedError(ProcessNotArchivedError.message)
 
     pid = process_doc.get("id", "")
-    now = _now()
+    with MAINTENANCE_LOCK:
+        # 持维护锁后重读工艺记录，防止并发 restore 后仍继续永久清理
+        latest_proc = ProcessStore().get(pid)
+        if latest_proc is None:
+            raise KeyError(pid)
+        if not is_archived(latest_proc):
+            raise ProcessNotArchivedError(ProcessNotArchivedError.message)
 
-    # 先收集计数与待处理对象，再动数据；工艺最后删除，失败可整轮重试。
-    passport_versions = PassportStore().list_versions(pid)
-    sessions = [
-        s for s in MeasurementStore().list_sessions() if s.get("process_id") == pid
-    ]
-    evaluations = [
-        e for e in EvaluationStore().list_evaluations() if e.get("process_id") == pid
-    ]
-    signoffs = SignoffStore().list(process_id=pid)
-    icc_name = str(process_doc.get("icc_file", "") or "")
-    icc_path = DATA_DIR / "processes" / icc_name if icc_name else None
-    icc_existed = bool(icc_path and icc_path.exists())
+        now = _now()
+        passport_versions = PassportStore().list_versions(pid)
+        icc_name = Path(str(latest_proc.get("icc_file", "") or "")).name
+        icc_path = DATA_DIR / "processes" / icc_name if icc_name else None
+        icc_existed = bool(icc_path and icc_path.exists())
 
-    # 1) 测量会话解绑保留（证据不删）
-    session_store = JsonStore(DATA_DIR / "measurements.json")
-    detached_sessions = 0
-    for session in sessions:
-        sid = session.get("id", "")
-        current = session_store.get(sid)
-        if not current or current.get("process_id") != pid:
-            continue
-        current["process_id"] = ""
-        current["detached_from_process"] = pid
-        current["detached_at"] = now
-        session_store.put(sid, current)
-        detached_sessions += 1
+        # 1) 测量会话批量解绑保留（单次原子落盘，证据不删）
+        session_store = JsonStore(DATA_DIR / "measurements.json")
 
-    # 2) 主观评价解绑保留（证据不删）
-    evaluation_store = JsonStore(DATA_DIR / "evaluations.json")
-    detached_evaluations = 0
-    for evaluation in evaluations:
-        eid = evaluation.get("id", "")
-        current = evaluation_store.get(eid)
-        if not current or current.get("process_id") != pid:
-            continue
-        current["process_id"] = ""
-        current["detached_from_process"] = pid
-        current["detached_at"] = now
-        evaluation_store.put(eid, current)
-        detached_evaluations += 1
+        def _detach_sessions(data: dict) -> int:
+            count = 0
+            for current in data.values():
+                if not isinstance(current, dict) or current.get("process_id") != pid:
+                    continue
+                current["process_id"] = ""
+                current["detached_from_process"] = pid
+                current["detached_at"] = now
+                count += 1
+            return count
 
-    # 3) 签样保留并标记 orphaned（不删证据）
-    signoff_store = JsonStore(DATA_DIR / "signoffs.json")
-    orphaned_signoffs = 0
-    for signoff in signoffs:
-        sid = signoff.get("id", "")
-        current = signoff_store.get(sid)
-        if not current or current.get("process_id") != pid:
-            continue
-        if not current.get("orphaned_at"):
-            current["orphaned_at"] = now
-            current["orphan_reason"] = ORPHAN_REASON_PERMANENT_DELETE
-            signoff_store.put(sid, current)
-            orphaned_signoffs += 1
+        detached_sessions = session_store.update(_detach_sessions)
 
-    # 4) 删除派生记录
-    deleted_recipes = RecipeStore().remove_process(pid)
-    deleted_compensation = 1 if CompensationStore().reset(pid) else 0
-    deleted_calibrations = CalibrationStore().remove_process(pid)
-    deleted_passport_versions = len(passport_versions)
-    PassportStore().remove_process(pid)
+        # 2) 主观评价批量解绑保留（单次原子落盘，证据不删）
+        evaluation_store = JsonStore(DATA_DIR / "evaluations.json")
 
-    # 5) 最后删除工艺与 ICC（ProcessStore.delete 内部同时 unlink ICC）
-    if not _hard_delete_process(pid):
-        raise KeyError(pid)
+        def _detach_evaluations(data: dict) -> int:
+            count = 0
+            for current in data.values():
+                if not isinstance(current, dict) or current.get("process_id") != pid:
+                    continue
+                current["process_id"] = ""
+                current["detached_from_process"] = pid
+                current["detached_at"] = now
+                count += 1
+            return count
+
+        detached_evaluations = evaluation_store.update(_detach_evaluations)
+
+        # 3) 签样批量保留并标记 orphaned（单次原子落盘，不删证据）
+        signoff_store = JsonStore(DATA_DIR / "signoffs.json")
+
+        def _orphan_signoffs(data: dict) -> int:
+            count = 0
+            for current in data.values():
+                if not isinstance(current, dict) or current.get("process_id") != pid:
+                    continue
+                if not current.get("orphaned_at"):
+                    current["orphaned_at"] = now
+                    current["orphan_reason"] = ORPHAN_REASON_PERMANENT_DELETE
+                    count += 1
+            return count
+
+        orphaned_signoffs = signoff_store.update(_orphan_signoffs)
+
+        # 4) 删除派生记录
+        deleted_recipes = RecipeStore().remove_process(pid)
+        deleted_compensation = 1 if CompensationStore().reset(pid) else 0
+        deleted_calibrations = CalibrationStore().remove_process(pid)
+        deleted_passport_versions = len(passport_versions)
+        PassportStore().remove_process(pid)
+
+        # 5) 最后删除工艺与 ICC（ProcessStore.delete 内部同时 unlink ICC 并清理缓存）
+        if not _hard_delete_process(pid):
+            raise KeyError(pid)
 
     return {
         "status": "permanently_deleted",

@@ -5,7 +5,17 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel as _PydanticBaseModel, ConfigDict, Field
+
+
+class BaseModel(_PydanticBaseModel):
+    """全局严格模型基类：禁止非标准 JSON 浮点 NaN/Infinity 进入请求与响应。"""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+
+# Base64 请求体最大字符数（约对应 45MB 原始文件）
+MAX_B64_CHARS = 60_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +72,7 @@ class DeviceUpdate(BaseModel):
 class Measurement(BaseModel):
     """单次测量记录。"""
     device_id: str
-    rgb: list[float] = Field(..., description="测量得到的 RGB 值")
+    rgb: tuple[float, float, float] = Field(..., description="测量得到的 RGB 值")
     space: str = "srgb"
     conditions_ok: bool = True
     note: str = ""
@@ -83,8 +93,8 @@ class MeasurementOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ColorCheckerDetectRequest(BaseModel):
-    image_bytes: str = Field(..., description="base64 编码的图像")
-    expected_patches: int = 24
+    image_bytes: str = Field(..., max_length=MAX_B64_CHARS, description="base64 编码的图像")
+    expected_patches: int = Field(24, ge=1, le=256)
     space: str = "srgb"
 
 
@@ -111,7 +121,7 @@ class ColorCheckerDetectResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ConvertRequest(BaseModel):
-    rgb: list[float]
+    rgb: tuple[float, float, float]
     from_space: str
     to_space: str
     intent: RenderingIntent = RenderingIntent.relative_colorimetric
@@ -129,11 +139,11 @@ class ConvertResponse(BaseModel):
 
 class CorrectionRequest(BaseModel):
     device_id: str
-    measured_rgb: list[float]
-    target_rgb: list[float]
+    measured_rgb: tuple[float, float, float]
+    target_rgb: tuple[float, float, float]
     space: str = "srgb"
     method: DeltaEMethod = DeltaEMethod.cie2000
-    tolerance: float = 2.0
+    tolerance: float = Field(2.0, gt=0.0, le=100.0)
 
 
 class CorrectionResponse(BaseModel):
@@ -151,8 +161,8 @@ class CorrectionResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class DeltaERequest(BaseModel):
-    rgb1: list[float]
-    rgb2: list[float]
+    rgb1: tuple[float, float, float]
+    rgb2: tuple[float, float, float]
     space: str = "srgb"
     method: DeltaEMethod = DeltaEMethod.cie2000
 
@@ -167,10 +177,10 @@ class DeltaEResponse(BaseModel):
 
 
 class LabDeltaERequest(BaseModel):
-    lab1: list[float] = Field(..., description="CIELAB [L, a, b]")
-    lab2: list[float] = Field(..., description="CIELAB [L, a, b]")
+    lab1: tuple[float, float, float] = Field(..., description="CIELAB [L, a, b]")
+    lab2: tuple[float, float, float] = Field(..., description="CIELAB [L, a, b]")
     method: DeltaEMethod = DeltaEMethod.cie2000
-    tolerance: float = 2.0
+    tolerance: float = Field(2.0, gt=0.0, le=100.0)
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +189,12 @@ class LabDeltaERequest(BaseModel):
 
 class ClosedLoopRequest(BaseModel):
     device_id: str
-    target_rgb: list[float]
-    initial_measured_rgb: list[float]
+    target_rgb: tuple[float, float, float]
+    initial_measured_rgb: tuple[float, float, float]
     space: str = "srgb"
     method: DeltaEMethod = DeltaEMethod.cie2000
-    tolerance: float = 2.0
-    max_iterations: int = 10
+    tolerance: float = Field(2.0, gt=0.0, le=100.0)
+    max_iterations: int = Field(10, ge=1, le=50)
 
 
 class LoopIteration(BaseModel):
@@ -291,9 +301,9 @@ class RecipeTarget(BaseModel):
 class RecipePredictRequest(BaseModel):
     process_id: str
     targets: list[RecipeTarget] = Field(..., max_length=50, description="目标色列表（单次最多 50 个）")
-    tolerance: float = 2.0
+    tolerance: float = Field(2.0, gt=0.0, le=100.0)
     method: DeltaEMethod = DeltaEMethod.cie2000
-    max_rounds: int = 6
+    max_rounds: int = Field(6, ge=1, le=20)
 
 
 class RecipeResult(BaseModel):
@@ -356,7 +366,7 @@ class RecipeVerifyResponse(BaseModel):
 
 
 class PreflightRequest(BaseModel):
-    image_b64: str
+    image_b64: str = Field(..., max_length=MAX_B64_CHARS)
     filename: str = ""
 
 
@@ -383,7 +393,7 @@ class PreflightReport(BaseModel):
 
 
 class FileConvertRequest(BaseModel):
-    image_b64: str
+    image_b64: str = Field(..., max_length=MAX_B64_CHARS)
     process_id: str
     intent: str = "relative_colorimetric"
     display_id: str = ""

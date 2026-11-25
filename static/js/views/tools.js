@@ -3,8 +3,8 @@
 import { apiGet, apiPost, apiDelete, apiPostRaw, downloadDataUri } from "../api.js";
 import { icon } from "../icons.js";
 import {
-  toast, swatch, drawCie, labToHex, fetchSpectrum, emptyState, observeRedraw,
-  openModal, confirmDanger,
+  toast, drawCie, labToHex, fetchSpectrum, emptyState, errorState, observeRedraw,
+  openModal, confirmDanger, esc, safeHex,
 } from "../components.js";
 import { SRGB_XY } from "../gamut-view.js";
 
@@ -20,17 +20,31 @@ const TOOLS = [
   ["integrity", "数据维护", "完整性扫描、Dry Run 与修复"],
 ];
 
-export async function renderToolsView(view) {
+export async function renderToolsView(view, params = {}) {
+  const signal = params.signal;
+  const isActive = params.isActive || (() => view.isConnected);
+  const onCleanup = params.onCleanup || (() => {});
+
   try {
     const [procs, disps] = await Promise.all([
-      apiGet("/api/processes"),
-      apiGet("/api/displays").catch(() => []),
+      apiGet("/api/processes", { signal }),
+      apiGet("/api/displays", { signal }).catch(() => []),
     ]);
+    if (!isActive()) return;
     processes = procs;
     displays = disps;
-  } catch (_) {
-    processes = [];
-    displays = [];
+  } catch (e) {
+    if (e.name === "AbortError" || !isActive()) return;
+    view.innerHTML = `
+      <div class="page-head">
+        <div>
+          <h1 class="large-title">工具箱</h1>
+          <p class="page-sub">专业色彩工具：正查、色差、色域、转换与数据维护</p>
+        </div>
+      </div>
+      ${errorState(e.message)}`;
+    view.querySelector(".btn-retry")?.addEventListener("click", () => renderToolsView(view, params));
+    return;
   }
 
   view.innerHTML = `
@@ -43,7 +57,7 @@ export async function renderToolsView(view) {
     <div class="seg tool-seg" id="tool-seg" style="margin-bottom:18px">
       ${TOOLS.map(([k, t]) => `<button data-tool="${k}" class="${k === "forward" ? "active" : ""}">${t}</button>`).join("")}
     </div>
-    ${TOOLS.map(([k, t, d], i) => `
+    ${TOOLS.map(([k, t, d]) => `
       <div class="tool-pane ${k === "forward" ? "active" : ""}" data-pane="${k}">
         <div class="card">
           <div class="card-title">${t}</div>
@@ -61,12 +75,13 @@ export async function renderToolsView(view) {
     });
   });
 
+  const ctx = { signal, isActive, onCleanup };
   buildForward(view.querySelector("#tool-forward"));
   buildDeltaE(view.querySelector("#tool-deltae"));
-  buildGamut(view.querySelector("#tool-gamut"));
+  buildGamut(view.querySelector("#tool-gamut"), ctx);
   buildConvert(view.querySelector("#tool-convert"));
-  buildDisplay(view.querySelector("#tool-display"));
-  buildIntegrity(view.querySelector("#tool-integrity"));
+  buildDisplay(view.querySelector("#tool-display"), ctx);
+  buildIntegrity(view.querySelector("#tool-integrity"), ctx);
 }
 
 /* ---------- CMYK→LAB 正查 ---------- */
@@ -80,7 +95,7 @@ function buildForward(box) {
       <div class="field" style="max-width:340px">
         <label>工艺</label>
         <select class="input" id="fq-process">
-          ${processes.map((p) => `<option value="${p.id}">${esc(p.name)} · ${p.icc_meta.device_space}</option>`).join("")}
+          ${processes.map((p) => `<option value="${esc(p.id)}">${esc(p.name)} · ${esc(p.icc_meta?.device_space || "")}</option>`).join("")}
         </select>
       </div>
     </div>
@@ -93,7 +108,7 @@ function buildForward(box) {
 
   const renderChannels = () => {
     const p = processes.find((x) => x.id === box.querySelector("#fq-process").value);
-    const names = { CMYK: ["C", "M", "Y", "K"], RGB: ["R", "G", "B"], GRAY: ["K"] }[p.icc_meta.device_space] || ["C", "M", "Y", "K"];
+    const names = { CMYK: ["C", "M", "Y", "K"], RGB: ["R", "G", "B"], GRAY: ["K"] }[p?.icc_meta?.device_space] || ["C", "M", "Y", "K"];
     box.querySelector("#fq-channels").innerHTML = names
       .map((n) => `<div class="field" style="max-width:110px"><label>${n} %</label><input class="input fq-v" data-ch="${n}" type="number" min="0" max="100" value="0"></div>`)
       .join("");
@@ -101,18 +116,26 @@ function buildForward(box) {
   renderChannels();
   box.querySelector("#fq-process").addEventListener("change", renderChannels);
 
-  box.querySelector("#fq-go").addEventListener("click", async () => {
-    const values = [...box.querySelectorAll(".fq-v")].map((i) => parseFloat(i.value) || 0);
+  const fqBtn = box.querySelector("#fq-go");
+  fqBtn.addEventListener("click", async () => {
+    const values = [...box.querySelectorAll(".fq-v")].map((i) => {
+      const v = parseFloat(i.value);
+      return Number.isFinite(v) ? v : 0;
+    });
+    fqBtn.disabled = true;
     try {
       const r = await apiPost("/api/recipes/forward", {
         process_id: box.querySelector("#fq-process").value,
         values,
       });
+      const hex = safeHex(r.hex);
       box.querySelector("#fq-result").innerHTML = `
-        <div class="swatch" style="background:${r.hex}"></div>
-        <div class="swatch-meta">Lab(${r.lab.join(", ")})<br>${r.hex}</div>`;
+        <div class="swatch" style="background:${hex}"></div>
+        <div class="swatch-meta">Lab(${r.lab.map((v) => Number(v).toFixed(2)).join(", ")})<br>${esc(r.hex)}</div>`;
     } catch (e) {
       toast(e.message, "err");
+    } finally {
+      fqBtn.disabled = false;
     }
   });
 }
@@ -135,33 +158,43 @@ function buildDeltaE(box) {
       <div id="de-result" style="display:flex;align-items:center;gap:10px"></div>
     </div>
   `;
-  box.querySelector("#de-go").addEventListener("click", async () => {
+  const deBtn = box.querySelector("#de-go");
+  deBtn.addEventListener("click", async () => {
     const g = (id) => parseFloat(box.querySelector("#" + id).value);
+    const lab1 = [g("de-l1"), g("de-a1"), g("de-b1")];
+    const lab2 = [g("de-l2"), g("de-a2"), g("de-b2")];
+    if (![...lab1, ...lab2].every(Number.isFinite)) {
+      return toast("请输入有效的 Lab 数值", "warn");
+    }
+    const tol = g("de-tol");
+    deBtn.disabled = true;
     try {
       const r = await apiPost("/api/delta-e/lab", {
-        lab1: [g("de-l1"), g("de-a1"), g("de-b1")],
-        lab2: [g("de-l2"), g("de-a2"), g("de-b2")],
-        tolerance: g("de-tol") || 2,
+        lab1,
+        lab2,
+        tolerance: Number.isFinite(tol) && tol > 0 ? tol : 2,
       });
       box.querySelector("#de-result").innerHTML = `
-        <span class="badge ${r.passed ? "badge-green" : "badge-red"}">ΔE ${r.delta_e} ${r.passed ? "· 通过" : "· 超差"}</span>
+        <span class="badge ${r.passed ? "badge-green" : "badge-red"}">ΔE ${esc(r.delta_e)} ${r.passed ? "· 通过" : "· 超差"}</span>
         <span class="swatch" style="background:${labToHex(r.lab1)}"></span>
         <span class="swatch" style="background:${labToHex(r.lab2)}"></span>`;
     } catch (e) {
       toast(e.message, "err");
+    } finally {
+      deBtn.disabled = false;
     }
   });
 }
 
 /* ---------- 色域对比 ---------- */
-async function buildGamut(box) {
+async function buildGamut(box, ctx) {
   box.innerHTML = `
     <div class="field-row" style="margin-bottom:12px">
       <div class="field" style="max-width:340px">
         <label>叠加工艺点集</label>
         <select class="input" id="gm-process">
           <option value="">不叠加</option>
-          ${processes.map((p) => `<option value="${p.id}">${esc(p.name)} · ${p.icc_meta.device_space}</option>`).join("")}
+          ${processes.map((p) => `<option value="${esc(p.id)}">${esc(p.name)} · ${esc(p.icc_meta?.device_space || "")}</option>`).join("")}
         </select>
       </div>
     </div>
@@ -181,46 +214,75 @@ async function buildGamut(box) {
     { color: "var(--yellow)", spaces: ["adobe-rgb"] },
   ];
   const canvas = box.querySelector("#gm-cie");
+  canvas.style.maxWidth = "440px";
+
+  // 缓存几何数据与工艺色域，resize/主题切换仅重绘画布，不触发网络请求
   let spectrum = null;
-  try {
-    spectrum = await fetchSpectrum();
-  } catch (_) { /* 光谱数据失败仍可画色域 */ }
-  const draw = async () => {
-    const series = [];
-    // sRGB 参考色域以嵌套底图为准（与工艺库详情页同源）
-    series.push({ points: SRGB_XY, color: "var(--accent)", fill: true, fillAlpha: 0.13 });
-    try {
-      const data = await apiGet("/api/visualization/gamut?spaces=dci-p3,adobe-rgb");
-      for (const s of SPECTRA) {
-        if (s.spaces[0] === "srgb") continue;
-        const poly = s.spaces.flatMap((sp) => data.gamut_polygons[sp] || []);
-        if (poly.length) series.push({ points: poly, color: s.color, fill: true });
-      }
-    } catch (_) { /* 忽略 */ }
+  let stdSeries = [
+    { points: SRGB_XY, color: "var(--accent)", fill: true, fillAlpha: 0.13 },
+  ];
+  const procGamutCache = new Map();
+  let activeProcSeries = null;
+  let gamutReqSeq = 0;
+
+  const redraw = () => {
+    const series = activeProcSeries ? [...stdSeries, activeProcSeries] : stdSeries;
+    drawCie(canvas, series, { spectrum });
+  };
+
+  // 一次性注册观察器，并在路由离开时销毁
+  const disposeRedraw = observeRedraw(canvas, redraw);
+  ctx.onCleanup(disposeRedraw);
+
+  // 初始加载光谱轨迹 + 标准色域多边形（只发一次请求）
+  const [specRes, gamutRes] = await Promise.all([
+    fetchSpectrum().catch(() => null),
+    apiGet("/api/visualization/gamut?spaces=dci-p3,adobe-rgb", { signal: ctx.signal }).catch(() => null),
+  ]);
+  if (!ctx.isActive()) return;
+  spectrum = specRes;
+  if (gamutRes?.gamut_polygons) {
+    for (const s of SPECTRA) {
+      if (s.spaces[0] === "srgb") continue;
+      const poly = s.spaces.flatMap((sp) => gamutRes.gamut_polygons[sp] || []);
+      if (poly.length) stdSeries.push({ points: poly, color: s.color, fill: true });
+    }
+  }
+  redraw();
+
+  const loadProcessGamut = async () => {
+    const seq = ++gamutReqSeq;
     const pid = box.querySelector("#gm-process").value;
-    if (pid) {
-      try {
-        const g = await apiGet(`/api/processes/${pid}/gamut?levels=7`);
-        series.push({
-          points: g.xy_points,
-          labPoints: g.lab_points,
-          hull: g.hull,
-          color: "var(--indigo)",
-          pointSize: 1.8,
-        });
-      } catch (e) {
+    if (!pid) {
+      activeProcSeries = null;
+      redraw();
+      return;
+    }
+    if (procGamutCache.has(pid)) {
+      activeProcSeries = procGamutCache.get(pid);
+      redraw();
+      return;
+    }
+    try {
+      const g = await apiGet(`/api/processes/${encodeURIComponent(pid)}/gamut?levels=7`, { signal: ctx.signal });
+      if (!ctx.isActive() || seq !== gamutReqSeq) return;
+      const entry = {
+        points: g.xy_points,
+        labPoints: g.lab_points,
+        hull: g.hull,
+        color: "var(--indigo)",
+        pointSize: 1.8,
+      };
+      procGamutCache.set(pid, entry);
+      activeProcSeries = entry;
+      redraw();
+    } catch (e) {
+      if (e.name !== "AbortError" && ctx.isActive() && seq === gamutReqSeq) {
         toast(`工艺色域加载失败：${e.message}`, "err");
       }
     }
-    drawCie(canvas, series, { spectrum });
-    if (!canvas.dataset.observed) {
-      canvas.dataset.observed = "1";
-      observeRedraw(canvas, draw);
-    }
   };
-  canvas.style.maxWidth = "440px";
-  draw();
-  box.querySelector("#gm-process").addEventListener("change", draw);
+  box.querySelector("#gm-process").addEventListener("change", loadProcessGamut);
 }
 
 /* ---------- 色彩转换器 ---------- */
@@ -250,20 +312,29 @@ function buildConvert(box) {
       <div id="cv-result" style="display:flex;align-items:center;gap:10px"></div>
     </div>
   `;
-  box.querySelector("#cv-go").addEventListener("click", async () => {
+  const cvBtn = box.querySelector("#cv-go");
+  cvBtn.addEventListener("click", async () => {
     const g = (id) => parseFloat(box.querySelector("#" + id).value);
+    const rgb = [g("cv-r"), g("cv-g"), g("cv-b")];
+    if (!rgb.every(Number.isFinite)) {
+      return toast("请输入有效的 RGB 数值", "warn");
+    }
+    cvBtn.disabled = true;
     try {
+      const toSpace = box.querySelector("#cv-to").value;
       const r = await apiPost("/api/convert", {
-        rgb: [g("cv-r"), g("cv-g"), g("cv-b")],
+        rgb,
         from_space: box.querySelector("#cv-from").value,
-        to_space: box.querySelector("#cv-to").value,
+        to_space: toSpace,
       });
-      const isLab = box.querySelector("#cv-to").value === "lab";
+      const isLab = toSpace === "lab";
       box.querySelector("#cv-result").innerHTML = `
         ${isLab ? `<div class="swatch" style="background:${labToHex(r.result)}"></div>` : ""}
-        <span class="swatch-meta">${box.querySelector("#cv-to").value.toUpperCase()}(${r.result.map((v) => Math.round(v * 1000) / 1000).join(", ")})</span>`;
+        <span class="swatch-meta">${esc(toSpace.toUpperCase())}(${r.result.map((v) => Math.round(v * 1000) / 1000).join(", ")})</span>`;
     } catch (e) {
       toast(e.message, "err");
+    } finally {
+      cvBtn.disabled = false;
     }
   });
 }
@@ -547,7 +618,7 @@ function renderRepairResult(box, result, dryRun, rescanned = false) {
     </div>`;
 }
 
-function buildIntegrity(box) {
+function buildIntegrity(box, ctx) {
   if (!box) return;
   box.innerHTML = `
     <div class="maintenance-toolbar">
@@ -584,12 +655,12 @@ function buildIntegrity(box) {
     rescanBtn.disabled = true;
     reportBox.innerHTML = `<div style="display:flex;align-items:center;gap:8px"><span class="spinner"></span><span class="swatch-meta">扫描工艺、派生记录、签样与 ICC 文件…</span></div>`;
     try {
-      report = await apiGet("/api/integrity/report");
-      if (!box.isConnected) return;
+      report = await apiGet("/api/integrity/report", { signal: ctx.signal });
+      if (!ctx.isActive() || !box.isConnected) return;
       renderIntegrityReport(reportBox, report);
       setReady(true);
     } catch (e) {
-      if (!box.isConnected) return;
+      if (e.name === "AbortError" || !ctx.isActive() || !box.isConnected) return;
       reportBox.innerHTML = `<div class="issue issue-error">${icon("xmark")}<span>${esc(e.message)}</span></div>
         <div style="margin-top:10px"><button class="btn btn-secondary btn-sm" id="integrity-retry">重试</button></div>`;
       reportBox.querySelector("#integrity-retry").addEventListener("click", refresh);
@@ -669,7 +740,7 @@ function dispStatusBadge(st) {
   return `<span class="${DISP_STATUS_BADGE[st?.status] || "badge badge-gray"}">${esc(st?.status_label || "未校准")}</span>`;
 }
 
-function buildDisplay(box) {
+function buildDisplay(box, ctx) {
   if (!box) return;
   const rows = displays.map((d) => {
     const st = d.status || {};
@@ -677,7 +748,7 @@ function buildDisplay(box) {
     const measLine = meas
       ? `<div class="row-sub">测量：${meas.patches} 块 · 白点 (${(meas.white_xy || []).map((v) => Number(v).toFixed(4)).join(", ") || "—"}) · 对比度 ${meas.contrast_ratio ?? "—"}:1${meas.luminance_cd_m2 != null ? ` · ${meas.luminance_cd_m2} cd/m²` : ""} · ${esc(meas.filename)}</div>`
       : "";
-    return `<div class="group-row" data-disp-id="${d.id}">
+    return `<div class="group-row" data-disp-id="${esc(d.id)}">
       <div class="grow">
         <div class="row-title">${esc(d.name)}${d.is_active ? '<span class="badge badge-blue" style="margin-left:6px">当前</span>' : ""} ${dispStatusBadge(st)}</div>
         <div class="row-sub">${esc(d.model || "型号未填")} · 目标 ${esc(d.targets.white_point)} / ${d.targets.luminance_cd_m2} cd/m² / ${d.targets.contrast_ratio}:1${st.expires_at ? ` · 到期 ${esc(st.expires_at)}` : ""}</div>
@@ -703,26 +774,31 @@ function buildDisplay(box) {
       iconName: "eye", title: "尚未登记显示器",
       desc: "登记显示器与校准确认后，软打样预览才会标记为可信；未登记时预览仅参考。",
     })}`;
-  box.querySelector("#disp-add")?.addEventListener("click", () => openDisplayCreate(box));
+  box.querySelector("#disp-add")?.addEventListener("click", () => openDisplayCreate(box, ctx));
   box.querySelectorAll("[data-disp-act]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const row = btn.closest("[data-disp-id]");
       const id = row?.dataset.dispId;
       const act = btn.dataset.dispAct;
       const disp = displays.find((d) => d.id === id);
+      const encId = encodeURIComponent(id);
       if (act === "activate") {
+        btn.disabled = true;
         try {
-          await apiPost(`/api/displays/${id}/activate`, {});
+          await apiPost(`/api/displays/${encId}/activate`, {});
           toast("已切换当前显示器", "ok");
-          refreshDisplayPane(box);
-        } catch (e) { toast(e.message, "err"); }
+          refreshDisplayPane(box, ctx);
+        } catch (e) {
+          btn.disabled = false;
+          toast(e.message, "err");
+        }
       } else if (act === "calibrate") {
-        openDisplayCalibration(disp, box);
+        openDisplayCalibration(disp, box, ctx);
       } else if (act === "measure") {
-        openDisplayMeasurement(disp, box);
+        openDisplayMeasurement(disp, box, ctx);
       } else if (act === "export-measure") {
         try {
-          const resp = await fetch(`/api/displays/${id}/measurements/latest`);
+          const resp = await fetch(`/api/displays/${encId}/measurements/latest`);
           if (!resp.ok) {
             let detail = "下载失败";
             try { detail = (await resp.json()).detail || detail; } catch (_) { /* 保留默认 */ }
@@ -736,7 +812,7 @@ function buildDisplay(box) {
         } catch (e) { toast(e.message, "err"); }
       } else if (act === "report") {
         try {
-          const report = await apiGet(`/api/displays/${id}/report`);
+          const report = await apiGet(`/api/displays/${encId}/report`);
           downloadDataUri(
             "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(report, null, 2)),
             `显示器校准-${report.display.name}.json`,
@@ -749,22 +825,31 @@ function buildDisplay(box) {
           confirmText: "删除",
         });
         if (!ok) return;
+        btn.disabled = true;
         try {
-          await apiDelete(`/api/displays/${id}`);
+          await apiDelete(`/api/displays/${encId}`);
           toast("显示器档案已删除", "ok");
-          refreshDisplayPane(box);
-        } catch (e) { toast(e.message, "err"); }
+          refreshDisplayPane(box, ctx);
+        } catch (e) {
+          btn.disabled = false;
+          toast(e.message, "err");
+        }
       }
     });
   });
 }
 
-async function refreshDisplayPane(box) {
-  displays = await apiGet("/api/displays").catch(() => []);
-  buildDisplay(box);
+async function refreshDisplayPane(box, ctx) {
+  try {
+    displays = await apiGet("/api/displays", { signal: ctx?.signal });
+    if (ctx && !ctx.isActive()) return;
+    buildDisplay(box, ctx);
+  } catch (e) {
+    if (e.name !== "AbortError") toast(e.message, "err");
+  }
 }
 
-function openDisplayCreate(box) {
+function openDisplayCreate(box, ctx) {
   const m = openModal(`
     <h3 class="card-title">${icon("eye")}新增显示器</h3>
     <div class="field-row">
@@ -790,7 +875,8 @@ function openDisplayCreate(box) {
     </div>
   `);
   m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
-  m.modal.querySelector("#dp-save").addEventListener("click", async () => {
+  const saveBtn = m.modal.querySelector("#dp-save");
+  saveBtn.addEventListener("click", async () => {
     const name = m.modal.querySelector("#dp-name").value.trim();
     if (!name) return toast("请填写显示器名称", "warn");
     const whitePoint = m.modal.querySelector("#dp-wp").value;
@@ -802,6 +888,7 @@ function openDisplayCreate(box) {
       white_point: whitePoint,
       profile_name: m.modal.querySelector("#dp-profile").value.trim(),
     } : null;
+    saveBtn.disabled = true;
     try {
       await apiPost("/api/displays", {
         name,
@@ -816,12 +903,15 @@ function openDisplayCreate(box) {
       });
       toast("显示器档案已创建", "ok");
       m.close();
-      refreshDisplayPane(box);
-    } catch (e) { toast(e.message, "err"); }
+      refreshDisplayPane(box, ctx);
+    } catch (e) {
+      saveBtn.disabled = false;
+      toast(e.message, "err");
+    }
   });
 }
 
-function openDisplayCalibration(disp, box) {
+function openDisplayCalibration(disp, box, ctx) {
   if (!disp) return;
   const whitePoint = disp.targets?.white_point || "D50";
   const m = openModal(`
@@ -845,13 +935,15 @@ function openDisplayCalibration(disp, box) {
     </div>
   `);
   m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
-  m.modal.querySelector("#dc-save").addEventListener("click", async () => {
+  const saveBtn = m.modal.querySelector("#dc-save");
+  saveBtn.addEventListener("click", async () => {
     const calDate = m.modal.querySelector("#dc-cal").value;
     if (!calDate) return toast("请填写校准日期", "warn");
     const lum = m.modal.querySelector("#dc-lum").value;
     const contrast = m.modal.querySelector("#dc-contrast").value;
+    saveBtn.disabled = true;
     try {
-      await apiPost(`/api/displays/${disp.id}/calibrations`, {
+      await apiPost(`/api/displays/${encodeURIComponent(disp.id)}/calibrations`, {
         calibrated_at: calDate,
         valid_months: Number(m.modal.querySelector("#dc-months").value) || 6,
         calibrator: m.modal.querySelector("#dc-calibrator").value.trim(),
@@ -863,12 +955,15 @@ function openDisplayCalibration(disp, box) {
       });
       toast("校准确认已保存", "ok");
       m.close();
-      refreshDisplayPane(box);
-    } catch (e) { toast(e.message, "err"); }
+      refreshDisplayPane(box, ctx);
+    } catch (e) {
+      saveBtn.disabled = false;
+      toast(e.message, "err");
+    }
   });
 }
 
-function openDisplayMeasurement(disp, box) {
+function openDisplayMeasurement(disp, box, ctx) {
   if (!disp) return;
   const m = openModal(`
     <h3 class="card-title">${icon("upload")}导入屏幕测量 · <span style="color:var(--label-2)">${esc(disp.name)}</span></h3>
@@ -881,26 +976,27 @@ function openDisplayMeasurement(disp, box) {
     </div>
   `);
   m.modal.querySelector("[data-cancel]").addEventListener("click", m.close);
-  m.modal.querySelector("#dm-save").addEventListener("click", async () => {
+  const saveBtn = m.modal.querySelector("#dm-save");
+  saveBtn.addEventListener("click", async () => {
     const input = m.modal.querySelector("#dm-file");
     const file = input.files && input.files[0];
     if (!file) return toast("请选择测量文件", "warn");
     const lum = m.modal.querySelector("#dm-lum").value;
     const query = { filename: file.name };
     if (lum !== "") query.white_luminance_cd_m2 = lum;
+    saveBtn.disabled = true;
     try {
       await apiPostRaw(
-        `/api/displays/${disp.id}/measurements`,
+        `/api/displays/${encodeURIComponent(disp.id)}/measurements`,
         query,
         new Uint8Array(await file.arrayBuffer()),
       );
       toast("屏幕测量已导入", "ok");
       m.close();
-      refreshDisplayPane(box);
-    } catch (e) { toast(e.message, "err"); }
+      refreshDisplayPane(box, ctx);
+    } catch (e) {
+      saveBtn.disabled = false;
+      toast(e.message, "err");
+    }
   });
-}
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }

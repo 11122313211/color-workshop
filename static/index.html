@@ -28,7 +28,7 @@
         <button class="nav-item" data-route="#/tools" data-nav="tools"><span data-icon="sliders"></span>工具箱</button>
       </nav>
       <div class="sidebar-foot">
-        <button class="theme-btn" id="theme-btn"><span data-icon="moon"></span><span id="theme-text">暗色</span></button>
+        <button class="theme-btn" id="theme-btn" type="button" data-theme-toggle aria-label="切换明暗主题"><span data-icon="moon"></span><span id="theme-text" data-theme-text>暗色</span></button>
         <span class="ver">v0.11.0</span>
       </div>
     </aside>
@@ -39,12 +39,13 @@
     </main>
 
     <!-- 底部标签栏（窄屏） -->
-    <nav class="tabbar">
-      <button class="nav-item" data-route="#/recipes"><span data-icon="wand"></span>配方</button>
-      <button class="nav-item" data-route="#/files"><span data-icon="doc"></span>印前</button>
-      <button class="nav-item" data-route="#/processes"><span data-icon="stack"></span>工艺</button>
-      <button class="nav-item" data-route="#/monitor"><span data-icon="chart"></span>监控</button>
-      <button class="nav-item" data-route="#/tools"><span data-icon="sliders"></span>工具</button>
+    <nav class="tabbar" aria-label="主导航">
+      <button class="nav-item" type="button" data-route="#/recipes"><span data-icon="wand"></span>配方</button>
+      <button class="nav-item" type="button" data-route="#/files"><span data-icon="doc"></span>印前</button>
+      <button class="nav-item" type="button" data-route="#/processes"><span data-icon="stack"></span>工艺</button>
+      <button class="nav-item" type="button" data-route="#/monitor"><span data-icon="chart"></span>监控</button>
+      <button class="nav-item" type="button" data-route="#/tools"><span data-icon="sliders"></span>工具</button>
+      <button class="nav-item" type="button" data-theme-toggle aria-label="切换明暗主题"><span data-icon="moon"></span><span data-theme-text>暗色</span></button>
     </nav>
   </div>
 

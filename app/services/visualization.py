@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import colour
 
-from ..algorithms.core import _rgb_batch_to_xyz, _sample_gamut_lab, compute_gamut_volume, gamut_coverage
+from ..algorithms.core import compute_gamut_volume, convert_color, delta_e_batch, gamut_coverage
 
 # 光谱轨迹计算结果缓存（CMF 数据固定，进程内只需计算一次）
 _spectrum_cache: list[dict] | None = None
@@ -27,7 +27,7 @@ def cie1931_spectrum() -> list[dict]:
     """
     global _spectrum_cache
     if _spectrum_cache is not None:
-        return _spectrum_cache
+        return [dict(item) for item in _spectrum_cache]
 
     cmfs = colour.MSDS_CMFS["CIE 1931 2 Degree Standard Observer"]
     wavelengths = np.arange(380, 701, 1)
@@ -55,7 +55,7 @@ def cie1931_spectrum() -> list[dict]:
         for wl, (px, py), (r, g, b) in zip(wavelengths, xy[:, :2], rgb8)
     ]
     _spectrum_cache = locus
-    return locus
+    return [dict(item) for item in locus]
 
 
 def spectrum_locus() -> dict:
@@ -110,17 +110,20 @@ def delta_e_distribution(
     space: str = "srgb",
     method: str = "cie2000",
 ) -> dict:
-    """生成 ΔE 分布数据：每个测量点与目标的色差。"""
-    from ..algorithms import delta_e_from_rgb
+    """生成 ΔE 分布数据：每个测量点与目标的色差（向量化批量计算）。"""
     distribution = []
-    for i, rgb in enumerate(measured_points):
-        de = delta_e_from_rgb(rgb, target_rgb, space, method)
-        distribution.append({
-            "index": i,
-            "delta_e": round(de, 4),
-            "passed": de <= 2.0,
-            "rgb": [round(v, 4) for v in rgb],
-        })
+    if measured_points:
+        target_lab = convert_color(target_rgb, space, "lab")
+        measured_labs = [convert_color(rgb, space, "lab") for rgb in measured_points]
+        des = delta_e_batch(measured_labs, target_lab, method)
+        for i, (rgb, de_val) in enumerate(zip(measured_points, des)):
+            de = float(de_val)
+            distribution.append({
+                "index": i,
+                "delta_e": round(de, 4),
+                "passed": de <= 2.0,
+                "rgb": [round(float(v), 4) for v in rgb],
+            })
     return {
         "target_rgb": target_rgb,
         "distribution": distribution,

@@ -3,10 +3,9 @@
 import { apiGet, apiPost, downloadCsv } from "../api.js";
 import { icon } from "../icons.js";
 import {
-  toast, emptyState, statusBadge, labToHex,
+  toast, emptyState, statusBadge, labToHex, esc,
   recipeLine, sparkline, disclosure, bindDisclosures, openModal,
 } from "../components.js";
-import { updateNavCount } from "./shell.js";
 
 let state = {
   processes: [],
@@ -39,8 +38,8 @@ export async function renderRecipesView(view, params = {}) {
       <div style="display:flex; gap:10px; margin-top:12px; align-items:center; flex-wrap:wrap">
         <button class="btn btn-ghost btn-sm" id="btn-add-row">${icon("plus")}添加颜色</button>
         <span style="flex:1"></span>
-        <label style="font-size:13px;color:var(--label-2)">容差 ΔE</label>
-        <input class="input" id="tolerance" type="number" step="0.1" min="0.1" style="width:80px" value="2.0">
+        <label for="tolerance" style="font-size:13px;color:var(--label-2)">容差 ΔE</label>
+        <input class="input" id="tolerance" type="number" step="0.1" min="0.1" style="width:80px" value="${esc(state.tolerance)}">
         <button class="btn" id="btn-predict">${icon("wand")}开始预测</button>
       </div>
       ${disclosure("粘贴批量数据（CSV / 制表符分隔，每行：名称,L,a,b）", `
@@ -53,9 +52,11 @@ export async function renderRecipesView(view, params = {}) {
   `;
 
   bindDisclosures(view);
-  await loadProcesses(view);
+  const isActive = params.isActive || (() => true);
+  await loadProcesses(view, params.signal, isActive);
+  if (!isActive()) return;
   renderRows(view);
-  bindEvents(view);
+  bindEvents(view, isActive);
   if (state.results) renderResults(view, state.results);
 }
 
@@ -68,14 +69,19 @@ function defaultRows() {
 }
 
 /* ---------- 工艺选择 ---------- */
-async function loadProcesses(view) {
+async function loadProcesses(view, signal, isActive = () => true) {
   try {
-    state.processes = await apiGet("/api/processes");
+    state.processes = await apiGet("/api/processes", { signal });
   } catch (e) {
-    view.querySelector("#process-picker").innerHTML = `<div class="issue issue-warn">${icon("warn")}<span>${e.message}</span></div>`;
+    if (e && e.name === "AbortError") return;
+    if (!isActive()) return;
+    const picker = view.querySelector("#process-picker");
+    if (picker) picker.innerHTML = `<div class="issue issue-warn">${icon("warn")}<span>${esc(e.message)}</span></div>`;
     return;
   }
+  if (!isActive()) return;
   const box = view.querySelector("#process-picker");
+  if (!box) return;
 
   if (!state.processes.length) {
     box.innerHTML = emptyState({
@@ -94,20 +100,13 @@ async function loadProcesses(view) {
   box.innerHTML = `<div style="display:flex; gap:10px; flex-wrap:wrap">${state.processes
     .map(
       (p) => `
-      <button class="proc-chip ${p.id === state.processId ? "active" : ""}" data-id="${p.id}">
-        <span class="badge ${p.icc_meta.device_space === "CMYK" ? "badge-blue" : "badge-gray"}">${p.icc_meta.device_space}</span>
+      <button class="proc-chip ${p.id === state.processId ? "active" : ""}" data-id="${esc(p.id)}">
+        <span class="badge ${p.icc_meta.device_space === "CMYK" ? "badge-blue" : "badge-gray"}">${esc(p.icc_meta.device_space)}</span>
         <span style="font-weight:600">${esc(p.name)}</span>
         ${p.paper ? `<span class="chip">${esc(p.paper)}</span>` : ""}
       </button>`
     )
-    .join("")}</div>
-  <style>
-    .proc-chip { display:inline-flex; align-items:center; gap:8px; padding:9px 14px; border-radius:12px;
-      border:1.5px solid var(--separator); background:var(--card); cursor:pointer; font-size:14px;
-      transition: border-color .15s, background .15s; color: var(--label); }
-    .proc-chip:hover { border-color: var(--accent); }
-    .proc-chip.active { border-color: var(--accent); background: var(--accent-soft); }
-  </style>`;
+    .join("")}</div>`;
 
   box.querySelectorAll(".proc-chip").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -120,6 +119,7 @@ async function loadProcesses(view) {
 /* ---------- LAB 输入表 ---------- */
 function renderRows(view) {
   const table = view.querySelector("#lab-table");
+  if (!table) return;
   table.innerHTML = `
     <div class="lab-row lab-head">
       <span>名称</span><span>L* (0-100)</span><span>a*</span><span>b*</span><span></span>
@@ -129,9 +129,9 @@ function renderRows(view) {
         (r, i) => `
       <div class="lab-row" data-i="${i}">
         <input class="input" data-k="label" value="${esc(r.label)}" placeholder="名称">
-        <input class="input" data-k="L" type="number" step="0.1" value="${r.L}" placeholder="L">
-        <input class="input" data-k="a" type="number" step="0.1" value="${r.a}" placeholder="a">
-        <input class="input" data-k="b" type="number" step="0.1" value="${r.b}" placeholder="b">
+        <input class="input" data-k="L" type="number" step="0.1" value="${esc(r.L)}" placeholder="L">
+        <input class="input" data-k="a" type="number" step="0.1" value="${esc(r.a)}" placeholder="a">
+        <input class="input" data-k="b" type="number" step="0.1" value="${esc(r.b)}" placeholder="b">
         <button class="icon-btn del-row" title="删除">${icon("trash")}</button>
       </div>`
       )
@@ -144,8 +144,8 @@ function renderRows(view) {
         state.rows[i][inp.dataset.k] = inp.value;
         if (inp.dataset.k !== "label") paintRow(row, i);
       });
-      if (inp.dataset.k !== "label") paintRow(row, i);
     });
+    paintRow(row, i);
     row.querySelector(".del-row").addEventListener("click", () => {
       if (state.rows.length <= 1) return toast("至少保留一行", "warn");
       state.rows.splice(i, 1);
@@ -162,6 +162,13 @@ function paintRow(row, i) {
   }
 }
 
+function _strictNum(val) {
+  const s = String(val ?? "").trim();
+  if (!s) return NaN;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function parseCsv(text) {
   return text
     .trim()
@@ -169,19 +176,21 @@ function parseCsv(text) {
     .map((line) => line.split(/[,\t;]+/).map((s) => s.trim()))
     .filter((cells) => cells.length >= 3)
     .map((cells) => {
-      if (cells.length >= 4 && Number.isNaN(parseFloat(cells[0])) === false && !Number.isNaN(parseFloat(cells[1]))) {
-        return { label: "", L: cells[0], a: cells[1], b: cells[2] }; // L,a,b
+      if (cells.length >= 3 && !Number.isNaN(_strictNum(cells[0])) && !Number.isNaN(_strictNum(cells[1])) && !Number.isNaN(_strictNum(cells[2]))) {
+        return { label: "", L: String(_strictNum(cells[0])), a: String(_strictNum(cells[1])), b: String(_strictNum(cells[2])) };
       }
       // 尝试 名称,L,a,b
       const tail = cells.slice(-3);
+      const nums = tail.map(_strictNum);
+      if (nums.some(Number.isNaN)) return null;
       const label = cells.slice(0, cells.length - 3).join(" ").trim();
-      return { label, L: tail[0], a: tail[1], b: tail[2] };
+      return { label, L: String(nums[0]), a: String(nums[1]), b: String(nums[2]) };
     })
-    .filter((r) => [r.L, r.a, r.b].every((v) => !Number.isNaN(parseFloat(v))));
+    .filter(Boolean);
 }
 
 /* ---------- 事件 ---------- */
-function bindEvents(view) {
+function bindEvents(view, isActive = () => true) {
   view.querySelector("#btn-add-row").addEventListener("click", () => {
     state.rows.push({ label: "", L: "", a: "", b: "" });
     renderRows(view);
@@ -199,11 +208,11 @@ function bindEvents(view) {
     state.tolerance = parseFloat(e.target.value) || 2.0;
   });
 
-  view.querySelector("#btn-predict").addEventListener("click", () => predict(view));
+  view.querySelector("#btn-predict").addEventListener("click", () => predict(view, isActive));
   view.querySelector("#btn-export").addEventListener("click", () => exportCsv());
 }
 
-async function predict(view) {
+async function predict(view, isActive = () => true) {
   const btn = view.querySelector("#btn-predict");
   const targets = state.rows
     .map((r) => ({
@@ -230,13 +239,19 @@ async function predict(view) {
       method: "cie2000",
     });
     state.results = resp;
+    if (!isActive()) return;
     renderResults(view, resp);
   } catch (e) {
-    area.innerHTML = `<div class="card"><div class="issue issue-error">${icon("xmark")}<span>${esc(e.message)}</span></div></div>`;
+    if (e && e.name === "AbortError") return;
+    if (area && area.isConnected) {
+      area.innerHTML = `<div class="card"><div class="issue issue-error">${icon("xmark")}<span>${esc(e.message)}</span></div></div>`;
+    }
     toast(e.message, "err");
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = `${icon("wand")}开始预测`;
+    if (btn && btn.isConnected) {
+      btn.disabled = false;
+      btn.innerHTML = `${icon("wand")}开始预测`;
+    }
   }
 }
 
@@ -339,12 +354,12 @@ function verificationBlock(v) {
 }
 
 function openVerifyModal(view, r, idx) {
-  const proc = state.processes.find((p) => p.id === state.processId);
+  const proc = state.processes.find((p) => p.id === (state.results?.process_id || state.processId));
   const procChip = proc
     ? `<span class="chip chip-mono">${esc(proc.name)}${proc.paper ? ` · ${esc(proc.paper)}` : ""}</span>`
     : "";
   const m = openModal(`
-    <h3 class="card-title">${icon("target")}实测验证 · ${r.label || `颜色 ${idx + 1}`} ${procChip}</h3>
+    <h3 class="card-title">${icon("target")}实测验证 · ${esc(r.label || `颜色 ${idx + 1}`)} ${procChip}</h3>
     <p class="card-desc">将当前配方打印后，用分光光度计测量色块，把实测 LAB 填入下方。系统将计算偏差并给出修正配方（模型误差补偿 p' = t − (m − p)）。</p>
     <div class="lab-row">
       <span class="lab-head">实测 L*</span><span class="lab-head">a*</span><span class="lab-head">b*</span><span></span><span></span>
@@ -386,22 +401,28 @@ function openVerifyModal(view, r, idx) {
   m.modal.querySelector("#vm-b").value = r.predicted_lab[2];
 
   m.modal.querySelector("#vm-cancel").addEventListener("click", m.close);
-  m.modal.querySelector("#vm-ok").addEventListener("click", async () => {
+  const okBtn = m.modal.querySelector("#vm-ok");
+  okBtn.addEventListener("click", async () => {
     const lab = [
       parseFloat(m.modal.querySelector("#vm-l").value),
       parseFloat(m.modal.querySelector("#vm-a").value),
       parseFloat(m.modal.querySelector("#vm-b").value),
     ];
     if (lab.some(Number.isNaN)) return toast("请填写完整实测 LAB", "warn");
+    okBtn.disabled = true;
     try {
-      // 找到该结果对应的配方记录（同工艺 + 同目标 LAB）
-      const records = await apiGet(`/api/recipes?process_id=${state.processId}`);
-      const doc = records.find(
-        (d) => d.target_lab[0] === r.target_lab[0] && d.target_lab[1] === r.target_lab[1] && d.target_lab[2] === r.target_lab[2]
-      );
-      if (!doc) throw new Error("未找到对应配方记录，请重新预测");
+      let recipeId = r.recipe_id || "";
+      if (!recipeId) {
+        const pid = state.results?.process_id || state.processId;
+        const records = await apiGet(`/api/recipes?process_id=${encodeURIComponent(pid)}`);
+        const doc = records.find(
+          (d) => d.target_lab[0] === r.target_lab[0] && d.target_lab[1] === r.target_lab[1] && d.target_lab[2] === r.target_lab[2]
+        );
+        if (!doc) throw new Error("未找到对应配方记录，请重新预测");
+        recipeId = doc.id;
+      }
       const v = await apiPost("/api/recipes/verify", {
-        recipe_id: doc.id,
+        recipe_id: recipeId,
         measured_lab: lab,
         measurement_session_id: m.modal.querySelector("#vm-sess").value || "",
       });
@@ -411,6 +432,8 @@ function openVerifyModal(view, r, idx) {
       toast(`验证完成：ΔE ${v.delta_e_measured} → ${v.delta_e_corrected}`, v.improved ? "ok" : "warn");
     } catch (e) {
       toast(e.message, "err");
+    } finally {
+      if (okBtn.isConnected) okBtn.disabled = false;
     }
   });
 }
@@ -440,8 +463,4 @@ function exportCsv() {
 
 function fmtLab(lab) {
   return lab.map((v) => Math.round(v * 10) / 10).join(", ");
-}
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }

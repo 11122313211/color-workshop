@@ -18,11 +18,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..services.lifecycle import archived_detail, is_archived
 from ..services.measurements import MEASUREMENT_CONDITIONS, MeasurementStore
 from ..services.processes import ProcessStore
+from ._http import (
+    MAX_EVAL_JSON_BYTES,
+    MAX_MEASUREMENT_BYTES,
+    key_error_msg,
+    read_body_limited,
+)
 
 router = APIRouter(prefix="/api/qc", tags=["qc"])
 
@@ -62,24 +71,32 @@ async def import_measurement(
     首次导入可留空 session_id，响应携带会话 id 供后续文件追加；
     每次导入后对整个会话重新分级（复测一致性/离群是会话级属性）。
     """
-    data = await request.body()
+    data = await read_body_limited(
+        request,
+        MAX_MEASUREMENT_BYTES,
+        too_large_detail="测量文件过大（>2MB）",
+    )
     if not data:
         raise HTTPException(400, "缺少测量文件内容（raw bytes body）")
-    if len(data) > 2_000_000:
-        raise HTTPException(413, "测量文件过大（>2MB）")
 
     proc_doc = _process_or_none(process_id)
     if proc_doc is not None:
         _ensure_active(proc_doc)
+    effective_proc = proc_doc
     if session_id:
         session = measurements.get_session(session_id)
         if session is None:
             raise HTTPException(404, "测量会话不存在")
         bound_pid = session.get("process_id") or ""
-        if bound_pid and not (proc_doc and proc_doc.get("id") == bound_pid):
+        if bound_pid:
+            if proc_doc is not None and proc_doc.get("id") != bound_pid:
+                raise HTTPException(422, "传入的 process_id 与该会话绑定的工艺不一致")
             bound_proc = _processes.get(bound_pid)
             if bound_proc is not None:
                 _ensure_active(bound_proc)
+                if effective_proc is None:
+                    # 追加导入未重复传 process_id 时自动继承会话绑定工艺，确保纸白校验不丢失
+                    effective_proc = bound_proc
         # 追加导入时允许更新复测声明（会话级属性，改后整体重分级）
         if repeat_mode and repeat_mode != session.get("repeat_mode"):
             measurements.update_session(session_id, repeat_mode=repeat_mode)
@@ -95,7 +112,9 @@ async def import_measurement(
     from ..services.cgats import CgatsParseError
 
     try:
-        record = measurements.add_record(session_id, filename, data, proc_doc)
+        record = await asyncio.to_thread(
+            measurements.add_record, session_id, filename, data, effective_proc
+        )
     except CgatsParseError as e:
         raise HTTPException(422, f"测量文件解析失败: {e}") from e
     session = measurements.get_session(session_id)
@@ -235,8 +254,13 @@ async def add_evaluation_entry(
     """录入一位评价人的打分（JSON body：{指标: 1-5, ...}）。"""
     from ..services.evaluations import EvaluationStore
 
+    raw = await read_body_limited(
+        request,
+        MAX_EVAL_JSON_BYTES,
+        too_large_detail="打分请求体过大（>256KB）",
+    )
     try:
-        scores = await request.json()
+        scores = json.loads(raw.decode("utf-8"))
     except Exception as e:
         raise HTTPException(422, "打分 body 需为 JSON 对象 {指标: 1-5}") from e
     if not isinstance(scores, dict):
@@ -252,7 +276,7 @@ async def add_evaluation_entry(
     try:
         doc = store.add_entry(evaluation_id, evaluator, scores)
     except KeyError as e:
-        raise HTTPException(404, str(e)) from e
+        raise HTTPException(404, key_error_msg(e, "评价不存在")) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
 
@@ -340,7 +364,13 @@ def calibration_form(
 
     result = generate_calibration_form(process_name=proc.get("name", ""), dpi=dpi)
     result["process"] = {"id": proc["id"], "name": proc.get("name", "")}
-    result["reference"] = build_reference(proc)
+    try:
+        result["reference"] = build_reference(proc)
+    except (FileNotFoundError, OSError) as e:
+        raise HTTPException(
+            409,
+            detail={"code": "MISSING_ICC", "message": "工艺 ICC 文件缺失或不可读，无法计算参考值"},
+        ) from e
     return result
 
 
@@ -360,7 +390,13 @@ def calibration_report_ep(
     from ..services.calibration import calibration_report
     from ..services.calibration_history import CalibrationStore, compare_rounds
 
-    report = calibration_report(proc, session)
+    try:
+        report = calibration_report(proc, session)
+    except (FileNotFoundError, OSError) as e:
+        raise HTTPException(
+            409,
+            detail={"code": "MISSING_ICC", "message": "工艺 ICC 文件缺失或不可读，无法生成校准报告"},
+        ) from e
     report["session_id"] = session_id
     report["process"] = {"id": proc["id"], "name": proc.get("name", "")}
     prev = CalibrationStore().latest_for_process(proc["id"], proc.get("icc_sha256"),
@@ -376,7 +412,7 @@ def calibration_apply(
 ):
     """把校准报告的逐通道墨量建议写入补偿模型（V0.7 第 3 步，预测立即联动）。
 
-    V0.8：同时落库为校准轮次（同会话幂等更新），响应含轮次号与「较上轮」判定。
+    V0.8：同时落库为校准轮次（同会话幂等更新，不重复累加偏置），响应含轮次号与「较上轮」判定。
     """
     session = measurements.get_session(session_id)
     if session is None:
@@ -391,17 +427,30 @@ def calibration_apply(
     )
     from ..services.compensation import CompensationStore
 
-    report = calibration_report(proc, session)
+    try:
+        report = calibration_report(proc, session)
+    except (FileNotFoundError, OSError) as e:
+        raise HTTPException(
+            409,
+            detail={"code": "MISSING_ICC", "message": "工艺 ICC 文件缺失或不可读，无法应用校准"},
+        ) from e
     if report["overall"] == "n/a":
         raise HTTPException(422, "会话未按校准版测量（色块命中不足），无法应用建议")
     store = CalibrationStore()
     prev = store.latest_for_process(proc["id"], proc.get("icc_sha256"),
                                     exclude_session=session_id)
     verdict = compare_rounds(report, prev) if prev else None
-    bias_before = (CompensationStore().get(proc["id"]) or {}).get("bias_device")
-    doc = apply_suggestions(proc, report)
+    # 同会话重复应用时以原有轮次的 bias_before 为基准，保证真正幂等不翻倍累加
+    existing_round = store.get_by_session(session_id)
+    if existing_round and existing_round.get("icc_sha256") == proc.get("icc_sha256"):
+        base_bias = existing_round.get("bias_before") or [0.0, 0.0, 0.0, 0.0]
+        bias_before = existing_round.get("bias_before") or []
+    else:
+        base_bias = None
+        bias_before = (CompensationStore().get(proc["id"]) or {}).get("bias_device") or []
+    doc = apply_suggestions(proc, report, base_bias=base_bias)
     round_doc = store.save_round(proc["id"], proc.get("icc_sha256"), session_id, report,
-                                 bias_before or [], doc["bias_device"])
+                                 bias_before, doc["bias_device"])
     return {
         "applied": True,
         "session_id": session_id,
@@ -463,15 +512,20 @@ def delete_measurement(
     proc_doc = _process_or_none(process_id)
     if proc_doc is not None:
         _ensure_active(proc_doc)
+    effective_proc = proc_doc
     session = measurements.get_session(session_id)
     if session is not None:
         bound_pid = session.get("process_id") or ""
-        if bound_pid and not (proc_doc and proc_doc.get("id") == bound_pid):
+        if bound_pid:
+            if proc_doc is not None and proc_doc.get("id") != bound_pid:
+                raise HTTPException(422, "传入的 process_id 与该会话绑定的工艺不一致")
             bound_proc = _processes.get(bound_pid)
             if bound_proc is not None:
                 _ensure_active(bound_proc)
+                if effective_proc is None:
+                    effective_proc = bound_proc
     if record_id:
-        if not measurements.delete_record(session_id, record_id, proc_doc):
+        if not measurements.delete_record(session_id, record_id, effective_proc):
             raise HTTPException(404, "测量记录不存在")
         session = measurements.get_session(session_id)
         return {"status": "deleted", "session": session}

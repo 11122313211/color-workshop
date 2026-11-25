@@ -3,12 +3,12 @@
 输入为 M1 可靠性管线输出的**已序列化记录**（仅消费 reliability=verified 且
 density_ok=True 的记录——分级数据流向：QC 指标不消费 warning/rejected）。
 
-指标（课程实践公式，工业通行口径）：
+指标（工业通行 GATF 口径）：
 - 色强度 DH = max(Dc, Dm, Dy)（滤色密度最大值）
 - 色相误差 = (DM − DL) / (DH − DL) × 100%
 - 灰度 = DL / DH × 100%
 - 色效率 = (1 − (DM + DL) / 2DH) × 100%
-- 色纯度（课程别名） = (DH − DL) / DH × 100%
+- 色纯度（行业别名） = (DH − DL) / DH × 100%
 - Murray–Davies 网点面积率 α = (1 − 10^−Dt) / (1 − 10^−Ds) × 100%
 - TVI（网点增大）= α实测 − 名义网点率
 
@@ -23,6 +23,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
+
+from .measurement_qa import WHITE_LABELS
 
 # 滤色通道与颜色的对应：实地块 C 的本通道滤色为 C
 CHANNEL_KEYS = ("C", "M", "Y")
@@ -47,7 +50,7 @@ class InkMetrics:
     hue_error: float      # 色相误差 0-1
     grayness: float       # 灰度 0-1
     efficiency: float     # 色效率 0-1
-    purity: float         # 色纯度 0-1（课程别名口径）
+    purity: float         # 色纯度 0-1（行业别名口径）
     densities: dict       # 四滤色密度
 
 
@@ -58,9 +61,14 @@ def ink_metrics(label: str, densities: dict) -> InkMetrics | None:
     H/L/M 取 C/M/Y 三滤色的最大/最小/中间值。
     """
     vals = [densities.get(c) for c in CHANNEL_KEYS]
-    if any(v is None for v in vals) or any(v <= 0 for v in vals):
+    if any(v is None for v in vals):
         return None
     dc, dm, dy = (float(v) for v in vals)
+    if not all(math.isfinite(v) for v in (dc, dm, dy)) or any(v <= 0 for v in (dc, dm, dy)):
+        return None
+    dk = float(densities.get("K", 0.0) or 0.0)
+    if not math.isfinite(dk):
+        dk = 0.0
     dh, dl = max(dc, dm, dy), min(dc, dm, dy)
     dm_mid = dc + dm + dy - dh - dl  # 中间值
     if dh <= 0 or dh <= dl:
@@ -73,7 +81,7 @@ def ink_metrics(label: str, densities: dict) -> InkMetrics | None:
         grayness=round(dl / dh, 4),
         efficiency=round(1 - (dm_mid + dl) / (2 * dh), 4),
         purity=round((dh - dl) / dh, 4),
-        densities={"C": dc, "M": dm, "Y": dy, "K": float(densities.get("K", 0.0))},
+        densities={"C": dc, "M": dm, "Y": dy, "K": dk},
     )
 
 
@@ -179,29 +187,21 @@ def density_stats(values: list[float]) -> dict | None:
 # 会话级聚合（只消费 verified）
 # ---------------------------------------------------------------------------
 
-_SOLID_RE = None  # 延迟编译
-_TINT_RE = None
-_GB_RE = None
-
-
-def _compile_patterns():
-    global _SOLID_RE, _TINT_RE, _GB_RE
-    import re
-
-    if _SOLID_RE is None:
-        # V0.6：黑版纳入实地/网点解析（k75 参与 K 值计算）
-        _SOLID_RE = re.compile(r"^([KCMY])$", re.IGNORECASE)
-        _TINT_RE = re.compile(r"^([KCMY])(\d{1,3})$", re.IGNORECASE)
-        _GB_RE = re.compile(r"^GB", re.IGNORECASE)
+# V0.6：黑版纳入实地/网点解析（k75 参与 K 值计算）；模块级预编译保证线程安全
+_SOLID_RE = re.compile(r"^([KCMY])$", re.IGNORECASE)
+_TINT_RE = re.compile(r"^([KCMY])(\d{1,3})$", re.IGNORECASE)
+_GB_RE = re.compile(r"^GB", re.IGNORECASE)
 
 
 def parse_ink_label(label: str) -> tuple[str, int | None]:
-    """解析油墨标签：K/C/M/Y 实地 → (channel, None)；k60/c75/m30 网点 → (channel, nominal)。"""
-    _compile_patterns()
+    """解析油墨标签：K/C/M/Y 实地 → (channel, None)；k60/c75/m30/C100 网点 → (channel, nominal)。"""
     s = str(label).strip()
     m = _TINT_RE.match(s)
     if m:
-        return m.group(1).upper(), int(m.group(2))
+        nominal = int(m.group(2))
+        if 0 < nominal <= 100:
+            return m.group(1).upper(), nominal
+        return "", None
     m = _SOLID_RE.match(s)
     if m:
         return m.group(1).upper(), None
@@ -210,8 +210,19 @@ def parse_ink_label(label: str) -> tuple[str, int | None]:
 
 def is_gray_balance_label(label: str) -> bool:
     """灰平衡块标签（GB 前缀，如样张的 GB1/GB2/GB3）。"""
-    _compile_patterns()
     return bool(_GB_RE.match(str(label).strip()))
+
+
+def _mean_densities(dens_list: list[dict]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for ch in ("C", "M", "Y", "K"):
+        vals = [
+            float(d[ch]) for d in dens_list
+            if d.get(ch) is not None and math.isfinite(float(d[ch]))
+        ]
+        if vals:
+            out[ch] = sum(vals) / len(vals)
+    return out
 
 
 def ink_quality_from_records(records: list[dict]) -> dict:
@@ -224,13 +235,12 @@ def ink_quality_from_records(records: list[dict]) -> dict:
           uniformity: [{ink, n, mean, std, cv}],
           verified_records, skipped_records, source_records: [filename]}。
     """
-    _compile_patterns()
     verified = [r for r in records if r.get("reliability") == "verified" and r.get("density_ok")]
     skipped = len(records) - len(verified)
 
-    inks: dict[str, dict] = {}
-    solids: dict[str, dict] = {}
-    tints: dict[str, list[tuple[int, dict]]] = {}
+    solid_acc: dict[str, list[dict]] = {}
+    solid_label: dict[str, str] = {}
+    tint_acc: dict[tuple[str, int], list[dict]] = {}
     sources: list[str] = []
     # 叠印色按标签聚合（复测对取均值密度，避免同标签多记录重复输出）
     over_acc: dict[str, list[dict]] = {}
@@ -252,10 +262,12 @@ def ink_quality_from_records(records: list[dict]) -> dict:
                     b = float(lab[2])
                 except (TypeError, ValueError, IndexError):
                     a = b = None
-                if a is not None and b is not None:
+                if a is not None and b is not None and math.isfinite(a) and math.isfinite(b):
                     acc = gray_acc.setdefault(label, {"l": [], "a": [], "b": []})
                     try:
-                        acc["l"].append(float(lab[0]))
+                        lv = float(lab[0])
+                        if math.isfinite(lv):
+                            acc["l"].append(lv)
                     except (TypeError, ValueError):
                         pass
                     acc["a"].append(a)
@@ -264,49 +276,83 @@ def ink_quality_from_records(records: list[dict]) -> dict:
                 continue
             channel, nominal = parse_ink_label(label)
             if channel == "K" and nominal is None:
-                # 黑版实地：色相类指标无 GATF 口径，仅入 solids 供 K 值/TVI 计算
                 dk = dens.get("K")
-                if dk is not None and float(dk) > 0:
-                    payload = {
-                        "label": label,
-                        "strength": round(float(dk), 4),
-                        "hue_error": None,
-                        "grayness": None,
-                        "efficiency": None,
-                        "purity": None,
-                        "densities": {
-                            "C": float(dens.get("C", 0.0) or 0.0),
-                            "M": float(dens.get("M", 0.0) or 0.0),
-                            "Y": float(dens.get("Y", 0.0) or 0.0),
-                            "K": float(dk),
-                        },
-                    }
-                    inks["K"] = payload
-                    solids["K"] = {**payload, "_channel": "K"}
+                if dk is not None and math.isfinite(float(dk)) and float(dk) > 0:
+                    solid_acc.setdefault("K", []).append(dens)
+                    solid_label.setdefault("K", label)
                     uniform_samples.setdefault("K", []).append(float(dk))
                 continue
-            m = ink_metrics(label, dens)
-            if m is None:
-                continue
-            payload = {
-                "label": label,
-                "strength": m.strength,
-                "hue_error": m.hue_error,
-                "grayness": m.grayness,
-                "efficiency": m.efficiency,
-                "purity": m.purity,
-                "densities": m.densities,
-            }
             if nominal is None and channel:
-                inks[channel] = payload
-                solids[channel] = {**payload, "_channel": channel}
-                uniform_samples.setdefault(channel, []).append(float(m.densities.get(channel, 0.0) or 0.0))
-            elif nominal is not None:
-                tints.setdefault(channel, []).append((nominal, dens))
-            elif label.strip().upper() not in ("W", "K") and not is_gray_balance_label(label):
-                # 叠印色（R/G/B/10M10Y 等）按标签聚合原始密度，均值后统一算指标
-                over_acc.setdefault(label.strip().upper(), []).append(
-                    {c: float(v) for c, v in dens.items() if v is not None})
+                m = ink_metrics(label, dens)
+                if m is not None:
+                    solid_acc.setdefault(channel, []).append(dens)
+                    solid_label.setdefault(channel, label)
+                    uniform_samples.setdefault(channel, []).append(float(m.densities.get(channel, 0.0) or 0.0))
+                continue
+            if nominal is not None and channel:
+                tint_acc.setdefault((channel, nominal), []).append(dens)
+                continue
+            low = label.strip().lower()
+            if low not in WHITE_LABELS and label.strip().upper() not in ("W", "K") and not is_gray_balance_label(label):
+                if ink_metrics(label, dens) is not None:
+                    over_acc.setdefault(label.strip().upper(), []).append(
+                        {c: float(v) for c, v in dens.items() if v is not None and math.isfinite(float(v))}
+                    )
+
+    # 若某通道无纯字母实地（如校准版标签 C100/K100），以 100% 梯级兜底作为实地
+    for ch in INK_KEYS:
+        if ch not in solid_acc and (ch, 100) in tint_acc:
+            solid_acc[ch] = list(tint_acc[(ch, 100)])
+            solid_label[ch] = f"{ch}100"
+            for d in solid_acc[ch]:
+                v = d.get(ch)
+                if v is not None and math.isfinite(float(v)) and float(v) > 0:
+                    uniform_samples.setdefault(ch, []).append(float(v))
+
+    # 实地按通道聚合均值，确保 K 值/TVI/叠印率与复测均值口径一致
+    inks: dict[str, dict] = {}
+    solids: dict[str, dict] = {}
+    for ch, dens_list in solid_acc.items():
+        mean_d = _mean_densities(dens_list)
+        lbl = solid_label.get(ch, ch)
+        if ch == "K":
+            dk = mean_d.get("K", 0.0)
+            if dk > 0:
+                payload = {
+                    "label": lbl,
+                    "strength": round(dk, 4),
+                    "hue_error": None,
+                    "grayness": None,
+                    "efficiency": None,
+                    "purity": None,
+                    "densities": {
+                        "C": mean_d.get("C", 0.0),
+                        "M": mean_d.get("M", 0.0),
+                        "Y": mean_d.get("Y", 0.0),
+                        "K": dk,
+                    },
+                }
+                inks["K"] = payload
+                solids["K"] = {**payload, "_channel": "K"}
+        else:
+            m = ink_metrics(lbl, mean_d)
+            if m is not None:
+                payload = {
+                    "label": lbl,
+                    "strength": m.strength,
+                    "hue_error": m.hue_error,
+                    "grayness": m.grayness,
+                    "efficiency": m.efficiency,
+                    "purity": m.purity,
+                    "densities": m.densities,
+                }
+                inks[ch] = payload
+                solids[ch] = {**payload, "_channel": ch}
+
+    # 梯级按 (channel, nominal) 聚合均值，消除复测产生重复 TVI 点
+    tints: dict[str, list[tuple[int, dict]]] = {}
+    for (ch, nominal), dens_list in sorted(tint_acc.items()):
+        tints.setdefault(ch, []).append((nominal, _mean_densities(dens_list)))
 
     tvi_points: list[dict] = []
     for channel, payload in solids.items():

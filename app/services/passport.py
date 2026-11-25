@@ -350,14 +350,25 @@ def _current_calibration_rounds(process_doc: dict) -> list[dict]:
     )
 
 
-def evaluate_status(snapshot: dict, process_doc: dict | None) -> dict:
+def build_eval_context(process_doc: dict | None) -> dict | None:
+    """单次预计算工艺当前 ICC/补偿/校准指纹，供多版本护照状态判定复用（消除 N+1 读盘解析）。"""
+    if not process_doc:
+        return None
+    pid = process_doc.get("id", "")
+    icc = _icc_state(process_doc)
+    comp_fp = compensation_fingerprint(CompensationStore().get(pid))
+    cal_fp = calibration_fingerprint(_current_calibration_rounds(process_doc))
+    return {"icc": icc, "comp_fp": comp_fp, "cal_fp": cal_fp}
+
+
+def evaluate_status(snapshot: dict, process_doc: dict | None, *, context: dict | None = None) -> dict:
     """动态判定护照状态；快照本身永不写入 status。"""
     reasons: list[dict] = []
     if not process_doc:
         _warn(reasons, "process_missing", "工艺不存在", "error")
         return {"status": "invalid", "status_label": STATUS_LABELS["invalid"], "status_reasons": reasons}
 
-    icc = _icc_state(process_doc)
+    icc = context["icc"] if context is not None else _icc_state(process_doc)
     if not icc["readable"]:
         _warn(reasons, "icc_unreadable", icc["error"] or "ICC 不可读", "error")
         return {"status": "invalid", "status_label": STATUS_LABELS["invalid"], "status_reasons": reasons}
@@ -372,9 +383,13 @@ def evaluate_status(snapshot: dict, process_doc: dict | None) -> dict:
             "error",
         )
 
-    current_comp = CompensationStore().get(process_doc.get("id", ""))
+    current_comp_fp = (
+        context["comp_fp"]
+        if context is not None
+        else compensation_fingerprint(CompensationStore().get(process_doc.get("id", "")))
+    )
     snapshot_comp_fp = (evidence.get("compensation") or {}).get("fingerprint", "")
-    if compensation_fingerprint(current_comp) != snapshot_comp_fp:
+    if current_comp_fp != snapshot_comp_fp:
         _warn(
             reasons,
             "compensation_changed",
@@ -382,7 +397,11 @@ def evaluate_status(snapshot: dict, process_doc: dict | None) -> dict:
             "error",
         )
 
-    current_cal_fp = calibration_fingerprint(_current_calibration_rounds(process_doc))
+    current_cal_fp = (
+        context["cal_fp"]
+        if context is not None
+        else calibration_fingerprint(_current_calibration_rounds(process_doc))
+    )
     snapshot_cal_fp = (evidence.get("calibration") or {}).get("fingerprint", "")
     if current_cal_fp != snapshot_cal_fp:
         _warn(
@@ -421,8 +440,8 @@ def evaluate_status(snapshot: dict, process_doc: dict | None) -> dict:
     return {"status": "valid", "status_label": STATUS_LABELS["valid"], "status_reasons": []}
 
 
-def expose_snapshot(snapshot: dict, process_doc: dict | None) -> dict:
-    status = evaluate_status(snapshot, process_doc)
+def expose_snapshot(snapshot: dict, process_doc: dict | None, *, context: dict | None = None) -> dict:
+    status = evaluate_status(snapshot, process_doc, context=context)
     pid = snapshot.get("process", {}).get("id", "")
     version = int(snapshot.get("version", 0) or 0)
     return {
@@ -512,14 +531,14 @@ class PassportStore:
             self._save(bucket)
             return expose_snapshot(payload, process_doc), True
 
-    def expose(self, snapshot: dict, process_doc: dict | None) -> dict:
-        return expose_snapshot(snapshot, process_doc)
+    def expose(self, snapshot: dict, process_doc: dict | None, *, context: dict | None = None) -> dict:
+        return expose_snapshot(snapshot, process_doc, context=context)
 
-    def summary_for_process(self, process_doc: dict) -> dict | None:
+    def summary_for_process(self, process_doc: dict, *, context: dict | None = None) -> dict | None:
         latest = self.latest_snapshot(process_doc.get("id", ""))
         if not latest:
             return None
-        exposed = expose_snapshot(latest, process_doc)
+        exposed = expose_snapshot(latest, process_doc, context=context)
         return {
             "passport_id": exposed["id"],
             "version": exposed["version"],

@@ -1,6 +1,6 @@
 """测量导出文本解析器（V0.5 可信测量闭环 · M1）。
 
-以课程 30 个真实导出文件为**格式模板**（只取结构，不取数值）：
+以典型分光光度计/密度计导出文件为**格式模板**（只取结构，不取数值）：
 - CGATS.17：BEGIN_DATA_FORMAT/END_DATA_FORMAT + BEGIN_DATA/END_DATA，
   字段变体：SPECTRAL（nm380-730）/ XYZ+LAB / RGB+XYZ+LAB；
 - Xrite530 TSV：``Color Name`` 表头 + Lab/XYZ/LCh/Status-T 密度列。
@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import functools
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -99,9 +101,10 @@ def decode_bytes(raw: bytes) -> tuple[str, str]:
 
 
 def _to_float(token: str) -> float | None:
-    """宽容浮点解析：容忍 -0025.44 / 100.00 / 非数返回 None。"""
+    """宽容浮点解析：容忍 -0025.44 / 100.00；拒绝 NaN/Inf 及非数返回 None。"""
     try:
-        return float(token)
+        v = float(token)
+        return v if math.isfinite(v) else None
     except (TypeError, ValueError):
         return None
 
@@ -143,11 +146,14 @@ def xyz_from_spectral(
         raise ValueError("光谱点数不足")
     cmf = _cmfs(observer)
     spd = _spd(illuminant)
-    # CMF/SPD 重采样到测量网格（测量网格可能与 CMF 原生网格不同）
-    cmf_g = np.stack([np.interp(wl, WL_GRID, cmf[:, ch]) for ch in range(3)], axis=1)
-    spd_g = np.interp(wl, WL_GRID, spd)
+    # CMF/SPD 重采样到测量网格（超界波长置 0，避免常数外推失真）
+    cmf_g = np.stack([np.interp(wl, WL_GRID, cmf[:, ch], left=0.0, right=0.0) for ch in range(3)], axis=1)
+    spd_g = np.interp(wl, WL_GRID, spd, left=0.0, right=0.0)
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        k = 100.0 / float((spd_g * cmf_g[:, 1]).sum())
+        denom = float((spd_g * cmf_g[:, 1]).sum())
+        if not math.isfinite(denom) or denom <= 0:
+            raise ValueError("光谱积分白点 Y 非正或非有限，请检查波长范围")
+        k = 100.0 / denom
         sums = (spd_g[:, None] * refl[:, None] * cmf_g).sum(axis=0)
         xyz = k * sums
     if not np.all(np.isfinite(xyz)):
@@ -166,10 +172,16 @@ def lab_from_xyz(xyz, white_xyz) -> list[float]:
     return [float(116.0 * f[1] - 16.0), float(500.0 * (f[0] - f[1])), float(100.0 * (f[1] - f[2]))]
 
 
-def white_xyz(illuminant: str = "D50", observer: str = "2") -> list[float]:
-    """积分白点（Y≡100）。教科书自检：D50/2°≈(96.42,100,82.49)，D65/2°≈(95.05,100,108.90)。"""
+@functools.lru_cache(maxsize=32)
+def _white_xyz_cached(illuminant: str, observer: str) -> tuple[float, float, float]:
     ones = {int(w): 1.0 for w in WL_GRID}
-    return xyz_from_spectral(ones, illuminant, observer)
+    vals = xyz_from_spectral(ones, illuminant, observer)
+    return (vals[0], vals[1], vals[2])
+
+
+def white_xyz(illuminant: str = "D50", observer: str = "2") -> list[float]:
+    """积分白点（Y≡100，带进程缓存）。教科书自检：D50/2°≈(96.42,100,82.49)，D65/2°≈(95.05,100,108.90)。"""
+    return list(_white_xyz_cached(illuminant, observer))
 
 
 def integrate_lab(
@@ -177,8 +189,14 @@ def integrate_lab(
     illuminant: str = "D50",
     observer: str = "2",
 ) -> list[float]:
-    """光谱 → Lab（D50/2° 等声明条件）。"""
-    return lab_from_xyz(xyz_from_spectral(spectral, illuminant, observer), white_xyz(illuminant, observer))
+    """光谱 → Lab（D50/2° 等声明条件）；子网格使用同网格积分白点归一化，消除白点失配偏移。"""
+    xyz = xyz_from_spectral(spectral, illuminant, observer)
+    # 完整标准网格直接复用缓存白点；子网格按同网格白点归一化
+    if len(spectral) == len(WL_GRID) and all(int(w) in spectral for w in WL_GRID):
+        wn = white_xyz(illuminant, observer)
+    else:
+        wn = xyz_from_spectral({int(w): 1.0 for w in spectral}, illuminant, observer)
+    return lab_from_xyz(xyz, wn)
 
 
 def probe_lab_condition(
@@ -268,10 +286,11 @@ def _parse_cgats(text: str) -> ParsedFile:
             continue
 
         if section == "await_data":
-            if upper.startswith("NUMBER_OF_SETS"):
-                n = _to_float(line.split()[-1]) if line.split() else None
+            if upper.startswith("NUMBER_OF_SETS") or upper.startswith("NUMBER_OF_SAMPLES"):
+                parts = line.split()
+                n = _to_float(parts[-1]) if parts else None
                 n_sets = int(n) if n is not None else n_sets
-                out.meta["NUMBER_OF_SETS"] = line.split()[-1] if line.split() else ""
+                out.meta[parts[0].upper()] = parts[-1] if parts else ""
             elif upper.startswith("BEGIN_DATA"):
                 section = "data"
             continue
@@ -286,36 +305,42 @@ def _parse_cgats(text: str) -> ParsedFile:
         if fields and len(tokens) != len(fields):
             out.notes.append(f"行字段数不符（{len(tokens)}/{len(fields)}），跳过：{line[:40]}")
             continue
-        patch = ParsedPatch(label=(tokens[fields.index("SAMPLE_NAME")] if "SAMPLE_NAME" in fields else tokens[0]))
-        for idx, name in enumerate(fields):
-            up = name.upper()
-            if up in ("SAMPLE_NAME",):
+        fields_upper = [f.upper() for f in fields]
+        label_idx = fields_upper.index("SAMPLE_NAME") if "SAMPLE_NAME" in fields_upper else 0
+        patch = ParsedPatch(label=tokens[label_idx])
+        lab_parts: dict[str, float] = {}
+        xyz_parts: dict[str, float] = {}
+        rgb_parts: dict[str, float] = {}
+        for idx, up in enumerate(fields_upper):
+            if up == "SAMPLE_NAME":
                 continue
             val = _to_float(tokens[idx])
-            if up == "LAB_L" and val is not None:
-                patch.lab = [val, 0.0, 0.0]
-            elif up in ("LAB_A", "LAB_B") and val is not None and patch.lab is not None:
-                patch.lab[1 if up == "LAB_A" else 2] = val
-            elif up == "XYZ_X" and val is not None:
-                patch.xyz = [val, 0.0, 0.0]
-            elif up in ("XYZ_Y", "XYZ_Z") and val is not None and patch.xyz is not None:
-                patch.xyz[1 if up == "XYZ_Y" else 2] = val
-            elif up == "RGB_R" and val is not None:
-                patch.rgb = [val, 0.0, 0.0]
-            elif up in ("RGB_G", "RGB_B") and val is not None and patch.rgb is not None:
-                patch.rgb[1 if up == "RGB_G" else 2] = val
+            if val is None:
+                continue
+            if up in ("LAB_L", "LAB_A", "LAB_B"):
+                lab_parts[up] = val
+            elif up in ("XYZ_X", "XYZ_Y", "XYZ_Z"):
+                xyz_parts[up] = val
+            elif up in ("RGB_R", "RGB_G", "RGB_B"):
+                rgb_parts[up] = val
             else:
                 m = _SPECTRAL_RE.match(up)
-                if m and val is not None:
+                if m:
                     if patch.spectral is None:
                         patch.spectral = {}
                     patch.spectral[int(m.group(1))] = val
                     continue
                 m = _DENSITY_RE.match(up)
-                if m and val is not None:
+                if m:
                     if patch.densities is None:
                         patch.densities = {}
                     patch.densities[m.group(1).upper()] = val
+        if len(lab_parts) == 3:
+            patch.lab = [lab_parts["LAB_L"], lab_parts["LAB_A"], lab_parts["LAB_B"]]
+        if len(xyz_parts) == 3:
+            patch.xyz = [xyz_parts["XYZ_X"], xyz_parts["XYZ_Y"], xyz_parts["XYZ_Z"]]
+        if len(rgb_parts) == 3:
+            patch.rgb = [rgb_parts["RGB_R"], rgb_parts["RGB_G"], rgb_parts["RGB_B"]]
         out.patches.append(patch)
 
     out.fields = fields
@@ -405,10 +430,17 @@ def parse_measurement_text(raw: bytes) -> ParsedFile:
             raise CgatsParseError("无法识别的结构：既非 CGATS.17 也非 Color Name TSV")
     parsed.meta["_encoding"] = enc
     if parsed.kind == "cgats":
+        ill, obs = _split_condition(parsed.source_condition) or ("D50", "2")
         for p in parsed.patches:
             if p.spectral and p.lab is None:
-                ill, obs = _split_condition(parsed.source_condition) or ("D50", "2")
-                p.lab_integrated = integrate_lab(p.spectral, ill, obs)
+                try:
+                    p.lab_integrated = integrate_lab(p.spectral, ill, obs)
+                except (KeyError, ValueError):
+                    try:
+                        p.lab_integrated = integrate_lab(p.spectral, "D50", "2")
+                        parsed.notes.append(f"色块 {p.label}：声明条件 {ill}/{obs}° 不支持，光谱积分已回退 D50/2°")
+                    except (KeyError, ValueError) as exc:
+                        parsed.notes.append(f"色块 {p.label}：光谱积分跳过（{exc}）")
     return parsed
 
 

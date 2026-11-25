@@ -91,16 +91,19 @@ function recordRow(r, sid) {
 }
 
 /* ---- 测量数据卡（V0.5 可信测量闭环） ---- */
-async function renderMeasurementCard(view) {
+async function renderMeasurementCard(view, ctx) {
   const holder = view.querySelector("#qc-measure-card");
+  if (!holder) return;
   let sessions;
   try {
-    sessions = await apiGet("/api/qc/measurements");
+    sessions = await ctx.getSessions();
   } catch (e) {
+    if (e.name === "AbortError" || !ctx.isActive()) return;
     holder.innerHTML = `<div class="card-title">${icon("check")}测量数据（可靠性闭环）</div>
       <div class="gamut-error" style="margin-top:10px">${esc(e.message)}</div>`;
     return;
   }
+  if (!ctx.isActive()) return;
 
   const total = sessions.reduce((acc, s) => {
     const st = s.stats || {};
@@ -113,10 +116,11 @@ async function renderMeasurementCard(view) {
   const procIds = [...new Set(sessions.map((s) => s.process_id).filter(Boolean))];
   await Promise.all(procIds.map(async (pid) => {
     try {
-      const t = await apiGet(`/api/qc/trend?process_id=${encodeURIComponent(pid)}`);
+      const t = await apiGet(`/api/qc/trend?process_id=${encodeURIComponent(pid)}`, { signal: ctx.signal });
       trends[pid] = t.points || [];
     } catch { trends[pid] = []; }
   }));
+  if (!ctx.isActive()) return;
 
   holder.innerHTML = `
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
@@ -135,14 +139,15 @@ async function renderMeasurementCard(view) {
       </div>`}
   `;
 
-  holder.querySelector(".qc-import-btn").addEventListener("click", () => openImportWizard(view));
+  holder.querySelector(".qc-import-btn").addEventListener("click", () => openImportWizard(view, ctx));
   holder.querySelectorAll(".qc-session").forEach((row) => {
     const sid = row.dataset.sid;
     row.querySelector(".qc-session-toggle").addEventListener("click", async () => {
       const box = row.querySelector(".qc-session-records");
       if (!box.hidden) { box.hidden = true; return; }
       try {
-        const detail = await apiGet(`/api/qc/measurements?session_id=${encodeURIComponent(sid)}`);
+        const detail = await apiGet(`/api/qc/measurements?session_id=${encodeURIComponent(sid)}`, { signal: ctx.signal });
+        if (!ctx.isActive()) return;
         box.innerHTML = (detail.records || []).map((r) => recordRow(r, sid)).join("")
           || `<p class="swatch-meta" style="padding:8px 0">会话内没有记录</p>`;
         box.hidden = false;
@@ -154,24 +159,31 @@ async function renderMeasurementCard(view) {
               confirmText: "删除",
             });
             if (!okGo) return;
+            btn.disabled = true;
             try {
               await apiDelete(`/api/qc/measurements?session_id=${encodeURIComponent(btn.dataset.sid)}&record_id=${encodeURIComponent(btn.dataset.rid)}`);
               toast("记录已删除，会话已重分级");
-              renderMeasurementCard(view);
-            } catch (e) { toast(e.message, "err"); }
+              ctx.reloadMeasurementCards();
+            } catch (e) {
+              btn.disabled = false;
+              toast(e.message, "err");
+            }
           });
         });
-      } catch (e) { toast(e.message, "err"); }
+      } catch (e) {
+        if (e.name !== "AbortError") toast(e.message, "err");
+      }
     });
   });
 }
 
 /* ---- 导入向导：会话登记 → 文件 → 逐文件分级结果 ---- */
-async function openImportWizard(view) {
+async function openImportWizard(view, ctx) {
   const [sessions, processes] = await Promise.all([
-    apiGet("/api/qc/measurements").catch(() => []),
-    apiGet("/api/processes").catch(() => []),
+    apiGet("/api/qc/measurements", { signal: ctx.signal }).catch(() => []),
+    apiGet("/api/processes", { signal: ctx.signal }).catch(() => []),
   ]);
+  if (!ctx.isActive()) return;
 
   const sessionOptions = ['<option value="">＋ 新建会话（测前登记）</option>']
     .concat(sessions.map((s) => `<option value="${esc(s.id)}">${esc(s.instrument)} · ${esc(s.condition)} · ${esc((s.created_at || "").replace("T", " "))}</option>`))
@@ -278,7 +290,7 @@ async function openImportWizard(view) {
     goBtn.disabled = false;
     const sess = sessions.find((s) => s.id === lastSessionId) || { instrument: "新会话" };
     toast(`导入完成（会话 ${sess.instrument}）`);
-    renderMeasurementCard(view);
+    ctx.reloadMeasurementCards();
   });
 
   modal.modal.querySelector("[data-close]").addEventListener("click", () => modal.close());
@@ -451,7 +463,7 @@ function diagnosisBlock(findings) {
     const s = sev[f.severity] || sev.info;
     return `
       <div class="qc-diagnosis" data-i="${i}" style="border-top:1px solid var(--separator); padding:8px 0">
-        <div style="display:flex; align-items:center; gap:8px; cursor:pointer">
+        <div class="qc-diagnosis-head" role="button" tabindex="0" aria-expanded="false" style="display:flex; align-items:center; gap:8px; cursor:pointer">
           <span class="badge ${s.cls}">${s.label}</span>
           <b style="color:var(--label); font-size:13px; flex:1">${esc(f.title)}</b>
           <span class="swatch-meta chip-mono">${esc(f.rule)}</span>
@@ -473,10 +485,19 @@ function diagnosisBlock(findings) {
 }
 
 function bindDiagnosisToggles(root) {
-  root.querySelectorAll(".qc-diagnosis > div:first-child").forEach((head) => {
-    head.addEventListener("click", () => {
+  root.querySelectorAll(".qc-diagnosis-head").forEach((head) => {
+    const toggle = () => {
       const detail = head.parentElement.querySelector(".qc-diagnosis-detail");
-      if (detail) detail.hidden = !detail.hidden;
+      if (!detail) return;
+      detail.hidden = !detail.hidden;
+      head.setAttribute("aria-expanded", String(!detail.hidden));
+    };
+    head.addEventListener("click", toggle);
+    head.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
     });
   });
 }
@@ -720,6 +741,7 @@ function openSpectralModal(row) {
     </tr>`).join("");
   const warnings = (row.warnings || []).map((w) => `
     <div class="issue issue-warn">${icon("warn")}<span>${esc(w)}</span></div>`).join("");
+  let disposeSpectralRedraw = null;
   const modal = openModal(`
     <h3 class="card-title">${icon("eye")}光谱曲线 · 色块 ${esc(row.label)}</h3>
     <p class="swatch-meta" style="margin-top:4px">${esc(row.disclaimer || "工程同色异谱风险指标，不等同 CIE 15 特殊同色异谱指数 MI")}</p>
@@ -734,29 +756,38 @@ function openSpectralModal(row) {
     <div style="display:flex;justify-content:flex-end;margin-top:16px">
       <button class="btn btn-secondary" data-close>关闭</button>
     </div>
-  `);
+  `, {
+    onClose: () => {
+      disposeSpectralRedraw?.();
+      disposeSpectralRedraw = null;
+    },
+  });
   modal.modal.style.width = "min(760px, 100%)";
   const canvas = modal.modal.querySelector("#spectral-modal-canvas");
   const redraw = () => drawSpectralCurve(canvas, row);
   redraw();
-  observeRedraw(canvas, redraw);
+  disposeSpectralRedraw = observeRedraw(canvas, redraw);
   modal.modal.querySelector("[data-close]").addEventListener("click", modal.close);
 }
 
-async function renderSpectralCard(view) {
+async function renderSpectralCard(view, ctx) {
   const holder = view.querySelector("#qc-spectral-card");
+  if (!holder) return;
   let sessions;
   try {
-    sessions = await apiGet("/api/qc/measurements");
+    sessions = await ctx.getSessions();
   } catch (e) {
+    if (e.name === "AbortError" || !ctx.isActive()) return;
     holder.innerHTML = `<div class="card-title">${icon("eye")}光谱 / 同色异谱</div>
       <div class="gamut-error" style="margin-top:10px">${esc(e.message)}</div>`;
     return;
   }
+  if (!ctx.isActive()) return;
 
   const summaries = (await Promise.all(
-    sessions.map((s) => apiGet(`/api/spectral/sessions/${encodeURIComponent(s.id)}/summary`).catch(() => null))
+    sessions.map((s) => apiGet(`/api/spectral/sessions/${encodeURIComponent(s.id)}/summary`, { signal: ctx.signal }).catch(() => null))
   )).filter((s) => s && s.available);
+  if (!ctx.isActive()) return;
 
   if (!summaries.length) {
     holder.innerHTML = `
@@ -790,8 +821,10 @@ async function renderSpectralCard(view) {
   if (summaries.length > 1) bSel.selectedIndex = 1;
   const resultBox = holder.querySelector("#spectral-result");
   const compareBtn = holder.querySelector("#spectral-compare");
+  let compareSeq = 0;
 
   const runCompare = async () => {
+    const seq = ++compareSeq;
     if (aSel.value === bSel.value) {
       resultBox.innerHTML = `<div class="issue issue-warn">${icon("warn")}<span>请选择两个不同的测量会话</span></div>`;
       return;
@@ -803,8 +836,8 @@ async function renderSpectralCard(view) {
         session_a: aSel.value,
         session_b: bSel.value,
         top_n: 12,
-      });
-      if (!view.isConnected) return;
+      }, { signal: ctx.signal });
+      if (!ctx.isActive() || seq !== compareSeq) return;
       if (!data.matched) {
         resultBox.innerHTML = `<div class="issue issue-warn">${icon("warn")}<span>${esc((data.warnings || []).join("；") || "两个会话没有共同光谱色块")}</span></div>`;
         return;
@@ -837,11 +870,11 @@ async function renderSpectralCard(view) {
         btn.addEventListener("click", () => openSpectralModal(data.top[+btn.dataset.spectralRow]));
       });
     } catch (e) {
-      if (view.isConnected) {
+      if (e.name !== "AbortError" && ctx.isActive() && seq === compareSeq) {
         resultBox.innerHTML = `<div class="issue issue-error">${icon("xmark")}<span>${esc(e.message)}</span></div>`;
       }
     } finally {
-      compareBtn.disabled = false;
+      if (seq === compareSeq) compareBtn.disabled = false;
     }
   };
 
@@ -849,16 +882,19 @@ async function renderSpectralCard(view) {
   if (summaries.length > 1) runCompare();
 }
 
-async function renderQcCard(view) {
+async function renderQcCard(view, ctx) {
   const holder = view.querySelector("#qc-ink-card");
+  if (!holder) return;
   let sessions;
   try {
-    sessions = await apiGet("/api/qc/measurements");
+    sessions = await ctx.getSessions();
   } catch (e) {
+    if (e.name === "AbortError" || !ctx.isActive()) return;
     holder.innerHTML = `<div class="card-title">${icon("printer")}印刷 QC（GATF）</div>
       <div class="gamut-error" style="margin-top:10px">${esc(e.message)}</div>`;
     return;
   }
+  if (!ctx.isActive()) return;
   if (!sessions.length) {
     holder.innerHTML = `
       <div class="card-title">${icon("printer")}印刷 QC（GATF）</div>
@@ -869,7 +905,7 @@ async function renderQcCard(view) {
     return;
   }
 
-  const options = sessions.map((s, i) =>
+  const options = sessions.map((s) =>
     `<option value="${esc(s.id)}">${esc(s.instrument)} · ${esc(s.condition)} · ${esc((s.created_at || "").replace("T", " "))}</option>`
   ).join("");
   const compareOptions = ['<option value="">不对比</option>']
@@ -888,21 +924,32 @@ async function renderQcCard(view) {
     <div id="qc-ink-body" style="margin-top:12px">${skeletonCards(1)}</div>
   `;
 
+  let qcReqSeq = 0;
+  let disposeQcRedraw = null;
+  ctx.onCleanup(() => {
+    disposeQcRedraw?.();
+    disposeQcRedraw = null;
+  });
+
   const load = async () => {
+    const seq = ++qcReqSeq;
     const sid = holder.querySelector("#qc-ink-session").value;
     const body = holder.querySelector("#qc-ink-body");
     let data;
     try {
-      data = await apiGet(`/api/qc/ink-quality?session_id=${encodeURIComponent(sid)}`);
+      data = await apiGet(`/api/qc/ink-quality?session_id=${encodeURIComponent(sid)}`, { signal: ctx.signal });
     } catch (e) {
+      if (e.name === "AbortError" || !ctx.isActive() || seq !== qcReqSeq) return;
       body.innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
       return;
     }
+    if (!ctx.isActive() || seq !== qcReqSeq) return;
 
     // V0.7/V0.8：校准状态摘要（会话按校准版测量时才有内容；失败静默——不阻塞 QC 卡）
     let calHtml = "";
     try {
-      const cal = await apiGet(`/api/qc/calibration?session_id=${encodeURIComponent(sid)}`);
+      const cal = await apiGet(`/api/qc/calibration?session_id=${encodeURIComponent(sid)}`, { signal: ctx.signal });
+      if (!ctx.isActive() || seq !== qcReqSeq) return;
       if (cal.matched >= 4) {
         const badge = {
           ok: `<span class="badge badge-green">达标</span>`,
@@ -912,7 +959,7 @@ async function renderQcCard(view) {
         }[cal.overall] || "";
         let roundHtml = "";
         try {
-          const hist = await apiGet(`/api/qc/calibration/history?process_id=${encodeURIComponent(cal.process.id)}`);
+          const hist = await apiGet(`/api/qc/calibration/history?process_id=${encodeURIComponent(cal.process.id)}`, { signal: ctx.signal });
           if (hist.round_no > 0) {
             const conv = hist.convergence || {};
             const convCls = { converged: "badge-green", improving: "badge-blue", worsening: "badge-red", flat: "badge-orange" }[conv.status];
@@ -928,10 +975,14 @@ async function renderQcCard(view) {
             ${roundHtml}
             <span class="swatch-meta">ΔE(ICC) max ${cal.summary.max_de_expected ?? "-"} · avg ${cal.summary.avg_de_expected ?? "-"} ·
               命中 ${cal.matched}/${cal.patch_count_total}</span>
-            <a href="#/processes/${esc(cal.process.id)}" class="swatch-meta" style="color:var(--accent)">打印校准 →</a>
+            <a href="#/processes/${encodeURIComponent(cal.process.id)}" class="swatch-meta" style="color:var(--accent)">打印校准 →</a>
           </div>`;
       }
     } catch (_) { /* 会话未绑定工艺/非 CMYK：无校准行 */ }
+    if (!ctx.isActive() || seq !== qcReqSeq) return;
+
+    disposeQcRedraw?.();
+    disposeQcRedraw = null;
 
     if (!data.verified_records || !Object.keys(data.inks).length) {
       body.innerHTML = `
@@ -944,7 +995,7 @@ async function renderQcCard(view) {
             ② 纸白块正常（未漂移、背衬正确）；<br>
             ③ Lab↔XYZ 交叉校验一致、密度在物理量程内（无 warning/rejected）。
           </p>
-          <p class="swatch-meta">当前：${data.verified_records} 条 verified · ${data.skipped_records} 条被排除（${(data.source_records || []).join("、") || "无来源"}）</p>
+          <p class="swatch-meta">当前：${data.verified_records} 条 verified · ${data.skipped_records} 条被排除（${(data.source_records || []).map(esc).join("、") || "无来源"}）</p>
         </div>`;
       return;
     }
@@ -958,16 +1009,19 @@ async function renderQcCard(view) {
     let cmpHtml = "";
     if (compareSid && compareSid !== sid) {
       try {
-        const cmp = await apiGet(`/api/qc/compare?session_id_a=${encodeURIComponent(sid)}&session_id_b=${encodeURIComponent(compareSid)}`);
+        const cmp = await apiGet(`/api/qc/compare?session_id_a=${encodeURIComponent(sid)}&session_id_b=${encodeURIComponent(compareSid)}`, { signal: ctx.signal });
+        if (!ctx.isActive() || seq !== qcReqSeq) return;
         cmpHtml = `
           <div id="qc-compare-block" style="margin-top:14px">
             <div class="card-title" style="font-size:14px">会话对比 Δ 表（Δ = 主会话 − 对比会话）</div>
             ${compareTable(cmp)}
           </div>`;
       } catch (e) {
+        if (e.name === "AbortError" || !ctx.isActive() || seq !== qcReqSeq) return;
         cmpHtml = `<div class="gamut-error" style="margin-top:10px">对比失败：${esc(e.message)}</div>`;
       }
     }
+    if (!ctx.isActive() || seq !== qcReqSeq) return;
 
     body.innerHTML = `
       ${calHtml}
@@ -993,7 +1047,7 @@ async function renderQcCard(view) {
     const wheelCanvas = body.querySelector("#qc-wheel-canvas");
     drawTvi(tviCanvas, data.tvi);
     drawWheel(wheelCanvas, wheelPatches);
-    observeRedraw(body, () => {
+    disposeQcRedraw = observeRedraw(body, () => {
       drawTvi(tviCanvas, data.tvi);
       drawWheel(wheelCanvas, wheelPatches);
     });
@@ -1060,17 +1114,21 @@ function processRow(p, tol) {
       : "";
   return `
     <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:12px 0; border-top:1px solid var(--separator)">
-      <a href="#/processes/${p.process_id}" style="font-weight:600; color:var(--label); min-width:140px">${esc(p.process_name || "未命名工艺")}</a>
+      <a href="#/processes/${encodeURIComponent(p.process_id)}" style="font-weight:600; color:var(--label); min-width:140px">${esc(p.process_name || "未命名工艺")}</a>
       <span class="chip chip-mono">n=${p.n}</span>
       <span class="swatch-meta">平均 ΔE <b>${p.mean_de ?? "-"}</b> · P95 <b>${p.p95_de ?? "-"}</b></span>
       ${p.pass_rate != null ? `<span class="badge ${p.pass_rate >= 0.9 ? "badge-green" : p.pass_rate >= 0.7 ? "badge-orange" : "badge-red"}">达标 ${(p.pass_rate * 100).toFixed(0)}%</span>` : ""}
       ${driftChip}
       <span style="flex:1"></span>
-      <a class="btn btn-secondary btn-sm" href="#/recipes?process=${p.process_id}">${icon("wand")}预测</a>
+      <a class="btn btn-secondary btn-sm" href="#/recipes?process=${encodeURIComponent(p.process_id)}">${icon("wand")}预测</a>
     </div>`;
 }
 
-export async function renderMonitorView(view) {
+export async function renderMonitorView(view, params = {}) {
+  const signal = params.signal;
+  const isActive = params.isActive || (() => view.isConnected);
+  const onCleanup = params.onCleanup || (() => {});
+
   view.innerHTML = `
     <div class="page-head">
       <div>
@@ -1084,21 +1142,45 @@ export async function renderMonitorView(view) {
     <div id="qc-ink-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
     <div id="qc-eval-card" class="card" style="margin-top:14px">${skeletonCards(1)}</div>
   `;
-  // 测量数据卡、QC 卡与主观评价卡独立加载（与配方统计互不阻塞）
-  renderMeasurementCard(view);
-  renderSpectralCard(view);
-  renderQcCard(view);
+
+  // 共享单次 /api/qc/measurements 请求，消除 3 张卡重复拉取
+  let sessionsPromise = null;
+  const getSessions = () => {
+    if (!sessionsPromise) {
+      sessionsPromise = apiGet("/api/qc/measurements", { signal });
+    }
+    return sessionsPromise;
+  };
+  const ctx = {
+    signal,
+    isActive,
+    onCleanup,
+    getSessions,
+    reloadMeasurementCards: () => {
+      sessionsPromise = null;
+      renderMeasurementCard(view, ctx);
+      renderSpectralCard(view, ctx);
+      renderQcCard(view, ctx);
+    },
+  };
+
+  // 测量数据卡、光谱卡、QC 卡与主观评价卡独立加载（与配方统计互不阻塞）
+  renderMeasurementCard(view, ctx);
+  renderSpectralCard(view, ctx);
+  renderQcCard(view, ctx);
   renderEvalCard(view);
 
   let stats;
   try {
-    stats = await apiGet("/api/recipes/stats");
+    stats = await apiGet("/api/recipes/stats", { signal });
   } catch (e) {
+    if (e.name === "AbortError" || !isActive()) return;
     view.querySelector("#monitor-body").innerHTML = errorState(e.message);
     const retry = view.querySelector(".btn-retry");
-    if (retry) retry.addEventListener("click", () => renderMonitorView(view));
+    if (retry) retry.addEventListener("click", () => renderMonitorView(view, params));
     return;
   }
+  if (!isActive()) return;
 
   if (!stats.total) {
     view.querySelector("#monitor-body").innerHTML = `

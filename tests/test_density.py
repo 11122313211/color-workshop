@@ -1,6 +1,6 @@
 """M2 密度与油墨质量测试：GATF 公式手算对拍 + verified 门禁。
 
-对拍基准（课程实验报告可复算数值，仅作公式正确性锚点）：
+对拍基准（手算可复算数值，仅作公式正确性锚点）：
 - C100 实地：Dc=1.55 Dm=0.43 Dy=0.17 → 色相误差 0.19、灰度 0.11、色效率 0.81、色纯度 0.89
 - Murray–Davies：Dt=0.51, Ds=1.49 → α=0.714（对应 c60 名义 60% → TVI≈+11.4pp）
 """
@@ -35,7 +35,7 @@ def test_ink_metrics_c100_handcheck():
 
 
 def test_ink_metrics_m_channel():
-    """M 实地：DH=1.56, DM_mid=0.86, DL=0.20（课程 M100 组）。"""
+    """M 实地：DH=1.56, DM_mid=0.86, DL=0.20（M100 手算锚点）。"""
     m = ink_metrics("M", {"C": 0.20, "M": 1.56, "Y": 0.86, "K": 0.60})
     assert m.strength == pytest.approx(1.56)
     assert m.hue_error == pytest.approx((0.86 - 0.20) / (1.56 - 0.20), abs=1e-3)
@@ -50,7 +50,7 @@ def test_ink_metrics_invalid_inputs():
 
 
 def test_murray_davies_handcheck():
-    """课程 c60：Dt=0.51，Ds=1.49 → α=0.714。"""
+    """c60 手算锚点：Dt=0.51，Ds=1.49 → α=0.714。"""
     alpha = murray_davies_dot_area(0.51, 1.49)
     assert alpha == pytest.approx((1 - 10 ** (-0.51)) / (1 - 10 ** (-1.49)), abs=1e-4)
     assert alpha == pytest.approx(0.714, abs=0.002)

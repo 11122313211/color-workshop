@@ -25,6 +25,7 @@ from ..services.recipe import (
     predict_recipe,
     run_verification,
 )
+from ._http import content_disposition, read_icc_or_409
 
 router = APIRouter(prefix="/api/recipes", tags=["recipes"])
 
@@ -45,7 +46,7 @@ def predict(req: RecipePredictRequest):
         raise HTTPException(404, "工艺不存在，请先在工艺库中创建")
     _ensure_active(proc)
 
-    icc_bytes = _processes.icc_bytes(req.process_id)
+    icc_bytes = read_icc_or_409(_processes, req.process_id)
     device_space = proc["icc_meta"]["device_space"]
 
     # 工艺级补偿模型：sha 匹配且样本达标时作用于种子
@@ -54,7 +55,7 @@ def predict(req: RecipePredictRequest):
     comp_n = int(comp_doc["n"]) if comp_doc else 0
 
     started = time.perf_counter()
-    results: list[RecipeResult] = []
+    computed: list[tuple[dict, str]] = []
     total_predictions = 0
     for t in req.targets:
         r = predict_recipe(
@@ -71,12 +72,12 @@ def predict(req: RecipePredictRequest):
         r["label"] = t.label
         r["compensation"] = {"n": comp_n, "applied": bias is not None}
         total_predictions += r["predictions"]
-        # 每个目标存一条配方历史
-        doc = recipe_store.create(
-            proc,
-            {**r, "method": req.method.value, "tolerance": req.tolerance},
-            t.label,
-        )
+        computed.append((r, t.label))
+
+    # 批量一次性落盘，消除多目标预测的 N 次整表重写
+    saved_docs = recipe_store.create_many(proc, computed)
+    results: list[RecipeResult] = []
+    for (r, _label), doc in zip(computed, saved_docs):
         r["recipe_id"] = doc["id"]
         results.append(RecipeResult(**r))
 
@@ -111,7 +112,7 @@ def forward(req: ForwardQueryRequest):
     channels = proc["icc_meta"]["channels"]
     if len(req.values) != channels:
         raise HTTPException(400, f"该工艺需要 {channels} 个通道值（{proc['icc_meta']['device_space']}）")
-    icc_bytes = _processes.icc_bytes(req.process_id)
+    icc_bytes = read_icc_or_409(_processes, req.process_id)
     return ForwardQueryResponse(**forward_query(icc_bytes, proc["icc_meta"]["device_space"], req.values))
 
 
@@ -182,9 +183,10 @@ def recipes_stats(process_id: str | None = None):
             prev5 = [float(r["delta_e"]) for r in rows[5:10]]
             drift = round(sum(last5) / 5 - sum(prev5) / 5, 3)
             agg["drift"] = drift
-            drop = (agg["pass_rate"] or 0) - (
-                round(sum(1 for r in rows[5:10] if r.get("converged")) / 5, 4)
-            )
+            last5_pass = sum(1 for r in rows[:5] if r.get("converged")) / 5.0
+            prev5_pass = sum(1 for r in rows[5:10] if r.get("converged")) / 5.0
+            # 达标率下降幅度：前 5 次 − 近 5 次 > 25pp 时触发漂移告警
+            drop = round(prev5_pass - last5_pass, 4)
             if drift > max(0.3, 0.25 * tol) or drop > 0.25:
                 agg["drift_flag"] = True
                 flags.append(
@@ -277,7 +279,7 @@ def export_recipe(rid: str, format: str = "json"):
     return Response(
         content=content.encode("utf-8"),
         media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename, fallback=filename)},
     )
 
 
@@ -305,7 +307,7 @@ def verify(req: RecipeVerifyRequest):
         raise HTTPException(404, "配方所属工艺已被删除")
     _ensure_active(proc)
 
-    # V0.5 补偿门禁：关联测量会话时，仅当会话含 verified 记录才允许补偿沉淀
+    # V0.5 补偿门禁：关联测量会话时，仅当会话属于当前工艺（或未绑定工艺）且含 verified 记录才允许沉淀
     comp_session = None
     if req.measurement_session_id:
         from ..services.measurements import MeasurementStore
@@ -313,9 +315,12 @@ def verify(req: RecipeVerifyRequest):
         comp_session = MeasurementStore().get_session(req.measurement_session_id)
         if comp_session is None:
             raise HTTPException(404, "关联测量会话不存在")
+        bound_pid = comp_session.get("process_id") or ""
+        if bound_pid and bound_pid != doc["process_id"]:
+            raise HTTPException(422, "关联测量会话绑定的是其他工艺，不能用于当前配方验证")
     comp_verified = bool(comp_session and (comp_session.get("stats") or {}).get("verified", 0) > 0)
 
-    icc_bytes = _processes.icc_bytes(doc["process_id"])
+    icc_bytes = read_icc_or_409(_processes, doc["process_id"])
     verification = run_verification(
         icc_bytes,
         doc["device_space"],

@@ -48,6 +48,7 @@ async function request(path, options = {}) {
   try {
     resp = await fetch(path, options);
   } catch (e) {
+    if (e && e.name === "AbortError") throw e;
     throw new Error("无法连接服务器，请确认后端已启动");
   }
   if (!resp.ok) {
@@ -61,36 +62,39 @@ async function request(path, options = {}) {
   return resp.json();
 }
 
-export function apiGet(path) {
-  return request(path);
+export function apiGet(path, options = {}) {
+  return request(path, options);
 }
 
-export function apiPost(path, body) {
+export function apiPost(path, body, options = {}) {
   return request(path, {
+    ...options,
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     body: JSON.stringify(body),
   });
 }
 
 /** POST 原始字节（query 参数携带元数据，Content-Type: application/octet-stream） */
-export function apiPostRaw(path, query, bytes) {
+export function apiPostRaw(path, query, bytes, options = {}) {
   const qs = new URLSearchParams(query);
   return request(`${path}?${qs.toString()}`, {
+    ...options,
     method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
+    headers: { "Content-Type": "application/octet-stream", ...(options.headers || {}) },
     body: bytes,
   });
 }
 
-export function apiDelete(path) {
-  return request(path, { method: "DELETE" });
+export function apiDelete(path, options = {}) {
+  return request(path, { ...options, method: "DELETE" });
 }
 
-export function apiPatch(path, body) {
+export function apiPatch(path, body, options = {}) {
   return request(path, {
+    ...options,
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     body: JSON.stringify(body),
   });
 }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..models.schemas import (
@@ -16,6 +18,7 @@ from ..services.lifecycle import archived_detail, is_archived
 from ..services.pdfx import MAX_PDF_BYTES, PdfxError, package_pdfx
 from ..services.processes import ProcessStore
 from ..services.displays import DisplayStore
+from ._http import read_body_limited, read_icc_or_409
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -30,8 +33,10 @@ def _ensure_active(proc: dict) -> None:
 
 def _decode_b64(data_b64: str) -> bytes:
     import base64
-    # 兼容 data URI 前缀
+    # 兼容 data URI 前缀（无逗号时按非法 data URI 拒绝，避免 IndexError 500）
     if data_b64.startswith("data:"):
+        if "," not in data_b64:
+            raise HTTPException(400, "无效的 data URI 编码")
         data_b64 = data_b64.split(",", 1)[1]
     try:
         return base64.b64decode(data_b64)
@@ -56,8 +61,8 @@ def run_convert(req: FileConvertRequest):
         raise HTTPException(404, "工艺不存在，请先在工艺库中创建")
     _ensure_active(proc)
     image_bytes = _decode_b64(req.image_b64)
+    icc_bytes = read_icc_or_409(_processes, req.process_id)
     try:
-        icc_bytes = _processes.icc_bytes(req.process_id)
         result = convert_image(
             image_bytes,
             icc_bytes,
@@ -81,22 +86,30 @@ async def make_pdfx(
 ):
     """把 PDF 封装为 PDF/X-4 结构文件（OutputIntent + XMP + 盒子）。
 
-    请求体为 PDF 原始字节；返回 base64 成品与逐项检查结论。
-    结构级合规，不替代 RIP 端全量 PDF/X 校验。
+    请求体为 PDF 原始字节（流式限流 + 线程池封装避免阻塞事件循环）。
     """
     proc = _processes.get(process_id)
     if not proc:
         raise HTTPException(404, "工艺不存在，请先在工艺库中创建")
     _ensure_active(proc)
-    data = await request.body()
+    data = await read_body_limited(
+        request,
+        MAX_PDF_BYTES,
+        too_large_detail=f"PDF 过大（>{MAX_PDF_BYTES // 1024 // 1024}MB），请拆分后再封装",
+    )
     if not data:
         raise HTTPException(400, "缺少 PDF 文件内容（raw bytes body）")
-    if len(data) > MAX_PDF_BYTES:
-        raise HTTPException(413, f"PDF 过大（>{MAX_PDF_BYTES // 1024 // 1024}MB），请拆分后再封装")
+    # 异步读取请求体完成后再次校验工艺仍存在且未归档
+    proc = _processes.get(process_id)
+    if not proc:
+        raise HTTPException(404, "工艺不存在，请先在工艺库中创建")
+    _ensure_active(proc)
+    icc_bytes = read_icc_or_409(_processes, process_id)
     try:
-        result = package_pdfx(
+        result = await asyncio.to_thread(
+            package_pdfx,
             data,
-            _processes.icc_bytes(process_id),
+            icc_bytes,
             proc.get("icc_meta") or {},
             process_name=proc.get("name", ""),
             filename=filename,

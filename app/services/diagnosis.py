@@ -198,10 +198,9 @@ def _rule_gray_balance(q: dict) -> list[Finding]:
     if not gb:
         return []
     out = []
-    worst = max(gb, key=lambda g: g.get("mag") or 0.0)
     bad = [g for g in gb if abs(g.get("da") or 0.0) > GB_AB_MAX or abs(g.get("db") or 0.0) > GB_AB_MAX]
     if bad:
-        w = worst
+        w = max(bad, key=lambda g: g.get("mag") or 0.0)
         fixes = []
         if (w.get("da") or 0.0) > 0:
             fixes.append("a* 偏红→降低 M 量（或提高 C）")
@@ -325,11 +324,13 @@ def _rule_gatf_color(q: dict) -> list[Finding]:
         if he is None or gr is None:
             continue
         if float(he) > HUE_ERROR_INFO or float(gr) > GRAYNESS_INFO:
+            strength = m.get("strength")
+            ev = f"DH={float(strength):.2f}" if strength is not None else ""
             out.append(Finding(
                 rule="R8",
                 severity="info",
                 title=f"{ink} 油墨色偏解读：色相误差 {he * 100:.0f}% / 灰度 {gr * 100:.0f}%",
-                evidence=f"DH={m.get('strength'):.2f}",
+                evidence=ev,
                 cause="原生油墨色偏或叠印脏化（灰度偏高提示杂质灰分）",
                 action="对照工艺目标油墨核对，必要时对色/换墨",
                 ref="GATF 三滤色指标口径",

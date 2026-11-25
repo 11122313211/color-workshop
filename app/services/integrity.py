@@ -24,7 +24,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from .filedb import JsonStore
+from .filedb import JsonStore, MAINTENANCE_LOCK
 from .processes import DATA_DIR, PROFILE_DIR, ProcessStore
 
 ORPHANED_ICC_DIR = DATA_DIR / "orphaned_icc"
@@ -452,6 +452,13 @@ def repair(dry_run: bool = True, actions=None) -> dict:
     """审计并按策略修复；``dry_run=True`` 只生成计划，不写盘。"""
     filters = _normalize_filters(actions)
     specs = _selected_specs(filters)
+    if dry_run:
+        return _repair_impl(dry_run=True, specs=specs)
+    with MAINTENANCE_LOCK:
+        return _repair_impl(dry_run=False, specs=specs)
+
+
+def _repair_impl(dry_run: bool, specs: list[dict]) -> dict:
     report = build_report()
     details = report["details"]
     summary = report["summary"]
@@ -551,87 +558,101 @@ def _apply(details: dict, specs: list[dict], executed: dict) -> None:
     selected = {spec["action"] for spec in specs}
     now = _now()
 
-    if "detach_orphan_measurement_sessions" in selected:
+    if "detach_orphan_measurement_sessions" in selected and details["orphan_measurement_sessions"]:
         store = _store("measurements.json")
-        for item in details["orphan_measurement_sessions"]:
-            sid = item.get("id", "")
-            doc = store.get(sid)
-            if not doc or doc.get("process_id") != item.get("process_id"):
-                executed["skipped"]["items"] += 1
-                continue
-            doc["process_id"] = ""
-            doc["detached_from_process"] = item.get("process_id", "")
-            doc["detached_at"] = now
-            store.put(sid, doc)
-            executed["detached"]["measurement_sessions"] += 1
 
-    if "detach_orphan_evaluations" in selected:
+        def _detach_ms(data: dict) -> None:
+            for item in details["orphan_measurement_sessions"]:
+                sid = item.get("id", "")
+                doc = data.get(sid)
+                if not isinstance(doc, dict) or doc.get("process_id") != item.get("process_id"):
+                    executed["skipped"]["items"] += 1
+                    continue
+                doc["process_id"] = ""
+                doc["detached_from_process"] = item.get("process_id", "")
+                doc["detached_at"] = now
+                executed["detached"]["measurement_sessions"] += 1
+
+        store.update(_detach_ms)
+
+    if "detach_orphan_evaluations" in selected and details["orphan_evaluations"]:
         store = _store("evaluations.json")
-        for item in details["orphan_evaluations"]:
-            eid = item.get("id", "")
-            doc = store.get(eid)
-            if not doc or doc.get("process_id") != item.get("process_id"):
-                executed["skipped"]["items"] += 1
-                continue
-            doc["process_id"] = ""
-            doc["detached_from_process"] = item.get("process_id", "")
-            doc["detached_at"] = now
-            store.put(eid, doc)
-            executed["detached"]["evaluations"] += 1
 
-    if "mark_orphan_signoffs" in selected:
+        def _detach_ev(data: dict) -> None:
+            for item in details["orphan_evaluations"]:
+                eid = item.get("id", "")
+                doc = data.get(eid)
+                if not isinstance(doc, dict) or doc.get("process_id") != item.get("process_id"):
+                    executed["skipped"]["items"] += 1
+                    continue
+                doc["process_id"] = ""
+                doc["detached_from_process"] = item.get("process_id", "")
+                doc["detached_at"] = now
+                executed["detached"]["evaluations"] += 1
+
+        store.update(_detach_ev)
+
+    if "mark_orphan_signoffs" in selected and details["orphan_signoffs"]:
         store = _store("signoffs.json")
-        for item in details["orphan_signoffs"]:
-            sid = item.get("id", "")
-            doc = store.get(sid)
-            if (
-                not doc
-                or doc.get("process_id") != item.get("process_id")
-                or doc.get("orphaned_at")
-            ):
-                executed["skipped"]["items"] += 1
-                continue
-            doc["orphaned_at"] = now
-            doc["orphan_reason"] = ORPHAN_REASON_MISSING_PROCESS
-            store.put(sid, doc)
-            executed["orphaned"]["signoffs"] += 1
 
-    if "delete_orphan_recipes" in selected:
+        def _mark_sg(data: dict) -> None:
+            for item in details["orphan_signoffs"]:
+                sid = item.get("id", "")
+                doc = data.get(sid)
+                if (
+                    not isinstance(doc, dict)
+                    or doc.get("process_id") != item.get("process_id")
+                    or doc.get("orphaned_at")
+                ):
+                    executed["skipped"]["items"] += 1
+                    continue
+                doc["orphaned_at"] = now
+                doc["orphan_reason"] = ORPHAN_REASON_MISSING_PROCESS
+                executed["orphaned"]["signoffs"] += 1
+
+        store.update(_mark_sg)
+
+    if "delete_orphan_recipes" in selected and details["orphan_recipes"]:
         store = _store("recipes.json")
-        for item in details["orphan_recipes"]:
-            if store.delete(item.get("id", "")):
-                executed["deleted"]["recipes"] += 1
-            else:
-                executed["skipped"]["items"] += 1
+        keys = [item.get("id", "") for item in details["orphan_recipes"]]
+        removed = store.delete_many(keys)
+        executed["deleted"]["recipes"] += removed
+        executed["skipped"]["items"] += max(0, len(keys) - removed)
 
-    if "delete_orphan_compensations" in selected:
+    if "delete_orphan_compensations" in selected and details["orphan_compensations"]:
         store = _store("compensations.json")
-        for item in details["orphan_compensations"]:
-            if store.delete(item.get("process_id", "")):
-                executed["deleted"]["compensations"] += 1
-            else:
-                executed["skipped"]["items"] += 1
+        keys = [item.get("process_id", "") for item in details["orphan_compensations"]]
+        removed = store.delete_many(keys)
+        executed["deleted"]["compensations"] += removed
+        executed["skipped"]["items"] += max(0, len(keys) - removed)
 
-    if "delete_orphan_calibrations" in selected:
+    if "delete_orphan_calibrations" in selected and details["orphan_calibrations"]:
         store = _store("calibrations.json")
-        for item in details["orphan_calibrations"]:
-            if store.delete(item.get("id", "")):
-                executed["deleted"]["calibrations"] += 1
-            else:
-                executed["skipped"]["items"] += 1
+        keys = [item.get("id", "") for item in details["orphan_calibrations"]]
+        removed = store.delete_many(keys)
+        executed["deleted"]["calibrations"] += removed
+        executed["skipped"]["items"] += max(0, len(keys) - removed)
 
-    if "delete_orphan_passports" in selected:
+    if "delete_orphan_passports" in selected and details["orphan_passports"]:
         store = _store("passports.json")
-        for item in details["orphan_passports"]:
-            pid = item.get("process_id", "")
-            if store.delete(pid):
-                executed["deleted"]["passports"] += int(item.get("versions", 0) or 0)
-            else:
-                executed["skipped"]["items"] += 1
+
+        def _del_pp(data: dict) -> None:
+            for item in details["orphan_passports"]:
+                pid = item.get("process_id", "")
+                if pid in data:
+                    del data[pid]
+                    executed["deleted"]["passports"] += int(item.get("versions", 0) or 0)
+                else:
+                    executed["skipped"]["items"] += 1
+
+        store.update(_del_pp)
 
     if "quarantine_unreferenced_icc" in selected:
         for item in details["unreferenced_icc"]:
-            filename = item.get("filename", "")
+            filename = Path(str(item.get("filename", ""))).name
+            if not filename:
+                executed["skipped"]["items"] += 1
+                continue
             source = PROFILE_DIR / filename
             if not source.exists():
                 executed["skipped"]["items"] += 1
