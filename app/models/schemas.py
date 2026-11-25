@@ -366,8 +366,15 @@ class RecipeVerifyResponse(BaseModel):
 
 
 class PreflightRequest(BaseModel):
-    image_b64: str = Field(..., max_length=MAX_B64_CHARS)
+    image_b64: Optional[str] = Field(None, max_length=MAX_B64_CHARS)
     filename: str = ""
+    # P0-#2 跨项目打通：支持直接消费 PrintGuard Pro 导出的机读 JSON 报告、校验工艺护照指纹与查询专色色域
+    printguard_report: Optional[dict] = None
+    process_id: str = ""
+    passport_hash: str = ""
+    expected_icc_sha256: str = ""
+    spot_colors: Optional[list] = None
+    spot_tolerance: float = Field(2.0, gt=0.0, le=20.0)
 
 
 class PreflightIssue(BaseModel):
@@ -393,6 +400,29 @@ class PreflightReport(BaseModel):
     # 渲染验证防线（仅 PDF 预检返回，含 verified/warning/rejected 分级）
     render_check: Optional[str] = None
     render_verification: Optional[dict] = None
+    # P0-#2 跨项目打通：工艺护照指纹门禁、专色色域核验与 PrintGuard 摘要
+    passport_gate: Optional[dict] = None
+    spot_check: Optional[dict] = None
+    printguard_summary: Optional[dict] = None
+
+
+class SpotCheckRequest(BaseModel):
+    process_id: str
+    spots: list = Field(default_factory=list, max_length=64, description="专色名或 {name, lab?, cmyk?, rgb?, hex?} 列表")
+    tolerance: float = Field(2.0, gt=0.0, le=20.0, description="色域内判定 ΔE₀₀ 容差（默认 2.0）")
+
+
+class SpotCheckResponse(BaseModel):
+    process_id: str
+    process_name: str = ""
+    device_space: str = ""
+    icc_sha256: str = ""
+    passport_summary: Optional[dict] = None
+    tolerance: float = 2.0
+    verdict: str = "verified"
+    summary: dict = {}
+    items: list[dict] = []
+    note: str = ""
 
 
 class FileConvertRequest(BaseModel):

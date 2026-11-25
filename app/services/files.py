@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 
 import numpy as np
@@ -60,6 +61,7 @@ def _image_preflight(image_bytes: bytes, filename: str = "") -> dict:
     issues: list[dict] = []
 
     if icc_profile_bytes:
+        embedded_sha = hashlib.sha256(icc_profile_bytes).hexdigest()
         try:
             embedded = ProcessStore.parse_meta(icc_profile_bytes)
         except Exception:  # noqa: BLE001 —— 损坏的嵌入 profile 不阻断预检
@@ -68,7 +70,8 @@ def _image_preflight(image_bytes: bytes, filename: str = "") -> dict:
                 "level": "warn",
                 "message": "文件嵌入了 ICC profile 但无法解析，建议重新导出文件",
             })
-        if embedded:
+        embedded = {**embedded, "sha256": embedded_sha}
+        if embedded.get("description") or embedded.get("device_space"):
             issues.append({
                 "level": "info",
                 "message": f"已嵌入 ICC：{embedded.get('description', '未知')}",
@@ -498,12 +501,21 @@ def _pdf_preflight(
                     }
                 )
 
-    # 输出意图（PDF/X 常见）
+    # 输出意图（PDF/X 常见；提取 DestOutputProfile 的真实 SHA-256 供工艺护照指纹门禁比对）
+    output_intent_icc_sha256 = ""
     try:
         root = reader.trailer["/Root"]
         oi = root.get("/OutputIntents")
-        pdf["has_output_intent"] = bool(oi and len(oi.get_object()))
+        oi_arr = oi.get_object() if oi is not None else None
+        pdf["has_output_intent"] = bool(oi_arr and len(oi_arr))
         if pdf["has_output_intent"]:
+            first_oi = _deref(oi_arr[0])
+            dest_prof = _deref(first_oi.get("/DestOutputProfile")) if hasattr(first_oi, "get") else None
+            if dest_prof is not None and hasattr(dest_prof, "get_data"):
+                prof_bytes = bytes(dest_prof.get_data())
+                if prof_bytes:
+                    output_intent_icc_sha256 = hashlib.sha256(prof_bytes).hexdigest()
+                    pdf["output_intent_icc_sha256"] = output_intent_icc_sha256
             issues.append({
                 "level": "info",
                 "message": "已嵌入输出意图（Output Intent），色彩将以印刷条件为基准",
@@ -666,6 +678,8 @@ def _pdf_preflight(
         "format": "PDF",
         "mode": "PDF",
         "size": [int(first[0]), int(first[1])],
+        "has_embedded_icc": bool(output_intent_icc_sha256),
+        "embedded_icc": {"sha256": output_intent_icc_sha256} if output_intent_icc_sha256 else {},
         "pages": pages,
         "pdf": pdf,
         "thumbnail_b64": thumbnail_b64,
