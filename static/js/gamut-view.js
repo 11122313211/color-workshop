@@ -18,8 +18,44 @@ export function registerRenderer(name, impl) {
   renderers.set(name, impl);
 }
 
-/** sRGB 参考原色 xy 色度坐标（与后端 _SRGB_PRIMARIES_XY 一致，唯一真源在组件层） */
-export const SRGB_XY = [[0.64, 0.33], [0.30, 0.6], [0.15, 0.06]];
+/** 标准 D65 参考色域元数据（与后端 _REFERENCE_GAMUTS_XY 一致） */
+export const STANDARD_GAMUTS = [
+  {
+    id: "srgb",
+    label: "sRGB",
+    shortLabel: "sRGB",
+    color: "var(--accent)",
+    dotClass: "gamut-dot-srgb",
+    points: [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
+  },
+  {
+    id: "dci-p3",
+    label: "Display P3",
+    shortLabel: "P3",
+    color: "var(--teal)",
+    dotClass: "gamut-dot-p3",
+    points: [[0.68, 0.32], [0.265, 0.69], [0.15, 0.06]],
+  },
+  {
+    id: "adobe-rgb",
+    label: "Adobe RGB",
+    shortLabel: "Adobe RGB",
+    color: "var(--yellow)",
+    dotClass: "gamut-dot-adobe",
+    points: [[0.64, 0.33], [0.21, 0.71], [0.15, 0.06]],
+  },
+  {
+    id: "rec2020",
+    label: "Rec.2020",
+    shortLabel: "Rec.2020",
+    color: "var(--orange)",
+    dotClass: "gamut-dot-rec2020",
+    points: [[0.708, 0.292], [0.17, 0.797], [0.131, 0.046]],
+  },
+];
+
+/** sRGB 参考原色 xy 色度坐标（向后兼容旧引用） */
+export const SRGB_XY = STANDARD_GAMUTS[0].points;
 
 /* ---------- canvas2d 渲染器（2D + 斜投影伪 3D） ---------- */
 
@@ -72,35 +108,57 @@ function draw2d(canvas, data, state, spectrum) {
   const labs = data.lab_points || [];
   // 按 L* 升序绘制：暗色在下、亮色在上，缓解 xy 投影大量重叠时的暗色糊板
   const order = labs.map((_, i) => i).sort((a, b) => labs[a][0] - labs[b][0]);
+  // 构建原索引 -> 排序后索引的反向映射，确保凸包顶点与 L* 切片严格对齐排序后数组
+  const rank = new Int32Array(labs.length);
+  order.forEach((origIdx, sortedIdx) => {
+    rank[origIdx] = sortedIdx;
+  });
+  const orderedPoints = order.map((i) => data.xy_points[i]);
+  const orderedLabs = order.map((i) => labs[i]);
+  const orderedHull =
+    state.showHull !== false && Array.isArray(data.hull) && data.hull.length >= 3
+      ? data.hull.map((origIdx) => rank[origIdx]).filter((i) => i !== undefined)
+      : null;
+
   const alphaFn =
     slice == null
       ? undefined
-      : (i) => (Math.abs(labs[i][0] - slice) <= 6 ? 0.95 : 0.06);
+      : (i) => (Math.abs(orderedLabs[i][0] - slice) <= 6 ? 0.95 : 0.06);
   const hiddenPoints = state.showPoints === false;
-  const projector = drawCie(
-    canvas,
-    [
-      // ColorThink 式嵌套：大色域 sRGB 半透明在下层
-      { points: SRGB_XY, color: "var(--accent)", fill: true, fillAlpha: 0.13 },
-      {
-        points: order.map((i) => data.xy_points[i]),
-        labPoints: order.map((i) => labs[i]),
-        hull: data.hull,
-        color: "var(--indigo)",
-        alphaFn,
-        pointSize: 1.7,
-        pointAlpha: 0.72,
-        hidePoints: hiddenPoints,
-        hullAlpha: 0.14,
-        hullWidth: 2,
-      },
-    ],
-    { spectrum: state.showSpectrum === false ? null : spectrum }
-  );
+
+  // ColorThink 式嵌套：大参考色域在下层、小参考色域在上层，用户可任意勾选/叠加
+  const selectedGamuts = state.selectedGamuts || new Set(["srgb"]);
+  const series = [];
+  for (let i = STANDARD_GAMUTS.length - 1; i >= 0; i--) {
+    const g = STANDARD_GAMUTS[i];
+    if (!selectedGamuts.has(g.id)) continue;
+    series.push({
+      points: g.points,
+      color: g.color,
+      fill: true,
+      fillAlpha: g.id === "srgb" ? 0.13 : 0.08,
+    });
+  }
+  series.push({
+    points: orderedPoints,
+    labPoints: orderedLabs,
+    hull: orderedHull,
+    color: "var(--indigo)",
+    alphaFn,
+    pointSize: 1.7,
+    pointAlpha: 0.72,
+    hidePoints: hiddenPoints,
+    hullAlpha: 0.14,
+    hullWidth: 2,
+  });
+
+  const projector = drawCie(canvas, series, {
+    spectrum: state.showSpectrum === false ? null : spectrum,
+  });
   // 屏幕坐标缓存（hover 命中测试用，顺序与绘制顺序一致）
-  const points = order.map((i) => {
-    const [sx, sy] = projector.toScreen(data.xy_points[i][0], data.xy_points[i][1]);
-    return { sx, sy, lab: labs[i], xy: data.xy_points[i] };
+  const points = orderedPoints.map((xy, i) => {
+    const [sx, sy] = projector.toScreen(xy[0], xy[1]);
+    return { sx, sy, lab: orderedLabs[i], xy };
   });
   return { points, spectrumPoints: projector.spectrumPoints || [] };
 }
@@ -187,11 +245,15 @@ registerRenderer("canvas2d", canvas2d);
 /* ---------- 视图组件 ---------- */
 
 /**
- * createGamutView(el, { getData, levels })
+ * createGamutView(el, { getData, levels, intents, defaultIntent, onData })
  * 返回 { setMode, setSlice, setRotation, onHover, redraw, destroy }
  */
-export function createGamutView(el, { getData, levels = 7 } = {}) {
+export function createGamutView(
+  el,
+  { getData, levels = 7, intents = false, defaultIntent = "relative", onData = null } = {}
+) {
   let mode = "2d";
+  let intent = defaultIntent;
   let theta = 35;
   let phi = 25;
   let zoom = 2.2;
@@ -202,11 +264,34 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
   let screenPts = [];
   let spectrumPts = [];
   let showSpectrum = true;
+  let showHull = true;
   let showPoints = true;
+  const selectedGamuts = new Set(["srgb"]);
+  const dataCache = new Map();
+  let loadSeq = 0;
   let dragging = false;
   let lastPointer = null;
   let disposed = false;
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const refGamutButtons = STANDARD_GAMUTS.map(
+    (g) => `
+        <button class="gamut-layer-toggle" type="button" data-gamut="${g.id}"
+          aria-pressed="${selectedGamuts.has(g.id) ? "true" : "false"}"
+          title="显示 / 隐藏 ${g.label} 参考色域（仅 2D）">
+          <i class="gamut-dot ${g.dotClass}" aria-hidden="true"></i><span>${g.label}</span>
+        </button>`
+  ).join("");
+
+  const intentSwitchHtml = intents
+    ? `
+      <div class="seg seg-compact" data-role="intent" title="切换 ICC 色度采样意图">
+        <button type="button" data-intent="relative" class="${intent === "relative" ? "active" : ""}"
+          title="相对色度（A2B1 表，纸白归一化到 D65）">相对色度</button>
+        <button type="button" data-intent="absolute" class="${intent === "absolute" ? "active" : ""}"
+          title="绝对色度（含真实纸张底色偏移）">绝对色度</button>
+      </div>`
+    : "";
 
   el.innerHTML = `
     <div class="gamut-toolbar">
@@ -214,13 +299,17 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
         <button data-mode="2d" class="active">2D 平面</button>
         <button data-mode="3d">3D 体积</button>
       </div>
-      <div class="gamut-legend" role="group" aria-label="色域图层">
+      ${intentSwitchHtml}
+      <div class="gamut-legend" role="group" aria-label="色域与图层选择">
         <button class="gamut-layer-toggle" type="button" data-layer="spectrum" aria-pressed="true"
           title="显示 / 隐藏 CIE 光谱轨迹（仅 2D）">
           <i class="gamut-dot gamut-dot-spectrum" aria-hidden="true"></i><span>光谱轨迹</span>
         </button>
-        <span class="gamut-key-item"><i class="gamut-dot gamut-dot-srgb" aria-hidden="true"></i>sRGB</span>
-        <span class="gamut-key-item"><i class="gamut-dot gamut-dot-hull" aria-hidden="true"></i>工艺凸包</span>
+        ${refGamutButtons}
+        <button class="gamut-layer-toggle" type="button" data-layer="hull" aria-pressed="true"
+          title="显示 / 隐藏工艺凸包边界（3D 下控制凸包外壳）">
+          <i class="gamut-dot gamut-dot-hull" aria-hidden="true"></i><span>工艺凸包</span>
+        </button>
         <button class="gamut-layer-toggle" type="button" data-layer="points" aria-pressed="true"
           title="显示 / 隐藏采样点（按 L* 着色）">
           <i class="gamut-dot gamut-dot-proc" aria-hidden="true"></i><span>采样点</span>
@@ -296,25 +385,69 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     b.textContent = threeState === "ready" ? "WebGL · three.js" : "Canvas 回退";
   }
 
+  function updateSampledText() {
+    if (!data || !data.sampled) {
+      sampledEl.textContent = "";
+      return;
+    }
+    const covMap = data.coverages || { srgb: data.coverage_srgb };
+    const picked = STANDARD_GAMUTS.filter((g) => selectedGamuts.has(g.id));
+    const parts = [`${data.sampled} 采样点`];
+    if (picked.length === 1) {
+      const g = picked[0];
+      const v = covMap[g.id];
+      if (v != null) parts.push(`${g.label} 覆盖 ${(v * 100).toFixed(0)}%`);
+    } else if (picked.length > 1) {
+      for (const g of picked) {
+        const v = covMap[g.id];
+        if (v != null) parts.push(`${g.shortLabel} ${(v * 100).toFixed(0)}%`);
+      }
+    } else if (data.coverage_srgb != null) {
+      parts.push(`sRGB 覆盖 ${(data.coverage_srgb * 100).toFixed(0)}%`);
+    }
+    sampledEl.textContent = parts.join(" · ");
+  }
+
   function updateLayerUI() {
     const spectrumToggle = el.querySelector('[data-layer="spectrum"]');
+    const hullToggle = el.querySelector('[data-layer="hull"]');
     const pointsToggle = el.querySelector('[data-layer="points"]');
     const hint = el.querySelector('[data-role="hint"]');
-    [spectrumToggle, pointsToggle].forEach((btn) => {
+    [
+      [spectrumToggle, showSpectrum],
+      [hullToggle, showHull],
+      [pointsToggle, showPoints],
+    ].forEach(([btn, on]) => {
       if (!btn) return;
-      const on = btn.dataset.layer === "spectrum" ? showSpectrum : showPoints;
       btn.setAttribute("aria-pressed", String(on));
       btn.classList.toggle("is-off", !on);
+    });
+    el.querySelectorAll("button[data-gamut]").forEach((btn) => {
+      const id = btn.dataset.gamut;
+      const on = selectedGamuts.has(id);
+      const meta = STANDARD_GAMUTS.find((g) => g.id === id);
+      btn.setAttribute("aria-pressed", String(on));
+      btn.classList.toggle("is-off", !on);
+      btn.disabled = mode === "3d";
+      btn.title =
+        mode === "3d"
+          ? "标准参考色域仅在 2D 平面显示"
+          : `显示 / 隐藏 ${meta?.label || id} 参考色域`;
     });
     if (spectrumToggle) {
       spectrumToggle.disabled = mode === "3d";
       spectrumToggle.title =
         mode === "3d" ? "光谱轨迹仅在 2D 平面显示" : "显示 / 隐藏 CIE 光谱轨迹";
     }
+    if (hullToggle) {
+      hullToggle.title =
+        mode === "3d" ? "显示 / 隐藏 3D 凸包外壳网格" : "显示 / 隐藏工艺凸包轮廓";
+    }
     if (hint) {
       hint.textContent =
         mode === "3d" ? "拖拽旋转 · 双击复位" : "悬停读取：采样点 / 光谱波长";
     }
+    updateSampledText();
   }
   updateLayerUI();
 
@@ -335,7 +468,17 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     rafId = requestAnimationFrame(() => {
       rafId = 0;
       if (disposed || !data) return;
-      const renderState = { mode, theta, phi, slice, zoom, showSpectrum, showPoints };
+      const renderState = {
+        mode,
+        theta,
+        phi,
+        slice,
+        zoom,
+        showSpectrum,
+        showHull,
+        showPoints,
+        selectedGamuts,
+      };
       if (mode === "3d" && threeState === "ready") {
         if (!glCanvas) {
           glCanvas = document.createElement("canvas");
@@ -412,18 +555,35 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
   }
 
   /* —— 数据加载 —— */
-  async function load() {
-    loading.hidden = false;
-    canvas.hidden = true;
-    try {
-      [data, spectrum] = await Promise.all([getData(), fetchSpectrum().catch(() => null)]);
-      if (disposed) return;
+  async function load(targetIntent = intent) {
+    const seq = ++loadSeq;
+    const cached = dataCache.get(targetIntent);
+    if (cached && spectrum !== undefined) {
+      data = cached;
       loading.hidden = true;
-      canvas.hidden = false;
-      sampledEl.textContent = data.sampled ? `${data.sampled} 采样点 · sRGB 覆盖 ${(data.coverage_srgb * 100).toFixed(0)}%` : "";
+      updateSampledText();
+      if (onData) onData(data);
+      schedule();
+      return;
+    }
+    loading.hidden = false;
+    if (!data) canvas.hidden = true;
+    try {
+      const [loadedData, loadedSpectrum] = await Promise.all([
+        getData(targetIntent),
+        spectrum ? Promise.resolve(spectrum) : fetchSpectrum().catch(() => null),
+      ]);
+      if (disposed || seq !== loadSeq) return;
+      data = loadedData;
+      spectrum = loadedSpectrum;
+      dataCache.set(targetIntent, data);
+      loading.hidden = true;
+      if (mode !== "3d" || threeState !== "ready") canvas.hidden = false;
+      updateSampledText();
+      if (onData) onData(data);
       schedule();
     } catch (e) {
-      if (disposed) return;
+      if (disposed || seq !== loadSeq) return;
       loading.hidden = true;
       stage.innerHTML = `<div class="gamut-error">${esc(e.message)}</div>`;
     }
@@ -512,11 +672,37 @@ export function createGamutView(el, { getData, levels = 7 } = {}) {
     schedule();
   });
 
+  const intentBar = el.querySelector('[data-role="intent"]');
+  if (intentBar) {
+    intentBar.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-intent]");
+      if (!btn || btn.dataset.intent === intent) return;
+      intent = btn.dataset.intent;
+      intentBar.querySelectorAll("button[data-intent]").forEach((b) =>
+        b.classList.toggle("active", b === btn)
+      );
+      hideTip();
+      load(intent);
+    });
+  }
+
   el.querySelector(".gamut-legend").addEventListener("click", (e) => {
+    const gamutBtn = e.target.closest("button[data-gamut]");
+    if (gamutBtn && !gamutBtn.disabled) {
+      const id = gamutBtn.dataset.gamut;
+      if (selectedGamuts.has(id)) selectedGamuts.delete(id);
+      else selectedGamuts.add(id);
+      hideTip();
+      updateLayerUI();
+      schedule();
+      return;
+    }
     const btn = e.target.closest("button[data-layer]");
     if (!btn || btn.disabled) return;
     if (btn.dataset.layer === "spectrum") {
       showSpectrum = !showSpectrum;
+    } else if (btn.dataset.layer === "hull") {
+      showHull = !showHull;
     } else if (btn.dataset.layer === "points") {
       showPoints = !showPoints;
     }

@@ -48,3 +48,11 @@ def test_api_js_handles_structured_error_detail(api_client):
     assert ".message" in text
     assert ".code" in text
     assert "PROCESS_ARCHIVED" in text or "String(detail" in text
+
+
+def test_gamut_view_exposes_reference_gamuts_hull_toggle_and_remapped_indices(api_client):
+    text = _text(api_client, "/static/js/gamut-view.js")
+    for token in ("STANDARD_GAMUTS", "dci-p3", "adobe-rgb", "rec2020", 'data-layer="hull"', "orderedHull", "orderedLabs"):
+        assert token in text, token
+    three_text = _text(api_client, "/static/js/gamut-three.js")
+    assert "state.showHull" in three_text and "state.showPoints" in three_text

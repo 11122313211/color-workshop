@@ -21,6 +21,7 @@ from ..services.lifecycle import (
     permanently_delete_process,
 )
 from ..services.processes import (
+    GAMUT_INTENTS,
     PROCESS_MEASUREMENT_CONDITIONS,
     ProcessArchivedError,
     ProcessStore,
@@ -327,12 +328,18 @@ def download_icc(pid: str):
 
 
 @router.get("/{pid}/gamut")
-def process_gamut(pid: str, levels: int = 6):
+def process_gamut(
+    pid: str,
+    levels: int = 6,
+    intent: str = Query("relative", description="采样渲染意图：relative（相对色度）| absolute（绝对色度）"),
+):
+    if intent not in GAMUT_INTENTS:
+        raise HTTPException(422, "intent 仅支持 relative / absolute")
     doc = process_store.get(pid)
     if not doc:
         raise HTTPException(404, "工艺不存在")
     try:
-        return sample_process_gamut(doc, levels=max(3, min(levels, 10)))
+        return sample_process_gamut(doc, levels=max(3, min(levels, 10)), intent=intent)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"色域采样失败: {e}") from e
 

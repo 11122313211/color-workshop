@@ -333,8 +333,20 @@ def evict_gamut_cache(icc_sha256: str) -> None:
         for key in [k for k in _gamut_cache if k.startswith(prefix)]:
             _gamut_cache.pop(key, None)
 
-# sRGB 三原色 xy 色度坐标（D65），与前端色度图绘制的参考三角形一致
-_SRGB_PRIMARIES_XY = ((0.6400, 0.3300), (0.3000, 0.6000), (0.1500, 0.0600))
+# 标准 D65 参考色域原色 xy 色度坐标（与前端标准参考色域绘制保持一致）
+_REFERENCE_GAMUTS_XY: dict[str, tuple[tuple[float, float], ...]] = {
+    "srgb": ((0.6400, 0.3300), (0.3000, 0.6000), (0.1500, 0.0600)),
+    "dci-p3": ((0.6800, 0.3200), (0.2650, 0.6900), (0.1500, 0.0600)),
+    "adobe-rgb": ((0.6400, 0.3300), (0.2100, 0.7100), (0.1500, 0.0600)),
+    "rec2020": ((0.7080, 0.2920), (0.1700, 0.7970), (0.1310, 0.0460)),
+}
+_SRGB_PRIMARIES_XY = _REFERENCE_GAMUTS_XY["srgb"]
+
+# 工艺色域采样支持的 ICC 色度渲染意图（默认相对色度，读取真实测量色度表 A2B1）
+GAMUT_INTENTS: dict[str, ImageCms.Intent] = {
+    "relative": ImageCms.Intent.RELATIVE_COLORIMETRIC,
+    "absolute": ImageCms.Intent.ABSOLUTE_COLORIMETRIC,
+}
 
 
 def _convex_hull_indices(points) -> list[int]:
@@ -381,20 +393,30 @@ def _point_in_srgb_triangle(xy) -> bool:
     return a >= -1e-9 and b >= -1e-9 and c >= -1e-9
 
 
-def sample_process_gamut(process: dict, levels: int = 6) -> dict:
+def sample_process_gamut(process: dict, levels: int = 6, intent: str = "relative") -> dict:
     """经工艺 ICC 采样设备空间网格 -> Lab，返回色域数据。
 
+    参数:
+        process: 工艺文档（含 icc_file / icc_sha256 / icc_meta）
+        levels: 每通道采样阶数（如 CMYK 下 levels=7 采样 7⁴=2401 点）
+        intent: ICC 色度渲染意图（"relative" 相对色度默认 / "absolute" 绝对色度含纸白）
+
     返回:
-        xy_points: CIE 1931 xy 色度点集（PCS 为 D50 Lab，按 D50 白点转 XYZ）
+        xy_points: CIE 1931 xy 色度点集（PCS D50 Lab 经 Bradford 色适应至 D65，与参考色域同基准）
         lab_points: 与 xy_points 等长对齐的 Lab 点集（前端 L* 着色 / 3D 投影用）
-        hull: 凸包顶点在 xy_points/lab_points 中的索引（闭合顺序，按 Y 过滤暗点）
-        coverage_srgb: 采样点落在 sRGB 三角形内的比例（近似覆盖率）
+        hull: 凸包顶点在 xy_points/lab_points 中的索引（闭合顺序，仅统计物理有效色度点）
+        coverage_srgb: 工艺凸包与 sRGB 三角形的交集面积占 sRGB 面积的比例
+        coverages: 工艺凸包对 srgb / dci-p3 / adobe-rgb / rec2020 的 xy 面积覆盖率字典
+        intent: 本次采样使用的渲染意图（"relative" | "absolute"）
         volume: Lab 包围盒体积估计
         L_range/a_range/b_range: 各维范围
         sampled: 采样点数
     """
-    # 缓存键必须含 levels：同工艺不同采样密度是不同结果
-    key = f"{process['icc_sha256']}:{levels}"
+    if intent not in GAMUT_INTENTS:
+        raise ValueError(f"不支持的渲染意图: {intent}（仅支持 relative / absolute）")
+
+    # 缓存键必须含 levels 与 intent：同工艺不同采样密度或渲染意图是不同结果
+    key = f"{process['icc_sha256']}:{levels}:{intent}"
     with _gamut_lock:
         cached = _gamut_cache.get(key)
         if cached is not None:
@@ -414,9 +436,16 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
     prof_lab = ImageCms.createProfile("LAB")
     xform = None
     last_err: Exception | None = None
+    cms_intent = GAMUT_INTENTS[intent]
     for in_mode in in_modes:
         try:
-            xform = ImageCms.buildTransform(prof_dev, prof_lab, in_mode, "LAB")
+            xform = ImageCms.buildTransform(
+                prof_dev,
+                prof_lab,
+                in_mode,
+                "LAB",
+                renderingIntent=cms_intent,
+            )
             break
         except Exception as e:  # noqa: BLE001 —— 逐候选尝试签名
             last_err = e
@@ -437,20 +466,53 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
     lab[:, 0] = raw[:, 0] / 2.55
     lab[:, 1:] = raw[:, 1:].astype(np.int8)
 
-    # Lab(D50) -> XYZ(D50) -> xy 色度坐标
-    d50 = colour.CCS_ILLUMINANTS["CIE 1931 2 Degree Standard Observer"]["D50"]
-    xyz = colour.Lab_to_XYZ(lab, illuminant=d50)
-    xy = colour.XYZ_to_xyY(xyz)[:, :2]
+    # Lab(D50 PCS) -> XYZ(D50) -> Bradford 色适应至 XYZ(D65)，对齐 D65 白点与标准色域三角形
+    d50_xy = colour.CCS_ILLUMINANTS["CIE 1931 2 Degree Standard Observer"]["D50"]
+    d65_xy = colour.CCS_ILLUMINANTS["CIE 1931 2 Degree Standard Observer"]["D65"]
+    xyz_d50 = colour.Lab_to_XYZ(lab, illuminant=d50_xy)
+    xyz_d65 = colour.chromatic_adaptation(
+        xyz_d50,
+        colour.xy_to_XYZ(d50_xy),
+        colour.xy_to_XYZ(d65_xy),
+        transform="Bradford",
+    )
+
+    # 物理有效色度掩码：排除 Y≈0 暗部奇异点及非物理负 XYZ，避免 0/0 噪声拉歪凸包
+    valid_mask = (xyz_d65[:, 0] >= 0.0) & (xyz_d65[:, 1] > 1e-4) & (xyz_d65[:, 2] >= 0.0)
+
+    # 保持 xy_points 与 lab_points 等长对齐；极少数负分量截零，零和全黑点归位至 D65 白点色度
+    xyz_safe = np.maximum(xyz_d65, 0.0)
+    totals = xyz_safe.sum(axis=1)
+    xy = np.empty((len(xyz_safe), 2), dtype=np.float64)
+    nonzero = totals > 1e-6
+    xy[nonzero, 0] = xyz_safe[nonzero, 0] / totals[nonzero]
+    xy[nonzero, 1] = xyz_safe[nonzero, 1] / totals[nonzero]
+    xy[~nonzero, 0] = float(d65_xy[0])
+    xy[~nonzero, 1] = float(d65_xy[1])
     xy = np.clip(xy, 0.0, 0.8)
 
-    # 凸包仅统计有效色度点：Y≈0 的暗色 xy 是 0/0 比值噪声（0,0 或撞上 clip 边界），
-    # 色度上无意义且会把包络拖向原点。注意：单调链返回的是「过滤后数组」的局部索引，
-    # 必须映射回全量 xy_points 索引，否则消费方按全量数组取点会错位（V0.3 遗留 bug）。
-    bright = np.where((xy[:, 0] > 1e-3) & (xy[:, 1] > 1e-3))[0]
+    # 凸包仅统计物理有效色度点，并将局部索引映射回全量 xy_points 索引
+    bright = np.where(valid_mask)[0]
     hull_idx = [int(bright[i]) for i in _convex_hull_indices(xy[bright])] if len(bright) >= 3 else []
-    coverage = float(
-        np.mean([_point_in_srgb_triangle(p) for p in xy])
-    ) if len(xy) else 0.0
+
+    # 标准参考色域 xy 面积覆盖率：area(工艺凸包 ∩ 参考色域) / area(参考色域)
+    coverages: dict[str, float] = {}
+    if len(hull_idx) >= 3:
+        hull_poly = xy[hull_idx]
+        for ref_key, ref_prims in _REFERENCE_GAMUTS_XY.items():
+            ref_poly = np.asarray(ref_prims, dtype=np.float64)
+            ref_area = _polygon_area(ref_poly)
+            inter = _clip_convex(hull_poly, ref_poly)
+            cov = (
+                _polygon_area(np.asarray(inter, dtype=np.float64)) / ref_area
+                if len(inter) >= 3 and ref_area > 0
+                else 0.0
+            )
+            coverages[ref_key] = round(min(max(float(cov), 0.0), 1.0), 4)
+    else:
+        for ref_key in _REFERENCE_GAMUTS_XY:
+            coverages[ref_key] = 0.0
+    coverage = coverages["srgb"]
 
     # 表面网格：Lab 空间凸包包络三角索引（scipy Qhull；GRAY 等低维色域无表面）。
     # V0.5 再考虑非凸等值面（voxel 边界提取）。
@@ -471,9 +533,11 @@ def sample_process_gamut(process: dict, levels: int = 6) -> dict:
             for l, a, b in lab
         ],
         "grid": {"levels": levels, "channels": channels},
+        "intent": intent,
         "surface": surface,
         "hull": hull_idx,
-        "coverage_srgb": round(coverage, 4),
+        "coverage_srgb": coverage,
+        "coverages": coverages,
         "volume": float(
             (lab[:, 0].max() - lab[:, 0].min())
             * (lab[:, 1].max() - lab[:, 1].min())
@@ -519,15 +583,15 @@ def _polygon_area(poly: np.ndarray) -> float:
     return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) / 2.0
 
 
-def _points_in_convex(points: np.ndarray, poly: np.ndarray) -> np.ndarray:
-    """点在凸多边形内判定（全向量化；对 CCW 多边形，内部点叉积恒 ≥0）。"""
+def _points_in_convex(points: np.ndarray, poly: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    """点在凸多边形内判定（全向量化；对 CCW 多边形，内部点叉积恒 ≥ -eps）。"""
     poly = _ensure_ccw(poly)
     x1, y1 = poly[:, 0], poly[:, 1]
     x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
     px = points[:, 0:1]
     py = points[:, 1:2]
     cross = (x2 - x1)[None, :] * (py - y1[None, :]) - (y2 - y1)[None, :] * (px - x1[None, :])
-    return (cross >= -1e-12).all(axis=1)
+    return (cross >= -eps).all(axis=1)
 
 
 def _line_intersect(p1, p2, a, b):

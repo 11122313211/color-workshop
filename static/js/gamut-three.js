@@ -215,11 +215,16 @@ const gamutThree = {
       c.uniforms.uSliceOn.value = state.slice == null ? 0 : 1;
       c.uniforms.uSlice.value = state.slice == null ? -1 : state.slice;
     }
-    if (c.mesh) c.mesh.material.opacity = state.slice == null ? 0.42 : 0.08;
+    if (c.points) c.points.visible = state.showPoints !== false;
+    if (c.mesh) {
+      c.mesh.visible = state.showHull !== false;
+      c.mesh.material.opacity = state.slice == null ? 0.42 : 0.08;
+    }
     c.grid.material.color.set(resolveToken("--label-3"));
 
     c.renderer.render(c.scene, c.camera);
 
+    if (state.showPoints === false) return [];
     // 屏幕点集（tooltip 命中）：世界坐标 → NDC → 像素
     const v = new THREE.Vector3();
     return (data.lab_points || []).map((lab) => {

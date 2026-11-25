@@ -1944,8 +1944,31 @@ export async function renderProcessDetail(view, params) {
     disposeDetail();
     const gamutHolder = view.querySelector("#gamut-view");
     if (gamutHolder) {
+      const gamutByIntent = new Map([["relative", gamutPromise]]);
       activeGamutView = createGamutView(gamutHolder, {
-        getData: () => gamutPromise,
+        intents: true,
+        defaultIntent: "relative",
+        getData: (intent = "relative") => {
+          if (!gamutByIntent.has(intent)) {
+            gamutByIntent.set(
+              intent,
+              apiGet(
+                `/api/processes/${encodeURIComponent(p.id)}/gamut?levels=7&intent=${encodeURIComponent(intent)}`,
+                { signal }
+              )
+            );
+          }
+          return gamutByIntent.get(intent);
+        },
+        onData: (g) => {
+          if (!isActive() || !g) return;
+          const volEl = view.querySelector("#st-volume");
+          const lrEl = view.querySelector("#st-lrange");
+          const covEl = view.querySelector("#st-cov");
+          if (volEl) volEl.textContent = formatVolume(g.volume);
+          if (lrEl) lrEl.textContent = `${g.L_range[0]} – ${g.L_range[1]}`;
+          if (covEl) covEl.textContent = `${Math.round(g.coverage_srgb * 100)}%`;
+        },
         levels: 7,
       });
     }

@@ -58,16 +58,32 @@ def test_gamut_levels_clamped(api_client, process_factory):
 
 
 def test_gamut_includes_hull_and_lab_points(api_client, process_factory):
-    """gamut 响应包含 V0.3 新字段：lab_points / hull / coverage_srgb。"""
+    """gamut 响应包含 V0.3 新字段：lab_points / hull / coverage_srgb / coverages / intent。"""
     proc = process_factory("新字段")
     r = api_client.get(f"/api/processes/{proc['id']}/gamut?levels=6")
     data = r.json()
     assert len(data["lab_points"]) == len(data["xy_points"]) == 6 ** 4
     assert len(data["hull"]) >= 3
     assert 0.0 <= data["coverage_srgb"] <= 1.0
+    assert data["intent"] == "relative"
+    assert set(data["coverages"].keys()) == {"srgb", "dci-p3", "adobe-rgb", "rec2020"}
     hull_pts = {tuple(p) for p in (data["xy_points"][i] for i in data["hull"])}
     assert len(hull_pts) == len(data["hull"])
     print(f"[PASS] gamut 新字段（hull {len(data['hull'])} 顶点 / 覆盖率 {data['coverage_srgb']:.2%}）")
+
+
+def test_gamut_intent_param_and_validation(api_client, process_factory):
+    """gamut 支持 relative / absolute 渲染意图切换与缓存隔离，非法意图返回 422。"""
+    proc = process_factory("意图切换")
+    r_rel = api_client.get(f"/api/processes/{proc['id']}/gamut?levels=5&intent=relative")
+    r_abs = api_client.get(f"/api/processes/{proc['id']}/gamut?levels=5&intent=absolute")
+    assert r_rel.status_code == 200 and r_abs.status_code == 200
+    d_rel, d_abs = r_rel.json(), r_abs.json()
+    assert d_rel["intent"] == "relative" and d_abs["intent"] == "absolute"
+    # 绝对色度含纸白偏移，白点 L* 通常低于相对色度的 100.0
+    assert d_abs["L_range"][1] <= d_rel["L_range"][1]
+    assert api_client.get(f"/api/processes/{proc['id']}/gamut?intent=perceptual").status_code == 422
+    print("[PASS] gamut 渲染意图切换与 422 校验")
 
 
 def test_gamut_levels_cache_regression(api_client, process_factory):

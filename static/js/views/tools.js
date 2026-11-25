@@ -6,7 +6,7 @@ import {
   toast, drawCie, labToHex, fetchSpectrum, emptyState, errorState, observeRedraw,
   openModal, confirmDanger, esc, safeHex,
 } from "../components.js";
-import { SRGB_XY } from "../gamut-view.js";
+import { STANDARD_GAMUTS } from "../gamut-view.js";
 
 let processes = [];
 let displays = [];
@@ -188,6 +188,19 @@ function buildDeltaE(box) {
 
 /* ---------- 色域对比 ---------- */
 async function buildGamut(box, ctx) {
+  const selectedGamuts = new Set(["srgb", "dci-p3", "adobe-rgb"]);
+  let showSpectrum = true;
+  let showHull = true;
+  let showPoints = true;
+
+  const gamutButtons = STANDARD_GAMUTS.map(
+    (g) => `
+      <button class="gamut-layer-toggle" type="button" data-gamut="${g.id}"
+        aria-pressed="${selectedGamuts.has(g.id) ? "true" : "false"}">
+        <i class="gamut-dot ${g.dotClass}" aria-hidden="true"></i><span>${g.label}</span>
+      </button>`
+  ).join("");
+
   box.innerHTML = `
     <div class="field-row" style="margin-bottom:12px">
       <div class="field" style="max-width:340px">
@@ -199,36 +212,92 @@ async function buildGamut(box, ctx) {
       </div>
     </div>
     <canvas class="cie-canvas" id="gm-cie"></canvas>
-    <div class="cie-legend">
-      <span><i class="dot" style="background:linear-gradient(90deg,#4400ff,#00ff00,#ff0000)"></i>光谱轨迹</span>
-      <span><i class="dot legend-srgb"></i>sRGB</span>
-      <span><i class="dot" style="background:var(--teal)"></i>Display P3</span>
-      <span><i class="dot" style="background:var(--yellow)"></i>Adobe RGB</span>
-      <span><i class="dot legend-proc"></i>工艺凸包 · 采样点按 L* 着色</span>
+    <div class="gamut-legend" id="gm-legend" role="group" aria-label="色域与图层选择" style="margin-top:10px">
+      <button class="gamut-layer-toggle" type="button" data-layer="spectrum" aria-pressed="true">
+        <i class="gamut-dot gamut-dot-spectrum" aria-hidden="true"></i><span>光谱轨迹</span>
+      </button>
+      ${gamutButtons}
+      <button class="gamut-layer-toggle" type="button" data-layer="hull" aria-pressed="true">
+        <i class="gamut-dot gamut-dot-hull" aria-hidden="true"></i><span>工艺凸包</span>
+      </button>
+      <button class="gamut-layer-toggle" type="button" data-layer="points" aria-pressed="true">
+        <i class="gamut-dot gamut-dot-proc" aria-hidden="true"></i><span>采样点</span>
+      </button>
     </div>
   `;
 
-  const SPECTRA = [
-    { color: "var(--accent)", spaces: ["srgb"] },
-    { color: "var(--teal)", spaces: ["dci-p3"] },
-    { color: "var(--yellow)", spaces: ["adobe-rgb"] },
-  ];
   const canvas = box.querySelector("#gm-cie");
   canvas.style.maxWidth = "440px";
 
   // 缓存几何数据与工艺色域，resize/主题切换仅重绘画布，不触发网络请求
   let spectrum = null;
-  let stdSeries = [
-    { points: SRGB_XY, color: "var(--accent)", fill: true, fillAlpha: 0.13 },
-  ];
+  const polyBySpace = new Map(STANDARD_GAMUTS.map((g) => [g.id, g.points]));
   const procGamutCache = new Map();
-  let activeProcSeries = null;
+  let activeProcData = null;
   let gamutReqSeq = 0;
 
-  const redraw = () => {
-    const series = activeProcSeries ? [...stdSeries, activeProcSeries] : stdSeries;
-    drawCie(canvas, series, { spectrum });
+  const updateLegendUI = () => {
+    const legend = box.querySelector("#gm-legend");
+    if (!legend) return;
+    legend.querySelectorAll("button[data-gamut]").forEach((btn) => {
+      const on = selectedGamuts.has(btn.dataset.gamut);
+      btn.setAttribute("aria-pressed", String(on));
+      btn.classList.toggle("is-off", !on);
+    });
+    const layers = { spectrum: showSpectrum, hull: showHull, points: showPoints };
+    legend.querySelectorAll("button[data-layer]").forEach((btn) => {
+      const on = !!layers[btn.dataset.layer];
+      btn.setAttribute("aria-pressed", String(on));
+      btn.classList.toggle("is-off", !on);
+      if (btn.dataset.layer === "hull" || btn.dataset.layer === "points") {
+        btn.disabled = !activeProcData;
+      }
+    });
   };
+
+  const redraw = () => {
+    const series = [];
+    for (let i = STANDARD_GAMUTS.length - 1; i >= 0; i--) {
+      const g = STANDARD_GAMUTS[i];
+      if (!selectedGamuts.has(g.id)) continue;
+      const pts = polyBySpace.get(g.id) || g.points;
+      if (pts.length) {
+        series.push({ points: pts, color: g.color, fill: true, fillAlpha: g.id === "srgb" ? 0.13 : 0.08 });
+      }
+    }
+    if (activeProcData) {
+      series.push({
+        points: activeProcData.xy_points,
+        labPoints: activeProcData.lab_points,
+        hull: showHull ? activeProcData.hull : null,
+        hidePoints: !showPoints,
+        color: "var(--indigo)",
+        pointSize: 1.8,
+      });
+    }
+    drawCie(canvas, series, { spectrum: showSpectrum ? spectrum : null });
+  };
+
+  updateLegendUI();
+
+  box.querySelector("#gm-legend").addEventListener("click", (e) => {
+    const gBtn = e.target.closest("button[data-gamut]");
+    if (gBtn) {
+      const id = gBtn.dataset.gamut;
+      if (selectedGamuts.has(id)) selectedGamuts.delete(id);
+      else selectedGamuts.add(id);
+      updateLegendUI();
+      redraw();
+      return;
+    }
+    const lBtn = e.target.closest("button[data-layer]");
+    if (!lBtn || lBtn.disabled) return;
+    if (lBtn.dataset.layer === "spectrum") showSpectrum = !showSpectrum;
+    else if (lBtn.dataset.layer === "hull") showHull = !showHull;
+    else if (lBtn.dataset.layer === "points") showPoints = !showPoints;
+    updateLegendUI();
+    redraw();
+  });
 
   // 一次性注册观察器，并在路由离开时销毁
   const disposeRedraw = observeRedraw(canvas, redraw);
@@ -237,15 +306,13 @@ async function buildGamut(box, ctx) {
   // 初始加载光谱轨迹 + 标准色域多边形（只发一次请求）
   const [specRes, gamutRes] = await Promise.all([
     fetchSpectrum().catch(() => null),
-    apiGet("/api/visualization/gamut?spaces=dci-p3,adobe-rgb", { signal: ctx.signal }).catch(() => null),
+    apiGet("/api/visualization/gamut?spaces=srgb,dci-p3,adobe-rgb,rec2020", { signal: ctx.signal }).catch(() => null),
   ]);
   if (!ctx.isActive()) return;
   spectrum = specRes;
   if (gamutRes?.gamut_polygons) {
-    for (const s of SPECTRA) {
-      if (s.spaces[0] === "srgb") continue;
-      const poly = s.spaces.flatMap((sp) => gamutRes.gamut_polygons[sp] || []);
-      if (poly.length) stdSeries.push({ points: poly, color: s.color, fill: true });
+    for (const [sp, poly] of Object.entries(gamutRes.gamut_polygons)) {
+      if (Array.isArray(poly) && poly.length >= 3) polyBySpace.set(sp, poly);
     }
   }
   redraw();
@@ -254,27 +321,23 @@ async function buildGamut(box, ctx) {
     const seq = ++gamutReqSeq;
     const pid = box.querySelector("#gm-process").value;
     if (!pid) {
-      activeProcSeries = null;
+      activeProcData = null;
+      updateLegendUI();
       redraw();
       return;
     }
     if (procGamutCache.has(pid)) {
-      activeProcSeries = procGamutCache.get(pid);
+      activeProcData = procGamutCache.get(pid);
+      updateLegendUI();
       redraw();
       return;
     }
     try {
       const g = await apiGet(`/api/processes/${encodeURIComponent(pid)}/gamut?levels=7`, { signal: ctx.signal });
       if (!ctx.isActive() || seq !== gamutReqSeq) return;
-      const entry = {
-        points: g.xy_points,
-        labPoints: g.lab_points,
-        hull: g.hull,
-        color: "var(--indigo)",
-        pointSize: 1.8,
-      };
-      procGamutCache.set(pid, entry);
-      activeProcSeries = entry;
+      procGamutCache.set(pid, g);
+      activeProcData = g;
+      updateLegendUI();
       redraw();
     } catch (e) {
       if (e.name !== "AbortError" && ctx.isActive() && seq === gamutReqSeq) {

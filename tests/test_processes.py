@@ -115,9 +115,64 @@ def test_process_gamut_gray(gray_icc):
         g = sample_process_gamut(proc, levels=5)
         assert g["sampled"] == 5
         assert len(g["xy_points"]) == 5
+        assert g["coverage_srgb"] == 0.0
     finally:
         store.delete(proc["id"])
     print("[PASS] GRAY 工艺色域采样（'L' 模式修复）")
+
+
+def _points_inside_locus(points, locus_xy) -> list[bool]:
+    """射线法判断 xy 点是否严格落在 CIE 1931 光谱轨迹闭合多边形内。"""
+    n = len(locus_xy)
+    out = []
+    for px, py in points:
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = locus_xy[i]
+            xj, yj = locus_xy[j]
+            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi + 1e-15) + xi):
+                inside = not inside
+            j = i
+        out.append(inside)
+    return out
+
+
+def test_process_gamut_inside_spectral_locus_and_srgb_area_coverage(process_factory, rgb_icc):
+    """色域科学性回归：所有采样点必须位于 CIE 光谱轨迹内；sRGB 自身面积覆盖率 ≈ 100%。"""
+    locus_xy = [(p["x"], p["y"]) for p in spectrum_locus()["locus"]]
+
+    # 1. CMYK 工艺（相对色度与绝对色度）均不得有采样点飞出光谱轨迹
+    proc = process_factory("物理边界测试")
+    for intent in ("relative", "absolute"):
+        g = sample_process_gamut(proc, levels=6, intent=intent)
+        assert g["intent"] == intent
+        inside = _points_inside_locus(g["xy_points"], locus_xy)
+        assert all(inside), f"{intent} 下存在 {inside.count(False)} 个采样点超出 CIE 光谱轨迹"
+        assert set(g["coverages"].keys()) == {"srgb", "dci-p3", "adobe-rgb", "rec2020"}
+        assert g["coverage_srgb"] == g["coverages"]["srgb"]
+        assert 0.3 < g["coverage_srgb"] < 0.98
+
+    # 2. 标准 sRGB ICC 自身面积覆盖率必须接近 100%（验证 Bradford 色适应与面积公式），
+    #    以及历史 RGB 显示器 ICC（ibm-t61.icc）全部采样点位于光谱轨迹内
+    from PIL import ImageCms
+
+    store = ProcessStore()
+    srgb_bytes = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    srgb_proc = store.create("sRGB自检", srgb_bytes)
+    t61_proc = store.create("RGB显示自检", rgb_icc)
+    try:
+        gs = sample_process_gamut(srgb_proc, levels=6, intent="relative")
+        assert all(_points_inside_locus(gs["xy_points"], locus_xy))
+        assert gs["coverage_srgb"] >= 0.98, f"sRGB 自身覆盖率偏低: {gs['coverage_srgb']}"
+
+        gt = sample_process_gamut(t61_proc, levels=6, intent="relative")
+        assert all(_points_inside_locus(gt["xy_points"], locus_xy))
+        assert 0.5 < gt["coverage_srgb"] < 0.85
+    finally:
+        store.delete(srgb_proc["id"])
+        store.delete(t61_proc["id"])
+    print("[PASS] 采样点 100% 位于光谱轨迹内且 sRGB 面积覆盖率准确")
 
 
 def _tiny_image(icc_embed: bytes | None = None) -> bytes:
