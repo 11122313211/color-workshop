@@ -69,6 +69,13 @@ def _validate_evidence(process_id: str, raw: dict) -> dict:
         bound = evaluation.get("process_id") or ""
         if bound and bound != process_id:
             raise HTTPException(422, "该评价绑定的是其他工艺，不能用于本签样")
+    rv = evidence.get("render_verification")
+    if rv is not None:
+        if not isinstance(rv, dict):
+            raise HTTPException(422, "render_verification 必须是对象")
+        verdict = rv.get("verdict")
+        if verdict is not None and verdict not in ("verified", "warning", "rejected"):
+            raise HTTPException(422, "render_verification.verdict 必须为 verified / warning / rejected")
     return evidence
 
 

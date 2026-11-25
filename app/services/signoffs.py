@@ -54,7 +54,40 @@ EVIDENCE_KEYS = (
     "file_name",
     "passport_id",
     "passport_hash",
+    "render_check",
+    "render_verification",
 )
+
+
+def _render_evidence_summary(doc: dict) -> dict | None:
+    """提取签样关联的渲染验证摘要（兼容 evidence 与 snapshot，未关联时返回 None）。"""
+    ev = doc.get("evidence") or {}
+    snap = doc.get("snapshot") or {}
+    raw = snap.get("render_verification") or ev.get("render_verification")
+    code = str(ev.get("render_check") or "").strip()
+    if not isinstance(raw, dict) and not code:
+        return None
+    raw = raw if isinstance(raw, dict) else {}
+    resolved_code = str(raw.get("code") or code or "ok").strip()
+    verdict = str(raw.get("verdict") or "").strip()
+    if verdict not in ("verified", "warning", "rejected"):
+        if resolved_code in ("ink_drift_suspect", "render_error"):
+            verdict = "rejected"
+        elif resolved_code in ("blank_page_suspect", "unavailable"):
+            verdict = "warning"
+        else:
+            verdict = "verified"
+    flags = [str(f) for f in (raw.get("flags") or []) if f]
+    if not flags and resolved_code not in ("", "ok"):
+        flags = [resolved_code]
+    return {
+        "verdict": verdict,
+        "code": resolved_code,
+        "flags": flags,
+        "blank_pages": list(raw.get("blank_pages") or []),
+        "drift_pages": list(raw.get("drift_pages") or []),
+        "reasons": [str(r) for r in (raw.get("reasons") or []) if r],
+    }
 
 
 def _now() -> str:
@@ -143,6 +176,7 @@ class SignoffStore:
             snapshot = PassportStore().get_by_hash(process_doc.get("id", ""), passport_hash)
             if snapshot is not None:
                 passport_version = int(snapshot.get("version", 0) or 0)
+        render_summary = _render_evidence_summary({"evidence": evidence})
         doc = {
             "id": _new_id(),
             "process_id": process_doc.get("id", ""),
@@ -162,6 +196,7 @@ class SignoffStore:
                 "passport_id": passport_id,
                 "passport_hash": passport_hash,
                 "passport_version": passport_version,
+                **({"render_verification": render_summary} if render_summary else {}),
             },
             "decision": None,
             "history": [],
@@ -355,6 +390,20 @@ class SignoffStore:
                     "passport_status_label": exposed.get("status_label", ""),
                     "passport_status_reasons": exposed.get("status_reasons") or [],
                 }
+        render_summary = _render_evidence_summary(latest)
+        if render_summary and render_summary.get("verdict") == "rejected":
+            reasons_text = "；".join(render_summary.get("reasons") or [])
+            return {
+                "allowed": False,
+                "reason": "render_rejected",
+                "message": (
+                    "关联交付文件的渲染验证未通过（rejected），禁止放行"
+                    + (f"：{reasons_text}" if reasons_text else "，请排查后重新封装并签样")
+                ),
+                "signoff_id": latest["id"],
+                "render_check": render_summary.get("code"),
+                "render_verification": render_summary,
+            }
         return {
             "allowed": True,
             "reason": "approved",
@@ -365,6 +414,8 @@ class SignoffStore:
             "release_token": latest.get("release_token"),
             "passport_hash": snapshot_passport_hash or None,
             "passport_status": passport_status,
+            "render_check": render_summary.get("code") if render_summary else None,
+            "render_verification": render_summary,
         }
 
     def release_manifest(self, process_doc: dict) -> dict:
@@ -412,4 +463,5 @@ class SignoffStore:
             },
             "signoff": summary(doc),
             "passport": passport,
+            "render_verification": gate.get("render_verification"),
         }

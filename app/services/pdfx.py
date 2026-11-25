@@ -30,6 +30,13 @@ from pypdf.generic import (
 )
 
 from .files import preflight
+from .render_check import (
+    DEFAULT_BLANK_PAGE_THRESHOLD,
+    DEFAULT_INK_DRIFT_THRESHOLD,
+    DEFAULT_RENDER_DPI,
+    MAX_FULL_RENDER_PAGES,
+    compare_pdf_render,
+)
 
 PDFX_VERSION = "PDF/X-4"
 
@@ -94,6 +101,13 @@ def _out_name(filename: str) -> str:
     return f"{stem}-PDFX4.pdf"
 
 
+def _serialize_pdfx(writer: PdfWriter) -> bytes:
+    """将 PdfWriter 序列化为 PDF 字节（独立函数便于渲染回归对照测试注入异常产物）。"""
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
 def package_pdfx(
     pdf_bytes: bytes,
     icc_bytes: bytes,
@@ -103,11 +117,17 @@ def package_pdfx(
     filename: str = "",
     strict: bool = True,
     allow_rgb: bool = False,
+    blank_threshold: float = DEFAULT_BLANK_PAGE_THRESHOLD,
+    drift_threshold: float = DEFAULT_INK_DRIFT_THRESHOLD,
+    render_dpi: float = DEFAULT_RENDER_DPI,
+    max_render_pages: int = MAX_FULL_RENDER_PAGES,
 ) -> dict:
-    """把 PDF 封装为 PDF/X-4 结构文件。
+    """把 PDF 封装为 PDF/X-4 结构文件，并在封装后执行渲染验证防线。
 
     strict=True 时，字体未嵌入 / 未标定 RGB 图像等硬阻断项直接抛 ``PdfxError``；
     strict=False 时仍生成文件，但在 checks/status 中如实标注未达标项。
+    封装完成后用 pypdfium2 对比封装前后页面墨量覆盖，检出空白页嫌疑或墨量漂移时
+    保留产物不删除，并在 render_check / render_verification / checks 中显式报警。
     """
     if not pdf_bytes.startswith(b"%PDF-"):
         raise PdfxError("仅支持 PDF 文件（PNG/JPEG/TIFF 请先组版或先做图像转换）")
@@ -115,7 +135,13 @@ def package_pdfx(
         raise PdfxError("PDF 过大（>40MB），请拆分后再封装")
 
     try:
-        report = preflight(pdf_bytes, filename, render_thumbnail=False)
+        # 封装后将对原始 PDF 与产物一并做渲染对比，此处关闭单文件渲染检查避免重复光栅化
+        report = preflight(
+            pdf_bytes,
+            filename,
+            render_thumbnail=False,
+            run_render_check=False,
+        )
     except Exception as e:  # noqa: BLE001 —— 解析失败统一转封装错误
         raise PdfxError(f"PDF 预检失败：{e}") from e
     if report.get("format") != "PDF" or report.get("status") == "error":
@@ -235,16 +261,54 @@ def package_pdfx(
         "/Creator": "色彩工坊",
     })
 
-    buf = io.BytesIO()
-    writer.write(buf)
-    output = buf.getvalue()
+    output = _serialize_pdfx(writer)
+
+    # ---- 渲染后验证防线（封装前 vs 封装后非白像素占比 + 空白页检测）----
+    render_verification = compare_pdf_render(
+        pdf_bytes,
+        output,
+        dpi=render_dpi,
+        blank_threshold=blank_threshold,
+        drift_threshold=drift_threshold,
+        max_pages=max_render_pages,
+    )
+    if render_verification.get("sampled"):
+        checks.append({
+            "level": "info",
+            "message": (
+                f"页数较多（共 {render_verification['total_pages']} 页），"
+                f"渲染验证按首尾必检+均匀抽样核验 {render_verification['checked_pages']} 页"
+            ),
+        })
+    for reason in render_verification.get("reasons") or []:
+        is_reject_reason = (
+            render_verification.get("verdict") == "rejected"
+            and ("ink_drift_suspect" in reason or "render_error" in reason)
+        )
+        checks.append({
+            "level": "error" if is_reject_reason else "warn",
+            "message": reason,
+        })
+
+    render_verdict = render_verification.get("verdict", "verified")
+    if render_verdict == "rejected":
+        status = "error"
+        compliant = False
+    elif blockers or derived_trim or render_verdict == "warning":
+        status = "warn"
+        compliant = not blockers
+    else:
+        status = "pass"
+        compliant = True
 
     return {
         "file_b64": "data:application/pdf;base64," + base64.b64encode(output).decode("ascii"),
         "filename": _out_name(filename),
         "mode": PDFX_VERSION,
-        "status": "warn" if blockers or derived_trim else "pass",
-        "compliant": not blockers,
+        "status": status,
+        "compliant": compliant,
+        "render_check": render_verification["code"],
+        "render_verification": render_verification,
         "checks": checks,
         "output_intent": {
             "identifier": identifier,
@@ -255,7 +319,7 @@ def package_pdfx(
         },
         "pages": len(pages),
         "notes": [
-            "结构级合规：已写入 OutputIntent、XMP GTS_PDFXVersion 与 TrimBox/BleedBox。",
-            "未执行 RIP 端 PDF/X 全量校验；交付前请用 Acrobat Preflight 或 callas pdfToolbox 复核。",
+            "结构级封装：已写入 OutputIntent、XMP GTS_PDFXVersion 与 TrimBox/BleedBox。",
+            "已执行渲染后墨量验证（非白像素覆盖率与封装前后漂移核验）；仅作内容防丢失防线，不替代 Acrobat Preflight / callas pdfToolbox 的商业 PDF/X 合规认证。",
         ],
     }

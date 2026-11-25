@@ -17,6 +17,11 @@ from ..services.files import convert_image, preflight
 from ..services.lifecycle import archived_detail, is_archived
 from ..services.pdfx import MAX_PDF_BYTES, PdfxError, package_pdfx
 from ..services.processes import ProcessStore
+from ..services.render_check import (
+    DEFAULT_BLANK_PAGE_THRESHOLD,
+    DEFAULT_INK_DRIFT_THRESHOLD,
+    DEFAULT_RENDER_DPI,
+)
 from ..services.displays import DisplayStore
 from ._http import read_body_limited, read_icc_or_409
 
@@ -83,8 +88,26 @@ async def make_pdfx(
     filename: str = Query("", description="源文件名（用于输出命名与 XMP 标题）"),
     strict: bool = Query(True, description="严格模式：字体未嵌入/RGB 图像直接拒绝"),
     allow_rgb: bool = Query(False, description="显式允许 RGB 图像（非严格时可用）"),
+    blank_threshold: float = Query(
+        DEFAULT_BLANK_PAGE_THRESHOLD,
+        ge=0.0,
+        le=1.0,
+        description="空白页判定非白像素占比阈值（默认 0.001 即 0.1%）",
+    ),
+    drift_threshold: float = Query(
+        DEFAULT_INK_DRIFT_THRESHOLD,
+        ge=0.0,
+        le=1.0,
+        description="封装前后墨量相对漂移阈值（默认 0.05 即 5%）",
+    ),
+    render_dpi: float = Query(
+        DEFAULT_RENDER_DPI,
+        ge=36.0,
+        le=150.0,
+        description="渲染验证分辨率 DPI（默认 72）",
+    ),
 ):
-    """把 PDF 封装为 PDF/X-4 结构文件（OutputIntent + XMP + 盒子）。
+    """把 PDF 封装为 PDF/X-4 结构文件（OutputIntent + XMP + 盒子）并执行渲染验证。
 
     请求体为 PDF 原始字节（流式限流 + 线程池封装避免阻塞事件循环）。
     """
@@ -115,6 +138,9 @@ async def make_pdfx(
             filename=filename,
             strict=strict,
             allow_rgb=allow_rgb,
+            blank_threshold=blank_threshold,
+            drift_threshold=drift_threshold,
+            render_dpi=render_dpi,
         )
     except PdfxError as e:
         raise HTTPException(422, str(e)) from e

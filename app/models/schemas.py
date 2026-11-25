@@ -390,6 +390,9 @@ class PreflightReport(BaseModel):
     pages: Optional[int] = None
     pdf: Optional[dict] = None
     thumbnail_b64: Optional[str] = None
+    # 渲染验证防线（仅 PDF 预检返回，含 verified/warning/rejected 分级）
+    render_check: Optional[str] = None
+    render_verification: Optional[dict] = None
 
 
 class FileConvertRequest(BaseModel):
@@ -408,13 +411,15 @@ class FileConvertResponse(BaseModel):
     softproof: dict = {}
 
 
-# V0.9 P0-2 · PDF/X-4 结构封装
+# V0.9 P0-2 · PDF/X-4 结构封装 + 渲染后验证防线
 class FilePdfxResponse(BaseModel):
     file_b64: str
     filename: str
     mode: str
     status: str = "pass"
     compliant: bool = True
+    render_check: str = "ok"
+    render_verification: dict = {}
     checks: list[PreflightIssue] = []
     output_intent: dict = {}
     pages: int = 0

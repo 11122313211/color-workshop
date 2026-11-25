@@ -233,7 +233,9 @@ def _synthetic_pdf(*, trim: bool = True, bleed_mm: float = 3.0,
         img[NameObject("/ColorSpace")] = NameObject(image_colorspace)
         img[NameObject("/BitsPerComponent")] = NumberObject(8)
         channels = 3 if image_colorspace == "/DeviceRGB" else 4
-        img.set_data(bytes(iw * ih * channels))
+        # DeviceRGB 全 0 为黑色；DeviceCMYK 全 0 为 0% 墨量纯白，需填入可见油墨像素避免整页白板
+        pixel = b"\x00\x00\x00" if channels == 3 else b"\x00\x80\x80\x19"
+        img.set_data(pixel * (iw * ih))
         resources[NameObject("/XObject")] = DictionaryObject({
             NameObject("/Im0"): writer._add_object(img),
         })

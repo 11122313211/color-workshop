@@ -13,6 +13,12 @@ import numpy as np
 from PIL import Image, ImageCms
 
 from .processes import ProcessStore
+from .render_check import (
+    DEFAULT_BLANK_PAGE_THRESHOLD,
+    DEFAULT_RENDER_DPI,
+    MAX_FULL_RENDER_PAGES,
+    verify_pdf_render,
+)
 
 _INTENT_MAP = {
     "perceptual": ImageCms.Intent.PERCEPTUAL,
@@ -22,10 +28,27 @@ _INTENT_MAP = {
 }
 
 
-def preflight(data: bytes, filename: str = "", *, render_thumbnail: bool = True) -> dict:
-    """印前预检入口：PDF 走结构化检查（pypdf），图像走原有检查。"""
+def preflight(
+    data: bytes,
+    filename: str = "",
+    *,
+    render_thumbnail: bool = True,
+    run_render_check: bool = True,
+    blank_threshold: float = DEFAULT_BLANK_PAGE_THRESHOLD,
+    render_dpi: float = DEFAULT_RENDER_DPI,
+    max_render_pages: int = MAX_FULL_RENDER_PAGES,
+) -> dict:
+    """印前预检入口：PDF 走结构化检查（pypdf）+ 渲染验证（pypdfium2），图像走原有检查。"""
     if data[:5] == b"%PDF-":
-        return _pdf_preflight(data, filename, render_thumbnail=render_thumbnail)
+        return _pdf_preflight(
+            data,
+            filename,
+            render_thumbnail=render_thumbnail,
+            run_render_check=run_render_check,
+            blank_threshold=blank_threshold,
+            render_dpi=render_dpi,
+            max_render_pages=max_render_pages,
+        )
     return _image_preflight(data, filename)
 
 
@@ -333,11 +356,21 @@ def _image_draw_dpi(reader, page, max_depth: int = 4) -> list[dict]:
     return results
 
 
-def _pdf_preflight(data: bytes, filename: str = "", *, render_thumbnail: bool = True) -> dict:
-    """PDF 印前预检（pypdf）：页面/色彩空间/专色/输出意图/字体/透明度/出血/有效 DPI。
+def _pdf_preflight(
+    data: bytes,
+    filename: str = "",
+    *,
+    render_thumbnail: bool = True,
+    run_render_check: bool = True,
+    blank_threshold: float = DEFAULT_BLANK_PAGE_THRESHOLD,
+    render_dpi: float = DEFAULT_RENDER_DPI,
+    max_render_pages: int = MAX_FULL_RENDER_PAGES,
+) -> dict:
+    """PDF 印前预检（pypdf + pypdfium2）：页面/色彩空间/专色/输出意图/字体/透明度/出血/有效 DPI/渲染防线。
 
     字体嵌入按 FontDescriptor→FontFile* 判定；出血按 TrimBox/BleedBox 计算；
-    图像有效 DPI 解析内容流 CTM（含 Form XObject 递归）。
+    图像有效 DPI 解析内容流 CTM（含 Form XObject 递归）；
+    渲染验证按低分辨率光栅化统计非白像素占比，检出空白页嫌疑但不删除产物。
     PDF 仅预检，不做 ICC 转换（栅格化转换记入 V0.5）。
     """
     issues: list[dict] = []
@@ -601,6 +634,29 @@ def _pdf_preflight(data: bytes, filename: str = "", *, render_thumbnail: bool = 
         # 有位图资源但内容流未解析出绘制尺寸（内联图像/异常内容流）
         pdf["effective_dpi"]["checked"] = False
 
+    # 渲染验证防线：结构预检不证明页面有内容，通过 pypdfium2 光栅化核验非白像素占比
+    render_verification = None
+    if run_render_check:
+        render_verification = verify_pdf_render(
+            data,
+            dpi=render_dpi,
+            blank_threshold=blank_threshold,
+            max_pages=max_render_pages,
+        )
+        pdf["render_check"] = render_verification["code"]
+        pdf["render_verification"] = render_verification
+        if render_verification.get("sampled"):
+            issues.append({
+                "level": "info",
+                "message": (
+                    f"页数较多（共 {render_verification['total_pages']} 页），"
+                    f"渲染验证按首尾必检+均匀抽样核验 {render_verification['checked_pages']} 页"
+                ),
+            })
+        for reason in render_verification.get("reasons") or []:
+            lvl = "error" if render_verification.get("verdict") == "rejected" else "warn"
+            issues.append({"level": lvl, "message": reason})
+
     status = "error" if any(i["level"] == "error" for i in issues) else (
         "warn" if any(i["level"] == "warn" for i in issues) else "pass"
     )
@@ -613,6 +669,8 @@ def _pdf_preflight(data: bytes, filename: str = "", *, render_thumbnail: bool = 
         "pages": pages,
         "pdf": pdf,
         "thumbnail_b64": thumbnail_b64,
+        "render_check": render_verification["code"] if render_verification else None,
+        "render_verification": render_verification,
         "issues": issues,
         "status": status,
     }

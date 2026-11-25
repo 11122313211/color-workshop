@@ -29,6 +29,22 @@ function safeLevel(level) {
   return level === "warn" || level === "error" ? level : "info";
 }
 
+function renderVerdictBadge(rv) {
+  if (!rv) return "—";
+  const v = rv.verdict || "verified";
+  const code = rv.code && rv.code !== "ok" ? ` · ${esc(rv.code)}` : "";
+  const pageInfo = rv.checked
+    ? ` <span style="color:var(--label-3)">（已检 ${rv.checked_pages}/${rv.total_pages} 页${rv.sampled ? " · 抽样" : ""} · ${rv.dpi} DPI）</span>`
+    : "";
+  if (v === "rejected") {
+    return `<span class="badge badge-red">${icon("xmark")}rejected${code}</span>${pageInfo}`;
+  }
+  if (v === "warning") {
+    return `<span class="badge badge-orange">${icon("warn")}warning${code}</span>${pageInfo}`;
+  }
+  return `<span class="badge badge-green">${icon("check")}verified</span>${pageInfo}`;
+}
+
 export async function renderFilesView(view, params = {}) {
   reset();
   const isActive = params.isActive || (() => true);
@@ -180,6 +196,7 @@ function uploadBody(view) {
         <dt>出血</dt><dd>${bleedText}</dd>
         <dt>有效分辨率</dt><dd>${dpiText}</dd>
         <dt>输出意图</dt><dd>${r.pdf.has_output_intent ? `<span class="badge badge-green">已嵌入</span>` : `<span class="badge badge-orange">未嵌入</span>`}</dd>
+        <dt>渲染验证</dt><dd>${renderVerdictBadge(r.render_verification || r.pdf.render_verification)}</dd>
         <dt>图像对象</dt><dd>${r.pdf.images.length ? r.pdf.images.slice(0, 4).map((im) => `第${im.page}页 ${im.px[0]}×${im.px[1]} ${esc(im.colorspace)}${im.effective_dpi != null ? ` · ${im.effective_dpi} DPI` : ""}`).join("；") + (r.pdf.images.length > 4 ? "…" : "") : "无位图对象"}</dd>
         <dt>专色</dt><dd>${r.pdf.spot_colors.length ? r.pdf.spot_colors.map(esc).join("、") : "—"}</dd>
         <dt>字体</dt><dd>${fontText || `${r.pdf.fonts} 个字体对象`}${fe && fe.not_embedded.length ? `<div class="row-sub" style="margin-top:4px">未嵌入：${fe.not_embedded.slice(0, 4).map((f) => esc(f.name)).join("、")}${fe.not_embedded.length > 4 ? " …" : ""}</div>` : ""}${r.pdf.transparency ? '<div class="row-sub" style="margin-top:4px">含透明对象</div>' : ""}</dd>
@@ -257,8 +274,10 @@ function pdfxDoneBody(view) {
     })
     .join("");
   const badge = c.status === "pass"
-    ? `<span class="badge badge-green">${icon("check")}结构完整</span>`
-    : `<span class="badge badge-orange">${icon("warn")}有确认项</span>`;
+    ? `<span class="badge badge-green">${icon("check")}结构与渲染通过</span>`
+    : (c.status === "error" || c.render_verification?.verdict === "rejected")
+      ? `<span class="badge badge-red">${icon("xmark")}渲染验证拦截</span>`
+      : `<span class="badge badge-orange">${icon("warn")}有确认项</span>`;
   return `<div class="step-card">
     <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap">
       ${badge}
@@ -269,6 +288,7 @@ function pdfxDoneBody(view) {
       <dt>输出意图</dt><dd>${esc(c.output_intent.identifier)} · ${c.output_intent.channels} 通道</dd>
       <dt>ICC 指纹</dt><dd><span class="chip chip-mono">${esc(c.output_intent.icc_sha256)}</span></dd>
       <dt>合规状态</dt><dd>${c.compliant ? "结构硬门禁通过（字体 / RGB / 解析）" : "结构已写入，存在未达标项"}</dd>
+      <dt>渲染验证</dt><dd>${renderVerdictBadge(c.render_verification)}</dd>
     </dl>
     <div class="issue-list" style="margin-top:10px">${checks || '<div class="issue issue-info">' + icon("check") + "<span>未发现额外问题</span></div>"}</div>
     ${(c.notes || []).map((n) => `<div class="issue issue-info" style="margin-top:6px">${icon("info")}<span>${esc(n)}</span></div>`).join("")}
