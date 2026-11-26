@@ -90,21 +90,25 @@ cd color-workshop
 # 安装 Python 依赖（推荐 Python 3.12+）
 pip install -r requirements.txt
 
-# 启动本地服务
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
+# 启动本地服务（默认端口 2354）
+python -m uvicorn app.main:app --host 127.0.0.1 --port 2354
+# 或直接运行模块入口（读取 COLORFORGE_HOST / COLORFORGE_PORT，默认 127.0.0.1:2354）
+python -m app.main
 ```
 
 启动后访问：
-- **Web 应用**：`http://127.0.0.1:8765/`
-- **交互式 API 文档（Swagger UI）**：`http://127.0.0.1:8765/docs`
+- **Web 应用**：`http://127.0.0.1:2354/`
+- **交互式 API 文档（Swagger UI）**：`http://127.0.0.1:2354/docs`
 
 ### 2. 可选环境变量
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
+| `COLORFORGE_HOST` | `127.0.0.1` | `python -m app.main` 启动时的监听地址 |
+| `COLORFORGE_PORT` | `2354` | `python -m app.main` 启动时的默认监听端口 |
 | `COLORFORGE_DATA_DIR` | `./data` | 运行时 JSON 与 ICC 存储目录（用于多环境/测试隔离） |
 | `COLORFORGE_CORS_ORIGINS` | 本地 `localhost`/`127.0.0.1` | 逗号分隔的允许跨域来源列表 |
-| `COLORFORGE_E2E_BASE_URL` | `http://127.0.0.1:8765` | HTTP E2E 脚本指向的目标服务地址 |
+| `COLORFORGE_E2E_BASE_URL` | `http://127.0.0.1:2354` | HTTP E2E 脚本指向的目标服务地址 |
 
 ### 3. 运行测试与维护命令
 

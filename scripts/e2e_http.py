@@ -16,7 +16,7 @@ from PIL import Image
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # 默认连接本机固定端口；可用环境变量改到隔离测试实例。
-_base_url = os.environ.get("COLORFORGE_E2E_BASE_URL", "http://127.0.0.1:8765")
+_base_url = os.environ.get("COLORFORGE_E2E_BASE_URL", "http://127.0.0.1:2354")
 client = httpx.Client(base_url=_base_url.rstrip("/"))
 ROOT = Path(__file__).resolve().parent.parent
 ICC_FIXTURE = ROOT / "tests" / "fixtures" / "icc" / "testbed_cmyk.icc"

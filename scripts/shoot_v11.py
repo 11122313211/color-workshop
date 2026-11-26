@@ -4,7 +4,7 @@
     python scripts/shoot_v11.py
     COLORFORGE_V11_BASE_URL=http://127.0.0.1:8799 python scripts/shoot_v11.py
 
-默认连接 ``http://127.0.0.1:8765``，截图输出到 ``.tmp/shots-v11``。
+默认连接 ``http://127.0.0.1:2354``，截图输出到 ``.tmp/shots-v11``。
 脚本通过公开 HTTP API 造数，结束时按 V0.11 协议归档并永久清理测试工艺。
 """
 
@@ -20,7 +20,7 @@ import httpx
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = os.environ.get("COLORFORGE_V11_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
+BASE = os.environ.get("COLORFORGE_V11_BASE_URL", "http://127.0.0.1:2354").rstrip("/")
 OUT = Path(os.environ.get("COLORFORGE_V11_SHOTS_DIR", ROOT / ".tmp" / "shots-v11"))
 OUT.mkdir(parents=True, exist_ok=True)
 

@@ -23,7 +23,7 @@ JUNK = {"E2E-SWOP", "冒烟工艺-SWOP", "dbg", "dbg2", "哈希1", "哈希2", "�
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="清理调试残留工艺（默认仅预览）")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8765")
+    parser.add_argument("--base-url", default="http://127.0.0.1:2354")
     parser.add_argument("--apply", action="store_true", help="显式执行归档并运行完整性修复")
     args = parser.parse_args()
 

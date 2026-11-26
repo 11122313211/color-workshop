@@ -86,3 +86,14 @@ if _static_dir.exists():
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+# 默认服务端口（可通过 COLORFORGE_PORT / COLORFORGE_HOST 覆盖）
+DEFAULT_HOST = os.environ.get("COLORFORGE_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.environ.get("COLORFORGE_PORT", "2354"))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", host=DEFAULT_HOST, port=DEFAULT_PORT)
