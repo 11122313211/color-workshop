@@ -1,5 +1,10 @@
 # 色彩工坊（Color Workshop）
 
+[![CI](https://github.com/11122313211/color-workshop/actions/workflows/ci.yml/badge.svg)](https://github.com/11122313211/color-workshop/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776ab?logo=python&logoColor=white)](./requirements.txt)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.162-009688?logo=fastapi&logoColor=white)](./app/main.py)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
+
 > 面向印前工程的**色彩数值优化与光谱证据闭环平台**（FastAPI + 原生 ES Module + Three.js，零前端构建，MIT 许可）。
 
 以 CIEDE2000（$\Delta E_{00}$）为统一度量，以**工艺 ICC 数值优化 + 方法学测量门禁 + 不可变工艺护照**为主线，打通从目标色反查分色值、实测验证与误差补偿、印刷质量诊断与校准收敛，到印前预检、PDF/X-4 封装与签样放行的完整印前闭环。
@@ -69,10 +74,14 @@ color-workshop/
 │   ├── css/app.css                  # 设计令牌、组件样式、暗色主题与响应式适配
 │   ├── vendor/three/                # Three.js r187 本地依赖（MIT，含完整性校验记录）
 │   └── js/                          # 路由、API 客户端、Canvas/WebGL 色域组件与各业务视图
+├── .github/workflows/ci.yml         # GitHub Actions 自动化测试工作流（Ubuntu + Python 3.12）
 ├── scripts/                         # 完整性审计 CLI、数据清理、HTTP E2E 与截图脚本
-├── tests/                           # 277 项自动化测试（含 MIT 测试 ICC 与精度基线）
+├── tests/                           # 290 项自动化测试（含 MIT 测试 ICC 与精度基线）
 ├── docs/                            # 架构设计与版本演进文档
+├── CHANGELOG.md                     # Keep a Changelog 版本变更记录
+├── pytest.ini                       # Pytest 测试配置与标记（precision / slow / api）
 ├── requirements.txt
+├── .editorconfig                    # 跨平台编码、缩进与换行符规范
 └── LICENSE
 ```
 
@@ -110,11 +119,18 @@ python -m app.main
 | `COLORFORGE_CORS_ORIGINS` | 本地 `localhost`/`127.0.0.1` | 逗号分隔的允许跨域来源列表 |
 | `COLORFORGE_E2E_BASE_URL` | `http://127.0.0.1:2354` | HTTP E2E 脚本指向的目标服务地址 |
 
-### 3. 运行测试与维护命令
+---
+
+## 测试与 CI
+
+项目内置 290 项跨平台自动化测试（包含 MIT 许可测试 ICC、API 集成测试与精度基线回归门禁，配置见 [pytest.ini](pytest.ini)），并通过 GitHub Actions（[.github/workflows/ci.yml](.github/workflows/ci.yml)）在每次推送或拉取请求至 `main` 分支时自动在 Ubuntu + Python 3.12 环境执行 `pytest -q`。
 
 ```bash
-# 全量自动化测试（277 项，内置 MIT 测试 ICC，跨平台可直接运行）
-python -m pytest tests/ -q
+# 全量自动化测试（290 项，内置 MIT 测试 ICC，跨平台可直接运行）
+python -m pytest -q
+
+# 仅运行精度基线回归门禁（算法重构或依赖升级前后推荐）
+python -m pytest -m precision -q
 
 # 数据完整性审计（默认只读 Dry Run，不写盘）
 python scripts/audit_data.py --dry-run
@@ -157,7 +173,9 @@ python scripts/e2e_http.py
 
 ## 版本演进
 
-- **V0.11（当前优化版）**：归档优先生命周期、完整性扫描与 Dry Run 修复、护照历史与签样引用、无障碍增强；以及全项目审计优化（跨实例存储并发锁、算法向量化与零警告、ICC 纸白校验/复测 QA/校准幂等/漂移公式修复、路由流控与 N+1 消除、前端 Display-P3 OETF 修正与泄漏治理、测试扩充至 277 项）。
+完整变更明细请查阅 [CHANGELOG.md](CHANGELOG.md)。
+
+- **V0.11（当前优化版）**：归档优先生命周期、完整性扫描与 Dry Run 修复、护照历史与签样引用、无障碍增强；以及全项目审计优化（跨实例存储并发锁、算法向量化与零警告、ICC 纸白校验/复测 QA/校准幂等/漂移公式修复、路由流控与 N+1 消除、前端 Display-P3 OETF 修正与泄漏治理、测试扩充至 277 项，后续持续迭代至 290 项）。
 - **V0.10**：版本化不可变工艺护照、`device_values` 配方语义、四光源光谱同色异谱风险评估与签样护照门禁。
 - **V0.9**：PDF 深度预检（字体嵌入/出血/有效 DPI/开本）、PDF/X-4 结构封装、签样状态机与显示器软打样门禁。
 - **V0.7 – V0.8**：ISO 12647-7 风格编号校准版、双基准校准报告、Lab 有效网点反演校正曲线与多轮收敛追踪。
